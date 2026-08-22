@@ -1032,6 +1032,8 @@ class MiniMaxM3Attention(nn.Module):
         kv_pool = self._get_sparse_kv_pool()
         # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
         # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
+        # An fp8 index-K cache (SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE) is fine: the
+        # fused kernel stores idx_k in the index cache's own dtype.
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         can_use_cache_fusion = (
             not main_kv_is_fp8

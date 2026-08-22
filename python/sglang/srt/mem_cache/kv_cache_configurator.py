@@ -1474,11 +1474,17 @@ class KVCacheConfigurator:
             # fp8 attn-GEMM mode opts the lightning-indexer cache into
             # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
             # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
+            # with the widening-dequant contract. On ROCm the indexer cache
+            # can opt into fp8 on its own (widening mode: bf16 q x fp8 k in
+            # the score kernels).
             index_dtype=(
                 self.kv_cache_dtype
                 if m3_fp8_attn_gemm_enabled(self.server_args)
-                else self.model_dtype
+                else (
+                    torch.float8_e4m3fn
+                    if _is_hip and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get()
+                    else self.model_dtype
+                )
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size

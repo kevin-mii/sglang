@@ -24,22 +24,41 @@ def _prune_decode_configs(configs, named_args, **kwargs):
     return [config for config in configs if config.kwargs["BLOCK_SIZE_N"] >= block_size]
 
 
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
-    }
-)
-@triton.autotune(
-    configs=[
+_ON_HIP = torch.version.hip is not None
+
+# On ROCm the autotune sweep is replaced by a fixed config plus a
+# BLOCK_SIZE_N heuristic (512 for tiny batches, else 128; num_warps=4,
+# num_stages=1): runtime autotune can fire under CUDA-graph capture and
+# mistune.
+_DECODE_SCORE_CONFIGS = (
+    [triton.Config({}, num_warps=4, num_stages=1)]
+    if _ON_HIP
+    else [
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
         for BN in [64, 128, 256, 512]
         for nw in [4, 8, 16]
         for ns in [1, 2, 3]
-    ],
+    ]
+)
+
+_DECODE_SCORE_HEURISTICS = {
+    "BLOCK_SIZE_H": lambda args: max(
+        16, triton.next_power_of_2(args["gqa_group_size"])
+    ),
+    "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+}
+if _ON_HIP:
+    _DECODE_SCORE_HEURISTICS["BLOCK_SIZE_N"] = lambda args: (
+        max(512, args["block_size"])
+        if args["batch_size"] <= 4
+        else max(128, args["block_size"])
+    )
+
+
+@triton.heuristics(_DECODE_SCORE_HEURISTICS)
+@triton.autotune(
+    configs=_DECODE_SCORE_CONFIGS,
     key=[
         "BATCH_SIZE_BUCKET",
         "gqa_group_size",
@@ -47,7 +66,9 @@ def _prune_decode_configs(configs, named_args, **kwargs):
         "block_size",
         "SCORE_TYPE",
     ],
-    prune_configs_by={"early_config_prune": _prune_decode_configs},
+    prune_configs_by=(
+        None if _ON_HIP else {"early_config_prune": _prune_decode_configs}
+    ),
 )
 @triton.jit
 def _decode_score_kernel(
