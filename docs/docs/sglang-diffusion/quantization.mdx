@@ -25,6 +25,8 @@ Use these paths:
 - `--quantization-ignored-layers`: transformer layer name patterns to keep unquantized during online quantization (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
+- `--component-paths.image_encoder`: replace an image encoder with a local component directory or Hub repository; native CLIP vision encoders accept serialized FP8 repositories
+- `--image-encoder-path`: shorter alias for `--component-paths.image_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
 
 Recommended example for pre-quantized checkpoints:
@@ -56,6 +58,24 @@ FL2VA or Ref2VA DiT file by local path, `owner/repo/path/file.safetensors`, or
 direct Hugging Face file URL; do not combine it with `--quantization`. Its GGUF
 usage is documented in
 the [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#pre-quantized-gguf-transformer).
+
+For a native CLIP vision encoder, convert and select the component independently.
+Its weights use SRT's serialized FP8 implementation while activations remain BF16:
+
+```bash
+python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
+  --model-dir /path/to/base-model/image_encoder \
+  --save-dir /path/to/fp8-image-encoder \
+  --strategy tensor
+
+sglang serve \
+  --model-path /path/to/base-model \
+  --component-paths.image_encoder /path/to/fp8-image-encoder \
+  --image-encoder-precision bf16
+```
+
+The component path may instead be a Hub repository containing the converted
+image-encoder `config.json` and safetensors files.
 
 ## Quantized Component Repositories
 

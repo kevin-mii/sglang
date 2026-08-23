@@ -3,7 +3,6 @@ import glob
 import os
 import re
 from collections.abc import Callable, Generator, Iterable
-from itertools import chain
 from typing import cast
 
 import torch
@@ -82,6 +81,15 @@ from sglang.multimodal_gen.runtime.weights.source import (
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import LinearBase as SRTLinearBase
+from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod as SRTUnquantizedLinearMethod,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 
 logger = init_logger(__name__)
 
@@ -110,12 +118,42 @@ def _delegate_standard_bnb4_to_transformers(
         )
 
 
+def _get_srt_encoder_quant_config(
+    component_config: dict,
+    model_cls: type[EncoderTensorParallelMixin],
+) -> SRTFp8Config | None:
+    quant_spec = resolve_checkpoint_quant_spec(component_config)
+    if quant_spec is None:
+        return None
+    if quant_spec.declared_method != "fp8":
+        raise ComponentCheckpointUnsupportedError(
+            "The SRT encoder checkpoint adapter supports only serialized 'fp8', "
+            f"got {quant_spec.declared_method!r}"
+        )
+
+    config = dict(quant_spec.config)
+    config["packed_modules_mapping"] = model_cls.packed_modules_mapping
+    return SRTFp8Config.from_config(config)
+
+
 def _get_encoder_quant_config(
     component_config: dict,
     component_model_path: str,
     component_weights_path: str,
     model_cls: type[nn.Module] | None = None,
 ):
+    if (
+        model_cls is not None
+        and issubclass(model_cls, EncoderTensorParallelMixin)
+        and model_cls.checkpoint_quantization_backend == "srt"
+    ):
+        srt_quant_config = _get_srt_encoder_quant_config(
+            component_config,
+            model_cls,
+        )
+        if srt_quant_config is not None:
+            return srt_quant_config
+
     quant_config = get_quant_config(component_config, component_model_path)
     if (
         quant_config is None
@@ -233,28 +271,6 @@ def _resolve_and_configure_encoder_quantization(
     return model_cls
 
 
-def _module_tensor_device(module: nn.Module) -> torch.device | None:
-    """Return the device of a module's own tensors.
-
-    Quantized linear layers are expected to keep their parameters and buffers
-    together.  Failing explicitly is safer than staging only part of a layer.
-    """
-
-    devices = {
-        tensor.device
-        for tensor in chain(
-            module.parameters(recurse=False),
-            module.buffers(recurse=False),
-        )
-    }
-    if len(devices) > 1:
-        raise ValueError(
-            f"Cannot stage {type(module).__name__} with tensors on multiple "
-            f"devices: {sorted(map(str, devices))}"
-        )
-    return next(iter(devices), None)
-
-
 def _process_quantized_encoder_weights(
     model: nn.Module,
     process_device: torch.device | None,
@@ -262,28 +278,19 @@ def _process_quantized_encoder_weights(
 ) -> int:
     processed_layers = 0
     for module in model.modules():
-        if not isinstance(module, LinearBase):
+        if not isinstance(module, (LinearBase, SRTLinearBase)):
             continue
         quant_method = module.quant_method
-        if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
+        if quant_method is None or isinstance(
+            quant_method, (UnquantizedLinearMethod, SRTUnquantizedLinearMethod)
+        ):
             continue
-
-        origin_device = _module_tensor_device(module)
-        should_stage = (
-            process_device is not None
-            and origin_device is not None
-            and origin_device != process_device
-        )
-        if should_stage:
-            module.to(process_device)
-        try:
+        if process_device is None:
             quant_method.process_weights_after_loading(module)
-            processed_layers += 1
-        finally:
-            # Post-load methods may replace parameters or register buffers. Move
-            # the complete layer back so component residency remains authoritative.
-            if should_stage:
-                module.to(origin_device)
+        else:
+            with stage_module_for_post_load(module, process_device):
+                quant_method.process_weights_after_loading(module)
+        processed_layers += 1
     if processed_layers == 0:
         raise ValueError(
             f"The {component_name!r} checkpoint declares quantization, but the "
@@ -298,9 +305,12 @@ def _require_quantized_encoder_layers(
     quant_config: QuantizationConfig | None = None,
 ) -> None:
     has_quantized_layers = any(
-        isinstance(module, LinearBase)
+        isinstance(module, (LinearBase, SRTLinearBase))
         and module.quant_method is not None
-        and not isinstance(module.quant_method, UnquantizedLinearMethod)
+        and not isinstance(
+            module.quant_method,
+            (UnquantizedLinearMethod, SRTUnquantizedLinearMethod),
+        )
         for module in model.modules()
     )
     if not has_quantized_layers:
