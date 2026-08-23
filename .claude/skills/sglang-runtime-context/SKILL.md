@@ -22,12 +22,18 @@ flags/resources/forward tiers.
 
 ## Config: publish + namespace bags
 
-**`ServerArgs` is a pristine seed. Business code never reads it for decisions —
-resolved configuration lives in the namespace bags.**
+**`ServerArgs` holds the raw input and nothing else. Resolution writes no field:
+it declares, and the declarations are what the namespace bags are projected from.
+Business code never reads the record for a decision — and after this cut, a field
+read there answers with what the operator typed, not with what resolution
+decided.**
 
 - Every publishing process entry calls `publish(server_args, role=...)`
   (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
-  detokenizer, encoder, weight-cache daemon, ...); the roles are enumerated once,
+  detokenizer, encoder, weight-cache daemon, the multi-tokenizer worker, the
+  spawned encoder TP/DP workers, the benchmark work functions, ...); constructors
+  do not publish — `ModelRunner`, `TokenizerManager` and `MMEncoder` call
+  `assert_published` and fail loudly if an entry forgot. The roles are enumerated once,
   as the keys of `ROLE_NAMESPACE_SETS` — there is no `launcher` role, the launch
   path publishes as `tokenizer`. The remaining non-publisher is
   `run_multi_detokenizer_router_process`: it *is* handed a `ServerArgs`, and uses
@@ -358,14 +364,30 @@ if you do it, say so in the test.
 
 ### Mid-resolution reads (inside the pipeline only)
 
-Resolution itself still runs in `__post_init__`: handlers and hooks read the
-in-flight state through `resolved_view(server_args)` / `self._resolved()`, fields are
-read-only during resolution, and declarations materialize once at the very end of
-`__post_init__` (gate order, last writer wins) — *then* `publish` snapshots the
-resolved values into the bags. `resolved_view` is pipeline-internal
-(`server_args.py` / `arg_groups/`, plus helpers the pipeline itself invokes
-mid-resolution, e.g. `adaptive_spec_params`); do not introduce new
-out-of-pipeline call sites.
+Resolution runs in `__post_init__` and **writes nothing onto the record**: a
+handler declares (`self._declare` / `declare_resolution`), the declaration goes
+into the stash, and the fields keep what the caller passed. So a mid-resolution
+read of a field answers with the *raw input* — every reader in the pipeline goes
+through a view instead:
+
+- `resolving_view(server_args)` / `self._resolved()` — the live view (walks the
+  stash per read). This is what handlers and hooks bind, conventionally as
+  `cfg = resolving_view(self)` at the top of the handler.
+- `resolved_view(server_args)` — snapshots the overlay when built, which is what
+  a post-process pass wants: it reads the state at *its* slot.
+
+`test_resolution_reads_the_declarations` pins direct field reads at zero over the
+two scopes it can derive exactly (every `arg_groups` function taking a config,
+every `ServerArgs` handler the dispatcher reaches). Readers the pipeline calls
+from elsewhere (`ModelConfig`, the platform defaults, the spec-algo hook) have
+moved to the view as well — a field read there is the same bug, just one the
+derivation cannot enumerate.
+
+One consequence worth knowing: because the fields are the raw input, resolving a
+bare `dataclasses.replace` copy lands in the same place as the parent —
+the pipeline no longer reads its own output. `replace_resolved` is still the way
+to copy a resolved record (it carries the declarations and the `model_config`
+memo, so the copy does not re-resolve at all).
 
 ### Adding a model-specific config adjustment
 
@@ -411,7 +433,8 @@ probes, swappable ACTIVE values. Not for config mirrors (read the bag leaf inste
 
 - Groups are typed dataclasses on `Flags` (`capture` / `moe` / `dp`): typo-safe writes,
   transactional test-only `override(**kw)` context manager.
-- `flags.moe` is materialized by `initialize_moe_config(server_args)` at scheduler init;
+- `flags.moe` is materialized by `initialize_moe_config()` at scheduler init (it
+  reads `exec.moe` / `spec` / `model`, and takes no record);
   accessors (`get_moe_a2a_backend` etc.) are thin shims with lazy defaults. The speculative
   contexts (`speculative_moe_backend_context`) swap the ACTIVE leaves around draft forwards.
 - `flags.dp` is materialized by `initialize_dp_attention`; `is_dp_attention_enabled()` is a
@@ -473,8 +496,12 @@ ONE thread — do not design for TBO threads that don't exist.
   them explicitly on the mock; `MagicMock(spec=...)` raises on attributes that only
   exist post-`__init__`, which is the fastest way to find a missed stub.
 - `reset_context()` in teardown when a test publishes outside a scoped override.
-- `ServerArgs(model_path="dummy")` early-returns `__post_init__` (no materialization, no
+- `ServerArgs(model_path="dummy")` early-returns the pipeline (few declarations, no
   strict guard) — fine for lightweight fixtures.
+- **Asserting what resolution decided reads `resolution_result(sa, "field")`**, not
+  `sa.field`: the field is the raw input. Assert the field only when the point of
+  the case *is* that the record stayed pristine (the FA4 page-size and waterfill
+  cases do exactly that, and say so).
 - **Run changed test files per-file** (own process), the way CI does: a monolithic local
   pytest run lets a context published by an earlier file mask a missing-publish bug in a
   later one.
