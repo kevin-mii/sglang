@@ -143,8 +143,6 @@ _EXPOSED = {
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
-    ("layers/cp/base.py", "attn_cp_size"),
-    ("layers/cp/base.py", "enable_prefill_cp"),
     ("parser/template_detection.py", "model_path"),
 }
 
