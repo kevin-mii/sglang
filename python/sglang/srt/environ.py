@@ -1107,6 +1107,10 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Disable the multimem all-gather fast path (fall back to NCCL). The symm-mem
+    # rendezvous can deadlock or time out when many colocated engines initialize
+    # concurrently (observed on GB300 NVL72 with 8 tp8 engines).
+    SGLANG_DISABLE_MULTIMEM_AG = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
