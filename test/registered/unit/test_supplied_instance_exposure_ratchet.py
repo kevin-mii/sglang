@@ -145,12 +145,7 @@ _EXPOSED = {
     ("entrypoints/engine.py", "tool_call_parser"),
     ("layers/cp/base.py", "attn_cp_size"),
     ("layers/cp/base.py", "enable_prefill_cp"),
-    ("layers/flashinfer_comm_fusion.py", "flashinfer_allreduce_fusion_backend"),
     ("parser/template_detection.py", "model_path"),
-    ("speculative/draft_worker_common.py", "speculative_draft_attention_backend"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
-    ("utils/hf_transformers/processor.py", "image_processor_backend"),
 }
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
@@ -175,8 +170,6 @@ _OVERRIDDEN_AND_READ = {
     ("mem_cache/unified_radix_cache.py", "hicache_storage_prefetch_policy"),
     ("mem_cache/unified_radix_cache.py", "hicache_write_policy"),
     ("parser/template_detection.py", "model_path"),
-    ("utils/common.py", "speculative_num_draft_tokens"),
-    ("utils/common.py", "speculative_num_steps"),
 }
 
 
