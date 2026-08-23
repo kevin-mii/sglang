@@ -167,13 +167,6 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 _OVERRIDDEN_AND_READ = {
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
-    ("mem_cache/kv_cache_builder.py", "hicache_storage_backend"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend"),
-    ("mem_cache/pool_host/common.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_backend_extra_config"),
-    ("mem_cache/unified_radix_cache.py", "hicache_storage_prefetch_policy"),
-    ("mem_cache/unified_radix_cache.py", "hicache_write_policy"),
     ("parser/template_detection.py", "model_path"),
 }
 
