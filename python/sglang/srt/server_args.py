@@ -9655,15 +9655,27 @@ class ServerArgs:
     @property
     def is_ep_joiner(self) -> bool:
         """True for processes launched as elastic-EP joiners."""
-        return self.ep_join_mode in ("scale", "recover")
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
+        return cfg.ep_join_mode in ("scale", "recover")
 
     @property
     def is_ep_scale_joiner(self) -> bool:
-        return self.ep_join_mode == "scale"
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
+        return cfg.ep_join_mode == "scale"
 
     @property
     def is_startup_weight_load_overlap(self) -> bool:
-        return self.startup_weight_load_mode == "overlap"
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
+        return cfg.startup_weight_load_mode == "overlap"
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
@@ -9797,20 +9809,24 @@ class ServerArgs:
         sizing fills `speculative_num_draft_tokens` in), and a cache filled that
         early would keep answering with it.
         """
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
         memo = self.__dict__.get("_max_speculative_num_draft_tokens")
         if memo is not None:
             return memo
-        if self.speculative_num_draft_tokens is None:
+        if cfg.speculative_num_draft_tokens is None:
             result = None
-        elif not self.speculative_adaptive:
-            result = self.speculative_num_draft_tokens
+        elif not cfg.speculative_adaptive:
+            result = cfg.speculative_num_draft_tokens
         else:
             from sglang.srt.speculative.adaptive_spec_params import (
                 resolve_candidate_steps_from_config,
             )
 
             candidate_steps = resolve_candidate_steps_from_config(
-                cfg_path=self.speculative_adaptive_config,
+                cfg_path=cfg.speculative_adaptive_config,
             )
             # TODO: adaptive spec currently requires topk=1, so each runtime
             # state needs steps + 1 draft-token slots. Revisit this if topk>1
@@ -9856,17 +9872,17 @@ class ServerArgs:
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
         # Reads through the declaration stash: see check_server_args.
-        resolved = resolved_view(self)
+        cfg = resolving_view(self)
 
         cp_tbo = (
             is_hip()
-            and resolved.enable_dsa_prefill_context_parallel
-            and resolved.dsa_prefill_cp_mode == "round-robin-split"
+            and cfg.enable_dsa_prefill_context_parallel
+            and cfg.dsa_prefill_cp_mode == "round-robin-split"
         )
         if (
-            resolved.enable_two_batch_overlap
-            and resolved.moe_a2a_backend == "none"
-            and not resolved.enable_dp_attention
+            cfg.enable_two_batch_overlap
+            and cfg.moe_a2a_backend == "none"
+            and not cfg.enable_dp_attention
             and not cp_tbo
         ):
             raise ValueError(
@@ -9879,25 +9895,22 @@ class ServerArgs:
         # Validation reads what resolution decided, not the fields: the
         # model-specific overrides declare into the stash without writing them
         # back, so a field read answers with the raw input.
-        resolved = resolved_view(self)
+        cfg = resolving_view(self)
 
         # Check parallel size constraints
-        if resolved.ep_join_mode != "scale":
+        if cfg.ep_join_mode != "scale":
             assert (
-                resolved.tp_size * resolved.pp_size
-            ) % resolved.nnodes == 0, "tp_size must be divisible by number of nodes"
+                cfg.tp_size * cfg.pp_size
+            ) % cfg.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         assert (
-            resolved.pp_max_micro_batch_size is None
-            or resolved.pp_max_micro_batch_size >= 1
+            cfg.pp_max_micro_batch_size is None or cfg.pp_max_micro_batch_size >= 1
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
-            f"Got: {resolved.pp_max_micro_batch_size}"
+            f"Got: {cfg.pp_max_micro_batch_size}"
         )
 
-        assert not (
-            resolved.disable_cuda_graph_padding and resolved.enable_torch_compile
-        ), (
+        assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
             "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
             "With padding disabled, every distinct batch size gets its own torch.compile + "
             "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
@@ -9905,73 +9918,67 @@ class ServerArgs:
             "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
-        if resolved.pp_size > 1:
+        if cfg.pp_size > 1:
             assert (
-                resolved.disable_overlap_schedule
-                and resolved.speculative_algorithm is None
+                cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            assert resolved.min_free_slots_delay is None, (
+            assert cfg.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
                 "pp-max-micro-batch-size, so the threshold may never be reached"
             )
 
         assert not (
-            resolved.dp_size > 1
-            and resolved.nnodes != 1
-            and not resolved.enable_dp_attention
+            cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
 
-        assert resolved.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert resolved.gpu_id_step >= 1, "gpu_id_step must be positive"
+        assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        assert resolved.moe_dense_tp_size in (
+        assert cfg.moe_dense_tp_size in (
             None,
             1,
-            resolved.tp_size,
+            cfg.tp_size,
         ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(resolved.served_model_name):
-            assert ":" not in resolved.served_model_name, (
+        if not is_runai_obj_uri(cfg.served_model_name):
+            assert ":" not in cfg.served_model_name, (
                 "served_model_name cannot contain a colon (':') character. "
                 "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-                f"Invalid value: '{resolved.served_model_name}'"
+                f"Invalid value: '{cfg.served_model_name}'"
             )
 
         # Check LoRA
         self.check_lora_server_args()
 
         # Check speculative decoding
-        if resolved.speculative_algorithm is not None:
+        if cfg.speculative_algorithm is not None:
             assert (
-                not resolved.enable_mixed_chunk
+                not cfg.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
-        if (
-            resolved.chunked_prefill_size > 0
-            and resolved.disaggregation_mode != "decode"
-        ):
+        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
-                resolved.chunked_prefill_size % resolved.page_size == 0
+                cfg.chunked_prefill_size % cfg.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
         # Check pdmux
-        if resolved.enable_pdmux:
+        if cfg.enable_pdmux:
             assert (
-                resolved.pp_size == 1
+                cfg.pp_size == 1
             ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
             assert (
-                resolved.chunked_prefill_size == -1
+                cfg.chunked_prefill_size == -1
             ), "PD-Multiplexing is not compatible with chunked prefill."
             assert (
-                resolved.disaggregation_mode == "null"
+                cfg.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
             assert (
-                resolved.disable_overlap_schedule
+                cfg.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
@@ -9984,44 +9991,39 @@ class ServerArgs:
                     "  Please manually install torch 2.6.x."
                 )
 
-        assert resolved.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
-        assert resolved.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         assert (
-            resolved.mm_processor_worker_num >= 0
+            cfg.mm_processor_worker_num >= 0
         ), "Multimodal processor worker num must >= 0"
-        assert resolved.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
+        assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
+        self.validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
         self.validate_buckets_rule(
-            "--prompt-tokens-buckets", resolved.prompt_tokens_buckets
-        )
-        self.validate_buckets_rule(
-            "--generation-tokens-buckets", resolved.generation_tokens_buckets
+            "--generation-tokens-buckets", cfg.generation_tokens_buckets
         )
 
         # Check scheduling policy
-        if resolved.enable_priority_scheduling:
-            assert resolved.schedule_policy in [
+        if cfg.enable_priority_scheduling:
+            assert cfg.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{resolved.schedule_policy}' is not supported."
-            if resolved.default_priority_value is None:
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            if cfg.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
                     "Requests without explicit priority will have priority=None, "
                     "resulting in priority='None' string labels in Prometheus metrics."
                 )
         else:
-            if resolved.disable_priority_preemption:
+            if cfg.disable_priority_preemption:
                 logger.warning(
                     "--disable-priority-preemption has no effect without --enable-priority-scheduling"
                 )
-            if resolved.default_priority_value is not None:
+            if cfg.default_priority_value is not None:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
-        if (
-            resolved.retraction_policy == "priority"
-            and not resolved.enable_priority_scheduling
-        ):
+        if cfg.retraction_policy == "priority" and not cfg.enable_priority_scheduling:
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
             )
@@ -10037,26 +10039,23 @@ class ServerArgs:
         run_post_process_pass(self, _hisparse_validation)
 
         assert (
-            resolved.schedule_conservativeness >= 0
+            cfg.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
 
-        if resolved.model_impl == "mindspore":
+        if cfg.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
         # Check metrics labels
         if (
-            not resolved.tokenizer_metrics_custom_labels_header
-            and resolved.tokenizer_metrics_allowed_custom_labels
+            not cfg.tokenizer_metrics_custom_labels_header
+            and cfg.tokenizer_metrics_allowed_custom_labels
         ):
             raise ValueError(
                 "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-custom-labels."
             )
 
         # Check metrics exporters
-        if (
-            resolved.export_metrics_to_file
-            and resolved.export_metrics_to_file_dir is None
-        ):
+        if cfg.export_metrics_to_file and cfg.export_metrics_to_file_dir is None:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
@@ -10065,71 +10064,68 @@ class ServerArgs:
         self._check_two_batch_overlap()
 
         # Check communications compression
-        if resolved.enable_quant_communications and resolved.tp_size == 1:
+        if cfg.enable_quant_communications and cfg.tp_size == 1:
             raise ValueError(
                 "Communications quantization is only used with tp_size != 1"
             )
 
-        if resolved.enable_quant_communications and resolved.device != "npu":
+        if cfg.enable_quant_communications and cfg.device != "npu":
             raise ValueError(
                 "Communications quantization is only supported for NPU device"
             )
 
         # grpc_port is None for HTTP-only launches, so the == comparison is
         # already False there; no explicit None check needed.
-        if (
-            not (resolved.smg_grpc_mode or resolved.grpc_mode)
-            and resolved.grpc_port == resolved.port
-        ):
+        if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
             raise ValueError(
-                f"--grpc-port ({resolved.grpc_port}) must differ from --port ({resolved.port})"
+                f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
             )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
         # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
         # and nccl_port have dynamic defaults that may not be resolved yet here.
 
-        if resolved.gc_threshold:
-            if not (1 <= len(resolved.gc_threshold) <= 3):
+        if cfg.gc_threshold:
+            if not (1 <= len(cfg.gc_threshold) <= 3):
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if resolved.kv_canary_sweep_interval > 0 and resolved.kv_canary == "none":
+        if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
     def check_lora_server_args(self):
         # Reads through the declaration stash: see check_server_args.
-        resolved = resolved_view(self)
+        cfg = resolving_view(self)
 
-        assert resolved.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+        assert cfg.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
-        if resolved.lora_paths:
-            if resolved.enable_lora is None:
+        if cfg.lora_paths:
+            if cfg.enable_lora is None:
                 self._late_resolution("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
-            elif resolved.enable_lora is False:
+            elif cfg.enable_lora is False:
                 logger.warning(
                     "--enable-lora is set to False, any provided lora_paths will be ignored."
                 )
 
-        if resolved.enable_lora:
-            if resolved.enable_lora_overlap_loading is None:
+        if cfg.enable_lora:
+            if cfg.enable_lora_overlap_loading is None:
                 self._late_resolution(
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
-            if resolved.enable_lora_overlap_loading:
+            if cfg.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = resolved.max_loras_per_batch * 2
+                max_loaded_loras_limit = cfg.max_loras_per_batch * 2
                 assert (
-                    resolved.max_loaded_loras is not None
-                    and resolved.max_loaded_loras <= max_loaded_loras_limit
+                    cfg.max_loaded_loras is not None
+                    and cfg.max_loaded_loras <= max_loaded_loras_limit
                 ), (
                     "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
                     f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
@@ -10139,9 +10135,9 @@ class ServerArgs:
             self._check_lora_speculative_compatibility()
 
             # Parse lora_paths
-            if isinstance(resolved.lora_paths, list):
+            if isinstance(cfg.lora_paths, list):
                 parsed_lora_paths = []
-                for lora_path in resolved.lora_paths:
+                for lora_path in cfg.lora_paths:
                     if isinstance(lora_path, str):
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
@@ -10179,7 +10175,7 @@ class ServerArgs:
                 self._late_resolution(
                     "check_lora_server_args", lora_paths=parsed_lora_paths
                 )
-            elif isinstance(resolved.lora_paths, dict):
+            elif isinstance(cfg.lora_paths, dict):
                 self._late_resolution(
                     "check_lora_server_args",
                     lora_paths=[
@@ -10189,60 +10185,56 @@ class ServerArgs:
                             lora_path=v,
                             pinned=False,
                         )
-                        for k, v in resolved.lora_paths.items()
+                        for k, v in cfg.lora_paths.items()
                     ],
                 )
-            elif resolved.lora_paths is None:
+            elif cfg.lora_paths is None:
                 self._late_resolution("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
-                    f"Invalid type for --lora-paths: {type(resolved.lora_paths)}. "
+                    f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
 
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
-            if resolved.lora_target_modules:
+            if cfg.lora_target_modules:
                 self._late_resolution(
                     "check_lora_server_args",
-                    lora_target_modules=set(resolved.lora_target_modules),
+                    lora_target_modules=set(cfg.lora_target_modules),
                 )
-                if "all" in resolved.lora_target_modules:
+                if "all" in cfg.lora_target_modules:
                     assert (
-                        len(resolved.lora_target_modules) == 1
+                        len(cfg.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
 
             # Ensure sufficient information is provided for LoRA initialization.
-            assert resolved.lora_paths or (
-                resolved.max_lora_rank and resolved.lora_target_modules
+            assert cfg.lora_paths or (
+                cfg.max_lora_rank and cfg.lora_target_modules
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
             # Validate max_loaded_loras
-            if resolved.max_loaded_loras is not None:
-                assert resolved.max_loaded_loras >= resolved.max_loras_per_batch, (
+            if cfg.max_loaded_loras is not None:
+                assert cfg.max_loaded_loras >= cfg.max_loras_per_batch, (
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
-                    f"max_loaded_loras={resolved.max_loaded_loras}, max_loras_per_batch={resolved.max_loras_per_batch}"
+                    f"max_loaded_loras={cfg.max_loaded_loras}, max_loras_per_batch={cfg.max_loras_per_batch}"
                 )
-                assert len(resolved.lora_paths) <= resolved.max_loaded_loras, (
+                assert len(cfg.lora_paths) <= cfg.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={resolved.max_loaded_loras}, lora_paths={len(resolved.lora_paths)}"
+                    f"max_loaded_loras={cfg.max_loaded_loras}, lora_paths={len(cfg.lora_paths)}"
                 )
 
-            if resolved.max_lora_chunk_size is not None:
+            if cfg.max_lora_chunk_size is not None:
                 assert (
-                    16 <= resolved.max_lora_chunk_size <= 128
-                    and (
-                        resolved.max_lora_chunk_size
-                        & (resolved.max_lora_chunk_size - 1)
-                    )
-                    == 0
+                    16 <= cfg.max_lora_chunk_size <= 128
+                    and (cfg.max_lora_chunk_size & (cfg.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
-            if resolved.lora_use_virtual_experts:
+            if cfg.lora_use_virtual_experts:
                 logger.info("Virtual expert computation enabled.")
 
             assert (
-                resolved.lora_drain_wait_threshold >= 0.0
+                cfg.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
 
     def _check_lora_speculative_compatibility(self):
@@ -10502,7 +10494,7 @@ class ServerArgs:
 
         # Through the stash: `page_size` is resolved by declaration, so the
         # field still holds whatever the operator passed (usually None).
-        resolved = resolved_view(self)
+        resolved = resolving_view(self)
         raw = resolved.kv_events_config
         page_size = resolved.page_size
         if not raw or page_size is None or page_size <= 0:
@@ -10544,10 +10536,18 @@ class ServerArgs:
         return cfg.expert_balancedness_report_mode != "off"
 
     def should_log_expert_balancedness_to_server_log(self) -> bool:
-        return self.expert_balancedness_report_mode in ("server_log", "both")
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
+        return cfg.expert_balancedness_report_mode in ("server_log", "both")
 
     def should_export_expert_balancedness_to_prometheus(self) -> bool:
-        return self.expert_balancedness_report_mode in ("prometheus", "both")
+        # Through the declarations: a declaration-only resolver leaves the
+        # field holding the raw input.
+        cfg = resolving_view(self)
+
+        return cfg.expert_balancedness_report_mode in ("prometheus", "both")
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
