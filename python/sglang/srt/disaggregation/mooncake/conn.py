@@ -1189,7 +1189,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
-            and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().config.enable_dsa_cache_layer_split
         ):
             skip_state = True
 

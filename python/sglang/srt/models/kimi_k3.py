@@ -116,7 +116,6 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
     get_server_args,
@@ -2789,7 +2788,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -3289,7 +3288,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().config.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

@@ -100,9 +100,6 @@ from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
-    configured_attn_cp_size,
-    configured_moe_dp_size,
-    configured_pp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -347,7 +344,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().dp_size
+            dp_size = get_parallel().config.dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -672,7 +669,7 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if get_parallel().dp_size > 1:
+        if get_parallel().config.dp_size > 1:
             raise ValueError(
                 "Weight cache daemon mode does not support dp_size > 1. "
                 "Please set --dp-size 1 when using --weight-cache-mode daemon."
@@ -692,7 +689,7 @@ class Engine(EngineScoreMixin, EngineBase):
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                configured_pp_size(),
+                get_parallel().config.pp_size,
                 tp_size,
                 server_args.node_rank,
             )
@@ -756,13 +753,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     "--tp-rank",
                     str(tp_rank),
                     "--pp-size",
-                    str(configured_pp_size()),
+                    str(get_parallel().config.pp_size),
                     "--pp-rank",
                     str(pp_rank),
                     "--dp-size",
                     "1",
                     "--ep-size",
-                    str(get_parallel().ep_size),
+                    str(get_parallel().config.ep_size),
                     "--load-format",
                     get_model().load_format,
                     "--dtype",
@@ -874,7 +871,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().config.dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -887,7 +884,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,
-                    configured_pp_size(),
+                    get_parallel().config.pp_size,
                     server_args.tp_size,
                     server_args.node_rank,
                 )
@@ -1887,10 +1884,14 @@ def _compute_parallelism_ranks(
     Called while the launcher is deciding what to spawn, so the sizes are the
     configured ones -- the groups this is laying out do not exist yet.
     """
-    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
+    attn_dp_size = (
+        get_parallel().config.dp_size
+        if get_parallel().config.enable_dp_attention
+        else 1
+    )
     tp_size = server_args.tp_size
-    attn_cp_size = configured_attn_cp_size()
-    moe_dp_size = configured_moe_dp_size()
+    attn_cp_size = get_parallel().config.attn_cp_size
+    moe_dp_size = get_parallel().config.moe_dp_size
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
@@ -1901,6 +1902,6 @@ def _compute_parallelism_ranks(
     moe_ep_rank = (
         tp_rank
         % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().ep_size)
+        // (tp_size // moe_dp_size // get_parallel().config.ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank

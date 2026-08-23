@@ -489,7 +489,7 @@ class IpcModelLoader(BaseModelLoader):
 
             ep_size = ps.moe_ep_size
 
-            dp_size = get_parallel().dp_size
+            dp_size = get_parallel().config.dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
