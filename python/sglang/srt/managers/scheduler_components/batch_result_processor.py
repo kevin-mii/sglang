@@ -280,7 +280,6 @@ class SchedulerBatchResultProcessor:
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
-                self.server_args,
             )
 
             # Check finish conditions
@@ -617,10 +616,7 @@ class SchedulerBatchResultProcessor:
             )
 
     @staticmethod
-    def _get_prefill_hidden_capture_mode(
-        batch: ScheduleBatch,
-        server_args: ServerArgs,
-    ) -> CaptureHiddenMode:
+    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,

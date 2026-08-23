@@ -141,7 +141,6 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         def effective(*, is_draft_worker, passed=None):
             return resolve_draft_attention_backend(
                 draft_attention_backend=passed,
-                server_args=server_args,
                 is_draft_worker=is_draft_worker,
             )
 
