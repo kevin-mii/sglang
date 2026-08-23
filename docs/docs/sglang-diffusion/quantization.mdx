@@ -175,6 +175,14 @@ backend.
       <td>CUDA; auto-detected; uses the fused Kitchen INT8 kernel and validates weight/scale layout before model construction. TP requires every row-parallel input shard to preserve the checkpoint's ConvRot group boundary. The H3 256-group DiT supports TP1/2/4, not TP8; its Qwen3-VL encoder keeps TP8 by replicating only incompatible row projections. Offload is supported; FSDP is not.</td>
     </tr>
     <tr>
+      <td><code>quanto-int8</code></td>
+      <td>One native encoder safetensors file with an embedded Quanto quantization map</td>
+      <td>An explicit weight file through <code>--component-paths.&lt;component&gt;</code></td>
+      <td>Native encoders whose mapped linear layers consume every declared qint8 entry; MiniMax-H3's Qwen3-VL encoder is supported</td>
+      <td>None</td>
+      <td>Auto-detected weight-only qint8 storage. Each active matrix is dequantized to the compute dtype for the ordinary linear operation, so this reduces stored/resident weight memory rather than promising INT8 GEMM speed. TP and offload are supported; FSDP is not.</td>
+    </tr>
+    <tr>
       <td><code>qvg-kv</code></td>
       <td>Unquantized model with runtime causal KV-cache compression</td>
       <td><code>--kv-cache-quant &#123;int4,int2&#125;</code></td>
