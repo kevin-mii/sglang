@@ -766,10 +766,18 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
         server_args.resolve_once()
         return server_args
 
-    def test_a_bare_replace_would_resolve_a_second_time(self):
-        """Why the helper exists. If this stops drifting, the pipeline became
-        idempotent and the helper's reason is gone -- read it again before
-        deleting either."""
+    def test_a_bare_replace_resolves_again_and_lands_in_the_same_place(self):
+        """The drift is gone, and this is why: the fields are the raw input.
+
+        `dataclasses.replace` copies the fields, so a bare copy re-runs
+        resolution over the *same input* the parent got rather than over the
+        parent's output -- the DP-attention halving and the conservativeness
+        scaling apply once, not twice. That is what the record holding only raw
+        input buys, and it retires the drift `replace_resolved` was written to
+        avoid. What the helper still buys is not resolving at all: it carries
+        the parent's declarations and its `model_config`, so the copy answers
+        without re-deriving anything.
+        """
         parent = self._resolved()
         bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
@@ -777,14 +785,21 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             "a bare replace carried the flag; then this test proves nothing",
         )
         bare.resolve_once()
+        drifted = {
+            field.name: (
+                resolution_result(parent, field.name),
+                resolution_result(bare, field.name),
+            )
+            for field in dataclasses.fields(parent)
+            if field.name not in ("dist_init_addr", "random_seed")
+            and repr(resolution_result(parent, field.name))
+            != repr(resolution_result(bare, field.name))
+        }
         self.assertEqual(
-            (bare.chunked_prefill_size, round(bare.schedule_conservativeness, 4)),
-            (
-                parent.chunked_prefill_size // 2,
-                round(parent.schedule_conservativeness * 0.3, 4),
-            ),
-            "the second pass no longer drifts; this is the drift the copy "
-            "helper exists to avoid",
+            drifted,
+            {},
+            "resolving a bare copy landed somewhere else, so the pipeline is "
+            "reading its own output again",
         )
 
     def test_replace_resolved_keeps_the_parents_resolution(self):
