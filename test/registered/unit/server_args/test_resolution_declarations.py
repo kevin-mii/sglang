@@ -376,6 +376,34 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(differences),
         )
 
+    def test_the_whole_object_readback_carries_only_fields(self):
+        """`/server_info` and its gRPC and in-process twins report
+        `ServerArgs.resolved_dict()`.
+
+        Two shapes preceded it. `dataclasses.asdict` reads the fields, which
+        carry resolution's result only while declarations materialize onto the
+        record. `vars()` -- what the scheduler's internal-state dump used --
+        carried the fields *plus* the resolution bookkeeping (`_raw_input`, the
+        declaration stash, the materialization marker) and the `ModelConfig`
+        memo, none of which is configuration and all of which crossed IPC into
+        the readback.
+        """
+        server_args = self._resolve({"tp_size": 2})
+        dump = server_args.resolved_dict()
+        self.assertEqual(
+            sorted(dump),
+            sorted(field.name for field in dataclasses.fields(server_args)),
+            "the readback dump is no longer exactly the fields",
+        )
+        leaked = sorted(
+            name
+            for name in vars(server_args)
+            if name not in dump and not name.startswith("__")
+        )
+        self.assertNotEqual(
+            leaked, [], "nothing to leak any more -- this check is now vacuous"
+        )
+
     def test_every_published_leaf_is_what_resolution_decided(self):
         """One hop further than the check above: the leaf a reader reads.
 
