@@ -135,11 +135,6 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
 _EXPOSED = {
-    ("configs/embedding_model_spec.py", "chunked_prefill_size"),
-    ("configs/embedding_model_spec.py", "cuda_graph_config"),
-    ("configs/embedding_model_spec.py", "disable_radix_cache"),
-    ("configs/embedding_model_spec.py", "is_embedding"),
-    ("configs/embedding_model_spec.py", "prefill_only_disable_kv_cache"),
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
