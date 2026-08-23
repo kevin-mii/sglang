@@ -522,8 +522,6 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
     swap under the speculative contexts and restore on exit."""
 
     def _init(self, **kw):
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.utils import initialize_moe_config
 
         defaults = dict(
@@ -541,7 +539,12 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             disable_shared_experts_fusion=False,
         )
         defaults.update(kw)
-        initialize_moe_config(SimpleNamespace(**defaults))
+        # The flags are seeded from the bags now, so the test publishes a
+        # config carrying these values instead of handing over a stand-in.
+        override = get_context().override_server_args(**defaults)
+        override.install()
+        self.addCleanup(override.restore)
+        initialize_moe_config()
 
     def test_lazy_defaults_before_initialize(self):
         from sglang.srt.layers.moe.utils import (

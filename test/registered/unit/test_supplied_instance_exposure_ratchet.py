@@ -139,11 +139,6 @@ _EXPOSED = {
     ("dllm/config.py", "model_path"),
     ("multimodal/processors/base_processor.py", "image_processor_backend"),
     ("speculative/spec_registry.py", "disable_overlap_schedule"),
-    ("layers/moe/utils.py", "deepep_mode"),
-    ("layers/moe/utils.py", "moe_a2a_backend"),
-    ("layers/moe/utils.py", "moe_runner_backend"),
-    ("layers/moe/utils.py", "quantization"),
-    ("layers/moe/utils.py", "speculative_moe_runner_backend"),
     ("configs/embedding_model_spec.py", "chunked_prefill_size"),
     ("configs/embedding_model_spec.py", "cuda_graph_config"),
     ("configs/embedding_model_spec.py", "disable_radix_cache"),
@@ -591,9 +586,9 @@ class TestSuppliedInstanceExposure(CustomTestCase):
 
         ``MODEL_OVERRIDES`` maps arch -> {field: value}, and the
         ``@register_model_override``(-``_predicate``) providers return (or
-        build by subscript) {field: value} dicts; ``materialize_declarations``
-        applies them all via setattr, so no assignment scan sees these writes
-        and a llama-only matrix never triggers them. Keys must be
+        build by subscript) {field: value} dicts, which go straight into the
+        declaration stash, so no assignment scan sees these writes and a
+        llama-only matrix never triggers them. Keys must be
         string literals; anything else fails loudly.
         """
         tree = ast.parse(

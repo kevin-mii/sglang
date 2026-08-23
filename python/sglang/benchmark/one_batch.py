@@ -887,7 +887,7 @@ def latency_test(
     # tp_size == 1 and spawns it per rank otherwise, and a spawned child
     # receives the record with nothing published.
     publish(server_args, role="scheduler")
-    initialize_moe_config(server_args)
+    initialize_moe_config()
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
 

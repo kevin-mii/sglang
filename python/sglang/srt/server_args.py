@@ -3664,7 +3664,7 @@ class ServerArgs:
         arrived by pickle and brought its declarations along, so the child has
         nothing left to derive and projects what the parent decided.
         """
-        if getattr(self, "_declarations_materialized", False):
+        if getattr(self, "_resolution_finished", False):
             return
         if getattr(self, "_resolution_failed", False):
             raise RuntimeError(
@@ -3683,7 +3683,7 @@ class ServerArgs:
         # Set here too, because the dummy/absent-model path returns before the
         # materialization that normally sets it: the gate is about whether the
         # handlers ran, not how far they got.
-        self._declarations_materialized = True
+        self._resolution_finished = True
 
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
@@ -3725,7 +3725,7 @@ class ServerArgs:
         copy's deep structure in-process mutates the parent's too.
         """
         replacement = dataclasses.replace(self, **changes)
-        if not getattr(self, "_declarations_materialized", False):
+        if not getattr(self, "_resolution_finished", False):
             # Not resolved yet: the copy goes through the gate itself.
             return replacement
 
@@ -3735,7 +3735,7 @@ class ServerArgs:
         # (the read-only guard refuses the write).
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
-            if name in field_names or name == "_declarations_materialized":
+            if name in field_names or name == "_resolution_finished":
                 continue
             if isinstance(value, (dict, list, set)):
                 value = copy.copy(value)
@@ -3746,7 +3746,7 @@ class ServerArgs:
             object.__setattr__(replacement, "_resolved_overrides", stash)
         if changes:
             stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_declarations_materialized", True)
+        object.__setattr__(replacement, "_resolution_finished", True)
         return replacement
 
     def _declare(self, source: str, **fields: Any) -> None:
@@ -3971,13 +3971,11 @@ class ServerArgs:
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
 
-        # End of resolution: apply the accumulated declarations onto the
-        # fields once (gate order). From here on server_args carries the
-        # resolved configuration — post-init readers, in any process, read
-        # the fields directly.
-        from sglang.srt.arg_groups.overrides import materialize_declarations
-
-        materialize_declarations(self)
+        # End of resolution. The declarations stay in the stash: a resolver
+        # that only declares (a model-specific override, a registry entry)
+        # leaves the field holding what the operator passed, and the config
+        # bags -- projected from the stash -- carry what resolution decided.
+        self._resolution_finished = True
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -9670,7 +9668,7 @@ class ServerArgs:
         # get_context().override(source, ...); a value one runner or worker
         # owns travels as a constructor argument to it.
         if (
-            getattr(self, "_declarations_materialized", False)
+            getattr(self, "_resolution_finished", False)
             and not getattr(self, "_internal_write", False)
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
@@ -9692,7 +9690,13 @@ class ServerArgs:
         return attention_backends_of(resolved_view(self))
 
     def get_attention_backends(self):
-        return attention_backends_of(self)
+        """The (prefill, decode) pair resolution decided.
+
+        Reads through the declaration stash, not the fields: the model-specific
+        overrides declare into the stash without writing the fields, so a field
+        read answers with what the operator typed.
+        """
+        return attention_backends_of(resolved_view(self))
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
@@ -9741,7 +9745,7 @@ class ServerArgs:
             # state needs steps + 1 draft-token slots. Revisit this if topk>1
             # is supported.
             result = max(candidate_steps) + 1
-        if getattr(self, "_declarations_materialized", False):
+        if getattr(self, "_resolution_finished", False):
             object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
         return result
 
@@ -9770,7 +9774,7 @@ class ServerArgs:
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
-            if not getattr(self, "_declarations_materialized", False):
+            if not getattr(self, "_resolution_finished", False):
                 return max(chunk_size, page_size)
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
@@ -9780,15 +9784,18 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
+        # Reads through the declaration stash: see check_server_args.
+        resolved = resolved_view(self)
+
         cp_tbo = (
             is_hip()
-            and self.enable_dsa_prefill_context_parallel
-            and self.dsa_prefill_cp_mode == "round-robin-split"
+            and resolved.enable_dsa_prefill_context_parallel
+            and resolved.dsa_prefill_cp_mode == "round-robin-split"
         )
         if (
-            self.enable_two_batch_overlap
-            and self.moe_a2a_backend == "none"
-            and not self.enable_dp_attention
+            resolved.enable_two_batch_overlap
+            and resolved.moe_a2a_backend == "none"
+            and not resolved.enable_dp_attention
             and not cp_tbo
         ):
             raise ValueError(
@@ -9798,20 +9805,28 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        # Validation reads what resolution decided, not the fields: the
+        # model-specific overrides declare into the stash without writing them
+        # back, so a field read answers with the raw input.
+        resolved = resolved_view(self)
+
         # Check parallel size constraints
-        if self.ep_join_mode != "scale":
+        if resolved.ep_join_mode != "scale":
             assert (
-                self.tp_size * self.pp_size
-            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+                resolved.tp_size * resolved.pp_size
+            ) % resolved.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         assert (
-            self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
+            resolved.pp_max_micro_batch_size is None
+            or resolved.pp_max_micro_batch_size >= 1
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
-            f"Got: {self.pp_max_micro_batch_size}"
+            f"Got: {resolved.pp_max_micro_batch_size}"
         )
 
-        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+        assert not (
+            resolved.disable_cuda_graph_padding and resolved.enable_torch_compile
+        ), (
             "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
             "With padding disabled, every distinct batch size gets its own torch.compile + "
             "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
@@ -9819,67 +9834,73 @@ class ServerArgs:
             "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
-        if self.pp_size > 1:
+        if resolved.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                resolved.disable_overlap_schedule
+                and resolved.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            assert self.min_free_slots_delay is None, (
+            assert resolved.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
                 "pp-max-micro-batch-size, so the threshold may never be reached"
             )
 
         assert not (
-            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
+            resolved.dp_size > 1
+            and resolved.nnodes != 1
+            and not resolved.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
 
-        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        assert resolved.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert resolved.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        assert self.moe_dense_tp_size in (
+        assert resolved.moe_dense_tp_size in (
             None,
             1,
-            self.tp_size,
+            resolved.tp_size,
         ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(self.served_model_name):
-            assert ":" not in self.served_model_name, (
+        if not is_runai_obj_uri(resolved.served_model_name):
+            assert ":" not in resolved.served_model_name, (
                 "served_model_name cannot contain a colon (':') character. "
                 "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-                f"Invalid value: '{self.served_model_name}'"
+                f"Invalid value: '{resolved.served_model_name}'"
             )
 
         # Check LoRA
         self.check_lora_server_args()
 
         # Check speculative decoding
-        if self.speculative_algorithm is not None:
+        if resolved.speculative_algorithm is not None:
             assert (
-                not self.enable_mixed_chunk
+                not resolved.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
-        if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+        if (
+            resolved.chunked_prefill_size > 0
+            and resolved.disaggregation_mode != "decode"
+        ):
             assert (
-                self.chunked_prefill_size % self.page_size == 0
+                resolved.chunked_prefill_size % resolved.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
         # Check pdmux
-        if self.enable_pdmux:
+        if resolved.enable_pdmux:
             assert (
-                self.pp_size == 1
+                resolved.pp_size == 1
             ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
             assert (
-                self.chunked_prefill_size == -1
+                resolved.chunked_prefill_size == -1
             ), "PD-Multiplexing is not compatible with chunked prefill."
             assert (
-                self.disaggregation_mode == "null"
+                resolved.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
             assert (
-                self.disable_overlap_schedule
+                resolved.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
@@ -9892,41 +9913,44 @@ class ServerArgs:
                     "  Please manually install torch 2.6.x."
                 )
 
-        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
-        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert resolved.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert resolved.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         assert (
-            self.mm_processor_worker_num >= 0
+            resolved.mm_processor_worker_num >= 0
         ), "Multimodal processor worker num must >= 0"
-        assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
+        assert resolved.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
         self.validate_buckets_rule(
-            "--prompt-tokens-buckets", self.prompt_tokens_buckets
+            "--prompt-tokens-buckets", resolved.prompt_tokens_buckets
         )
         self.validate_buckets_rule(
-            "--generation-tokens-buckets", self.generation_tokens_buckets
+            "--generation-tokens-buckets", resolved.generation_tokens_buckets
         )
 
         # Check scheduling policy
-        if self.enable_priority_scheduling:
-            assert self.schedule_policy in [
+        if resolved.enable_priority_scheduling:
+            assert resolved.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
-            if self.default_priority_value is None:
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{resolved.schedule_policy}' is not supported."
+            if resolved.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
                     "Requests without explicit priority will have priority=None, "
                     "resulting in priority='None' string labels in Prometheus metrics."
                 )
         else:
-            if self.disable_priority_preemption:
+            if resolved.disable_priority_preemption:
                 logger.warning(
                     "--disable-priority-preemption has no effect without --enable-priority-scheduling"
                 )
-            if self.default_priority_value is not None:
+            if resolved.default_priority_value is not None:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
-        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
+        if (
+            resolved.retraction_policy == "priority"
+            and not resolved.enable_priority_scheduling
+        ):
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
             )
@@ -9942,23 +9966,26 @@ class ServerArgs:
         run_post_process_pass(self, _hisparse_validation)
 
         assert (
-            self.schedule_conservativeness >= 0
+            resolved.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
 
-        if self.model_impl == "mindspore":
+        if resolved.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
         # Check metrics labels
         if (
-            not self.tokenizer_metrics_custom_labels_header
-            and self.tokenizer_metrics_allowed_custom_labels
+            not resolved.tokenizer_metrics_custom_labels_header
+            and resolved.tokenizer_metrics_allowed_custom_labels
         ):
             raise ValueError(
                 "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-custom-labels."
             )
 
         # Check metrics exporters
-        if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
+        if (
+            resolved.export_metrics_to_file
+            and resolved.export_metrics_to_file_dir is None
+        ):
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
@@ -9967,65 +9994,71 @@ class ServerArgs:
         self._check_two_batch_overlap()
 
         # Check communications compression
-        if self.enable_quant_communications and self.tp_size == 1:
+        if resolved.enable_quant_communications and resolved.tp_size == 1:
             raise ValueError(
                 "Communications quantization is only used with tp_size != 1"
             )
 
-        if self.enable_quant_communications and self.device != "npu":
+        if resolved.enable_quant_communications and resolved.device != "npu":
             raise ValueError(
                 "Communications quantization is only supported for NPU device"
             )
 
         # grpc_port is None for HTTP-only launches, so the == comparison is
         # already False there; no explicit None check needed.
-        if not (self.smg_grpc_mode or self.grpc_mode) and self.grpc_port == self.port:
+        if (
+            not (resolved.smg_grpc_mode or resolved.grpc_mode)
+            and resolved.grpc_port == resolved.port
+        ):
             raise ValueError(
-                f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
+                f"--grpc-port ({resolved.grpc_port}) must differ from --port ({resolved.port})"
             )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
         # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
         # and nccl_port have dynamic defaults that may not be resolved yet here.
 
-        if self.gc_threshold:
-            if not (1 <= len(self.gc_threshold) <= 3):
+        if resolved.gc_threshold:
+            if not (1 <= len(resolved.gc_threshold) <= 3):
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
+        if resolved.kv_canary_sweep_interval > 0 and resolved.kv_canary == "none":
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
     def check_lora_server_args(self):
-        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+        # Reads through the declaration stash: see check_server_args.
+        resolved = resolved_view(self)
+
+        assert resolved.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
-        if self.lora_paths:
-            if self.enable_lora is None:
+        if resolved.lora_paths:
+            if resolved.enable_lora is None:
                 self._late_resolution("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
-            elif self.enable_lora is False:
+            elif resolved.enable_lora is False:
                 logger.warning(
                     "--enable-lora is set to False, any provided lora_paths will be ignored."
                 )
 
-        if self.enable_lora:
-            if self.enable_lora_overlap_loading is None:
+        if resolved.enable_lora:
+            if resolved.enable_lora_overlap_loading is None:
                 self._late_resolution(
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
-            if self.enable_lora_overlap_loading:
+            if resolved.enable_lora_overlap_loading:
                 # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = self.max_loras_per_batch * 2
+                max_loaded_loras_limit = resolved.max_loras_per_batch * 2
                 assert (
-                    self.max_loaded_loras is not None
-                    and self.max_loaded_loras <= max_loaded_loras_limit
+                    resolved.max_loaded_loras is not None
+                    and resolved.max_loaded_loras <= max_loaded_loras_limit
                 ), (
                     "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
                     f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
@@ -10035,9 +10068,9 @@ class ServerArgs:
             self._check_lora_speculative_compatibility()
 
             # Parse lora_paths
-            if isinstance(self.lora_paths, list):
+            if isinstance(resolved.lora_paths, list):
                 parsed_lora_paths = []
-                for lora_path in self.lora_paths:
+                for lora_path in resolved.lora_paths:
                     if isinstance(lora_path, str):
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
@@ -10075,7 +10108,7 @@ class ServerArgs:
                 self._late_resolution(
                     "check_lora_server_args", lora_paths=parsed_lora_paths
                 )
-            elif isinstance(self.lora_paths, dict):
+            elif isinstance(resolved.lora_paths, dict):
                 self._late_resolution(
                     "check_lora_server_args",
                     lora_paths=[
@@ -10085,56 +10118,60 @@ class ServerArgs:
                             lora_path=v,
                             pinned=False,
                         )
-                        for k, v in self.lora_paths.items()
+                        for k, v in resolved.lora_paths.items()
                     ],
                 )
-            elif self.lora_paths is None:
+            elif resolved.lora_paths is None:
                 self._late_resolution("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
-                    f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
+                    f"Invalid type for --lora-paths: {type(resolved.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
 
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
-            if self.lora_target_modules:
+            if resolved.lora_target_modules:
                 self._late_resolution(
                     "check_lora_server_args",
-                    lora_target_modules=set(self.lora_target_modules),
+                    lora_target_modules=set(resolved.lora_target_modules),
                 )
-                if "all" in self.lora_target_modules:
+                if "all" in resolved.lora_target_modules:
                     assert (
-                        len(self.lora_target_modules) == 1
+                        len(resolved.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
 
             # Ensure sufficient information is provided for LoRA initialization.
-            assert self.lora_paths or (
-                self.max_lora_rank and self.lora_target_modules
+            assert resolved.lora_paths or (
+                resolved.max_lora_rank and resolved.lora_target_modules
             ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
             # Validate max_loaded_loras
-            if self.max_loaded_loras is not None:
-                assert self.max_loaded_loras >= self.max_loras_per_batch, (
+            if resolved.max_loaded_loras is not None:
+                assert resolved.max_loaded_loras >= resolved.max_loras_per_batch, (
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
-                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
+                    f"max_loaded_loras={resolved.max_loaded_loras}, max_loras_per_batch={resolved.max_loras_per_batch}"
                 )
-                assert len(self.lora_paths) <= self.max_loaded_loras, (
+                assert len(resolved.lora_paths) <= resolved.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                    f"max_loaded_loras={resolved.max_loaded_loras}, lora_paths={len(resolved.lora_paths)}"
                 )
 
-            if self.max_lora_chunk_size is not None:
+            if resolved.max_lora_chunk_size is not None:
                 assert (
-                    16 <= self.max_lora_chunk_size <= 128
-                    and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
+                    16 <= resolved.max_lora_chunk_size <= 128
+                    and (
+                        resolved.max_lora_chunk_size
+                        & (resolved.max_lora_chunk_size - 1)
+                    )
+                    == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
-            if self.lora_use_virtual_experts:
+            if resolved.lora_use_virtual_experts:
                 logger.info("Virtual expert computation enabled.")
 
             assert (
-                self.lora_drain_wait_threshold >= 0.0
+                resolved.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
 
     def _check_lora_speculative_compatibility(self):
@@ -10390,8 +10427,11 @@ class ServerArgs:
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import KVEventsConfig
 
-        raw = self.kv_events_config
-        page_size = self.page_size
+        # Through the stash: `page_size` is resolved by declaration, so the
+        # field still holds whatever the operator passed (usually None).
+        resolved = resolved_view(self)
+        raw = resolved.kv_events_config
+        page_size = resolved.page_size
         if not raw or page_size is None or page_size <= 0:
             return None
         try:
@@ -10422,8 +10462,8 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": self.kv_event_block_size,
-            "dp_size": self.dp_size,
+            "block_size": resolved.kv_event_block_size,
+            "dp_size": resolved.dp_size,
         }
 
     def should_report_expert_balancedness(self) -> bool:
