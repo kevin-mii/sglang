@@ -18,6 +18,10 @@ class WeightLoadPlan:
     defer_cpu_placement: bool = False
     # keep the complete mapped checkpoint state dict on the load device
     load_full_state_dict_on_device: bool = False
+    # Attempt to bind weights to checkpoint-mmap views instead of materializing
+    # them (distributed layerwise offload); falls back to the ordinary loader
+    # when the preflight proves the checkpoint incompatible.
+    try_checkpoint_mmap: bool = False
 
     @classmethod
     def for_component(
@@ -28,6 +32,7 @@ class WeightLoadPlan:
         component_starts_on_cpu: bool,
         load_full_state_dict_on_device: bool = False,
         mps_layerwise_cpu_staging: bool = False,
+        try_checkpoint_mmap: bool = False,
     ) -> "WeightLoadPlan":
         # if on-device weight postprocessing is required, load directly to device to speedup loading
         weight_postprocess_device = (
@@ -41,4 +46,5 @@ class WeightLoadPlan:
             ),
             load_full_state_dict_on_device=load_full_state_dict_on_device,
             mps_layerwise_cpu_staging=mps_layerwise_cpu_staging,
+            try_checkpoint_mmap=try_checkpoint_mmap,
         )

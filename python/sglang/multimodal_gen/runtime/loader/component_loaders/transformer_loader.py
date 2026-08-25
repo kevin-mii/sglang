@@ -412,6 +412,17 @@ class TransformerLoader(ComponentLoader):
             raise ValueError(
                 "--direct-gpu-weight-loading supports only unquantized DiT checkpoints"
             )
+        # Distributed layerwise offload prefers checkpoint-mmap host weights:
+        # every load-path feature that rewrites weight bytes must be absent,
+        # and the per-tensor preflight inside the loader stays fail-closed.
+        try_checkpoint_mmap = bool(
+            component_server_args.enable_distributed_layerwise_offload
+            and component_server_args.is_dit_layerwise_offload_selected
+            and quant_spec.runtime_quant_config is None
+            and not quant_spec.post_load_hooks
+            and not component_server_args.use_fsdp_inference
+            and not direct_gpu_weight_loading
+        )
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
@@ -420,6 +431,7 @@ class TransformerLoader(ComponentLoader):
             mps_layerwise_cpu_staging=bool(
                 cpu_offload_flag and current_platform.is_mps()
             ),
+            try_checkpoint_mmap=try_checkpoint_mmap,
         )
         if direct_gpu_weight_loading:
             logger.warning(

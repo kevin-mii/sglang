@@ -405,6 +405,8 @@ class LayerwiseOffloadManager:
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
         self._configured = False
+        self.device = None
+        self.copy_stream = None
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
@@ -419,6 +421,7 @@ class LayerwiseOffloadManager:
         self.copy_stream = (
             None if self._synchronous_mps else torch.get_device_module().Stream()
         )
+        self._init_transfer_resources()
 
         # ``named_parameters()`` is relative to ``model``, just like the path in
         # ``layers_attr_str``. Anchor the match so a manager for top-level
@@ -695,6 +698,7 @@ class LayerwiseOffloadManager:
                 local_tensor.dtype, []
             ).append((name, tensor))
 
+        self._validate_storage_support()
         layer_hosting = self._plan_layer_hosting(layer_groups)
 
         # 2. concat and offload (in pinned memory)
@@ -782,22 +786,24 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                # create concatenated CPU buffer (in pinned memory)
-                cpu_buffer = torch.empty(
-                    total_numel, dtype=dtype, pin_memory=pin_this_layer
+                # Persist the layer group's host bytes. Metadata offsets always
+                # refer to the FULL flat buffer, so subclasses can change where
+                # the bytes live without changing how parameters are rebound.
+                self._store_layer_group(
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    contiguous_weights=contiguous_weights,
+                    aligned_offsets=aligned_offsets,
+                    total_numel=total_numel,
+                    pin_memory=pin_this_layer,
                 )
 
-                # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
                     current_offset = aligned_offsets[name]
-                    numel = local_weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
-                        local_weight.flatten()
-                    )
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
-                        "numel": numel,
+                        "numel": local_weight.numel(),
                         "shape": local_weight.shape,
                         "stride": local_weight.stride(),
                         "preserve_strides": False,
@@ -807,9 +813,7 @@ class LayerwiseOffloadManager:
                         weight, dtype
                     )
 
-                    current_offset += numel
-
-                self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+        self._post_initialize_storage()
 
     def _finalize_initialization(self) -> None:
         # prefetch the head of the stream for warm-up; residency is not armed
@@ -868,6 +872,54 @@ class LayerwiseOffloadManager:
             f"Initialized synchronous MPS layerwise offload with {self.num_layers} layers"
         )
 
+    def _validate_storage_support(self) -> None:
+        """Reject unsupported weight kinds; the base manager supports all."""
+
+    def _init_transfer_resources(self) -> None:
+        """Hook for extra transfer resources (streams, device slots).
+
+        The base manager needs nothing beyond the copy stream created above;
+        the distributed subclass adds its comm stream and bounded-slot config.
+        """
+
+    def _store_layer_group(
+        self,
+        *,
+        layer_idx: int,
+        dtype: torch.dtype,
+        contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]],
+        aligned_offsets: Dict[str, int],
+        total_numel: int,
+        pin_memory: bool,
+    ) -> None:
+        """Persist one (layer, dtype) group's host bytes.
+
+        The base manager keeps a full private flat buffer, pinned when the
+        hosting plan allows. The distributed subclass overrides this with
+        sharded or file-backed storage; metadata offsets stay relative to the
+        FULL flat buffer either way.
+        """
+        cpu_buffer = torch.empty(total_numel, dtype=dtype, pin_memory=pin_memory)
+        for name, _, local_weight in contiguous_weights:
+            offset = aligned_offsets[name]
+            cpu_buffer[offset : offset + local_weight.numel()].copy_(
+                local_weight.flatten()
+            )
+        self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+    def _post_initialize_storage(self) -> None:
+        """Hook for storage that needs setup after every layer is offloaded."""
+
+    def _has_layer_storage(self, layer_idx: int) -> bool:
+        return layer_idx in self._consolidated_cpu_weights or bool(
+            self._mapped_cpu_weights.get(layer_idx)
+        )
+
+    def _wait_transfer_streams(self) -> None:
+        """Make the compute stream wait for all in-flight weight transfers."""
+        if self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
@@ -877,7 +929,7 @@ class LayerwiseOffloadManager:
         for layer_idx in sorted(self._retained_set):
             self.prefetch_layer(layer_idx, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+            self._wait_transfer_streams()
 
         # The head of the stream is issued after that wait, and always
         # asynchronously. wait_stream drains the whole copy stream, so issuing
@@ -966,9 +1018,7 @@ class LayerwiseOffloadManager:
                     )
             self._gpu_layers.add(layer_idx)
             return
-        if layer_idx not in self._consolidated_cpu_weights and not (
-            self._mapped_cpu_weights.get(layer_idx)
-        ):
+        if not self._has_layer_storage(layer_idx):
             return
         if self.copy_stream is not None:
             self.copy_stream.wait_stream(torch.get_device_module().current_stream())
@@ -1159,8 +1209,7 @@ class LayerwiseOffloadManager:
         denoise stage that the resident set is scoped to."""
         if not self.enabled or self.device is None:
             return
-        if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+        self._wait_transfer_streams()
 
         # A layer still in flight holds device tensors inside the courier;
         # collecting binds and accounts for them so the release below sees them.
@@ -1175,8 +1224,7 @@ class LayerwiseOffloadManager:
         """Load all layers from CPU to GPU."""
         if not self.enabled or self.device is None:
             return
-        if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+        self._wait_transfer_streams()
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
@@ -1194,8 +1242,7 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._consolidated_cpu_weights:
             return
 
-        if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+        self._wait_transfer_streams()
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
@@ -1224,10 +1271,10 @@ class LayerwiseOffloadManager:
         """Sync all loaded layers' weights from GPU back to CPU."""
         if not self.enabled or self.device is None:
             return
-        if self.copy_stream is not None:
-            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+        self._wait_transfer_streams()
 
-        for layer_idx in list(self._gpu_layers):
+        # Sorted so any collective writeback in subclasses lines up across ranks.
+        for layer_idx in sorted(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
 
     @torch.compiler.disable
@@ -1450,6 +1497,44 @@ class LayerwiseOffloadableModuleMixin:
     # under layerwise offload. See _host_resident_tables for what qualifies.
     host_resident_table_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
+    # Loader-proved checkpoint-mmap host-weight plan (set by the transformer
+    # loader when direct file backing is compatible; consumed by DLO managers).
+    checkpoint_mmap_plan = None
+
+    def _build_layerwise_offload_manager_factory(self, server_args: ServerArgs):
+        """Pick the manager class and its DLO configuration for this module.
+
+        Distributed layerwise offload is DiT-group scoped: auxiliary
+        components may traverse their blocks out of order (e.g. the LTX audio
+        VAE decodes in reverse) and must never trigger weight collectives.
+        """
+        if not (
+            self.layerwise_offload_dit_group_enabled
+            and server_args.enable_distributed_layerwise_offload
+        ):
+            return LayerwiseOffloadManager, {}
+
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_distributed import (
+            DistributedLayerwiseOffloadManager,
+        )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_sharding import (
+            resolve_sp_shard_group,
+        )
+
+        shard_group = None
+        if server_args.dlo_use_allgather:
+            shard_group = resolve_sp_shard_group()
+            if shard_group is None:
+                logger.warning(
+                    "Distributed layerwise offload requested, but no multi-rank "
+                    "sequence-parallel group is available; running the "
+                    "rank-local DLO transfer path for %s.",
+                    self.__class__.__name__,
+                )
+        return DistributedLayerwiseOffloadManager, {
+            "shard_group": shard_group,
+            "mmap_plan": self.checkpoint_mmap_plan,
+        }
 
     # Whether to park non-layer parameters on the host between uses. Costs a
     # transfer per request and is worth it only when device memory is the
@@ -1679,6 +1764,9 @@ class LayerwiseOffloadableModuleMixin:
                 dit_group=self.layerwise_offload_dit_group_enabled,
             )
         )
+        manager_cls, manager_kwargs = self._build_layerwise_offload_manager_factory(
+            server_args
+        )
         for layer_name in self.layer_names:
             module_list = named_modules.get(layer_name)
             if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
@@ -1735,7 +1823,7 @@ class LayerwiseOffloadableModuleMixin:
             # itself. See _plan_layer_hosting.
             pin_component_name = f"{component_name or type(self).__name__}.{layer_name}"
 
-            manager = LayerwiseOffloadManager(
+            manager = manager_cls(
                 model=self,
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
@@ -1747,6 +1835,7 @@ class LayerwiseOffloadableModuleMixin:
                 resident_layers=resident_layers,
                 initialize=False,
                 residency_policy=residency_policy,
+                **manager_kwargs,
             )
             self.layerwise_offload_managers.append(manager)
 

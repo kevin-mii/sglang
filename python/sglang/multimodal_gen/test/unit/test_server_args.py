@@ -3140,5 +3140,106 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
+class TestDistributedLayerwiseOffloadArgs(unittest.TestCase):
+    def test_dlo_implies_dit_layerwise_group(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_distributed_layerwise_offload": True,
+                "num_gpus": 8,
+                "sp_degree": 8,
+            }
+        )
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertIn("dit", args.layerwise_offload_components)
+        self.assertTrue(args.dlo_use_allgather)
+
+    def test_dlo_allgather_rejects_dp_without_sp(self):
+        with self.assertRaisesRegex(ValueError, "dlo-no-use-allgather"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "enable_distributed_layerwise_offload": True,
+                    "num_gpus": 8,
+                    "dp_size": 8,
+                    "sp_degree": 1,
+                }
+            )
+
+    def test_dlo_rank_local_needs_no_parallel_group(self):
+        # Rank-local streaming has no sharding group requirement at all.
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_distributed_layerwise_offload": True,
+                "dlo_use_allgather": False,
+                "num_gpus": 1,
+                "sp_degree": 1,
+            }
+        )
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+        self.assertFalse(args.dlo_use_allgather)
+
+    def test_dlo_allgather_with_sp1_downgrades_without_error(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_distributed_layerwise_offload": True,
+                "num_gpus": 1,
+                "sp_degree": 1,
+            }
+        )
+        self.assertTrue(args.is_dit_layerwise_offload_selected)
+
+    def test_no_allgather_flag_without_dlo_is_ignored(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "dlo_use_allgather": False,
+            }
+        )
+        self.assertFalse(args.enable_distributed_layerwise_offload)
+        self.assertFalse(args.is_dit_layerwise_offload_selected)
+
+    def test_dlo_allgather_rejects_breakable_cuda_graph(self):
+        # A BCG-supported model ref, so BCG survives the adjust phase and the
+        # DLO validation is what rejects the combination.
+        with self.assertRaisesRegex(ValueError, "breakable-cuda-graph"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "Qwen/Qwen-Image",
+                    "enable_distributed_layerwise_offload": True,
+                    "num_gpus": 8,
+                    "sp_degree": 8,
+                    "enable_breakable_cuda_graph": True,
+                }
+            )
+
+    def test_dlo_rejects_explicit_fsdp(self):
+        with self.assertRaisesRegex(ValueError, "FSDP"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "enable_distributed_layerwise_offload": True,
+                    "num_gpus": 8,
+                    "sp_degree": 8,
+                    "use_fsdp_inference": True,
+                }
+            )
+
+    def test_dlo_cli_flags_parse(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+        ]
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertTrue(args.enable_distributed_layerwise_offload)
+        self.assertFalse(args.dlo_use_allgather)
+
+
 if __name__ == "__main__":
     unittest.main()

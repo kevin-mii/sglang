@@ -360,6 +360,16 @@ class ServerArgs(DisaggServerArgsMixin):
     layerwise_residency_policy: dict[str, str] | str | None = field(
         default_factory=dict
     )
+    # Distributed layerwise offload (DLO): implies the DiT layerwise group and,
+    # with AllGather (default), shards each offloaded DiT layer's pinned host
+    # buffer across the sequence-parallel group, reconstructing full layers
+    # with all_gather_into_tensor at prefetch time. Flag names match
+    # vLLM-Omni's; the sharding group is derived from the topology.
+    enable_distributed_layerwise_offload: bool = False
+    # False (--dlo-no-use-allgather): disable only DLO's weight AllGather and
+    # stream complete rank-local layers with H2D through the bounded device
+    # slots. Works with any DP/SP topology and needs no synchronized requests.
+    dlo_use_allgather: bool = True
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -1424,6 +1434,8 @@ class ServerArgs(DisaggServerArgsMixin):
                     "residency"
                 )
             self.use_fsdp_inference = False
+            # DLO needs CUDA streams and (for AllGather) NCCL collectives.
+            self.enable_distributed_layerwise_offload = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
@@ -1609,7 +1621,9 @@ class ServerArgs(DisaggServerArgsMixin):
         selected_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
         )
-        if self.dit_layerwise_offload:
+        # Distributed layerwise offload implies the DiT layerwise group, the
+        # same way --dit-layerwise-offload does (vLLM-Omni priority resolution).
+        if self.dit_layerwise_offload or self.enable_distributed_layerwise_offload:
             if selected_component_names is None:
                 selected_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
             elif LAYERWISE_OFFLOAD_DIT_GROUP not in selected_component_names:
@@ -2367,6 +2381,29 @@ class ServerArgs(DisaggServerArgsMixin):
             "schedule. Worth trying when weight streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
+        )
+        parser.add_argument(
+            "--enable-distributed-layerwise-offload",
+            action="store_true",
+            default=ServerArgs.enable_distributed_layerwise_offload,
+            help="Enable distributed layerwise offload (DLO) for the DiT (implies "
+            "--dit-layerwise-offload). By default each rank stores only 1/sp of "
+            "every offloaded DiT layer in pinned host memory and full layers are "
+            "reconstructed with AllGather over the sequence-parallel group at "
+            "prefetch time, cutting per-rank host memory and PCIe traffic sp-fold. "
+            "Requires --ulysses-degree/--sp-degree > 1 for sharding; the group is "
+            "derived from the topology (TP excluded). Not supported with FSDP "
+            "inference, DTensor weights, or --enable-breakable-cuda-graph.",
+        )
+        parser.add_argument(
+            "--dlo-no-use-allgather",
+            action="store_false",
+            dest="dlo_use_allgather",
+            default=ServerArgs.dlo_use_allgather,
+            help="With --enable-distributed-layerwise-offload, disable only DLO's "
+            "weight AllGather: stream complete rank-local layers with H2D through "
+            "the bounded device slots. Works with any DP/SP topology, requires no "
+            "synchronized request waves, and each rank executes independently.",
         )
 
         # offload flags
@@ -3182,6 +3219,7 @@ class ServerArgs(DisaggServerArgsMixin):
         cli_aliases = {
             "cfg_parallel_size": "cfg_parallel_degree",
             "data_parallel_size": "dp_size",
+            "dlo_no_use_allgather": "dlo_use_allgather",
             "dp": "dp_size",
             "layerwise_offload_modules": "layerwise_offload_components",
             "mode": "performance_mode",
@@ -3219,7 +3257,51 @@ class ServerArgs(DisaggServerArgsMixin):
                 "is not supported"
             )
 
+    def _validate_distributed_layerwise_offload(self):
+        if not self.enable_distributed_layerwise_offload:
+            if self.is_arg_explicitly_set("dlo_use_allgather"):
+                logger.warning(
+                    "--dlo-no-use-allgather has no effect without "
+                    "--enable-distributed-layerwise-offload; ignoring."
+                )
+            return
+
+        if self.use_fsdp_inference and self.is_arg_explicitly_set(
+            "use_fsdp_inference"
+        ):
+            raise ValueError(
+                "Distributed layerwise offload cannot be combined with FSDP "
+                "inference: FSDP parameters are already-sharded DTensors, and "
+                "the offloader would shard or share them again. Disable "
+                "--use-fsdp-inference or --enable-distributed-layerwise-offload."
+            )
+
+        sp_degree = self.sp_degree or 1
+        if self.dlo_use_allgather:
+            if self.enable_breakable_cuda_graph:
+                raise ValueError(
+                    "Distributed layerwise offload with AllGather is not "
+                    "supported together with --enable-breakable-cuda-graph: "
+                    "per-layer weight collectives cannot run inside captured "
+                    "graph segments. Pass --dlo-no-use-allgather or disable BCG."
+                )
+            if self.dp_size > 1 and sp_degree <= 1:
+                raise ValueError(
+                    "Distributed layerwise offload with AllGather shards weights "
+                    "across the sequence-parallel group, but this deployment has "
+                    f"dp_size={self.dp_size} with sp_degree=1. DP-group sharding "
+                    "requires synchronized request waves and is not supported "
+                    "yet; pass --dlo-no-use-allgather for rank-local streaming."
+                )
+            if sp_degree <= 1:
+                logger.warning(
+                    "--enable-distributed-layerwise-offload with sp_degree=1 has "
+                    "no group to shard weights across; running the rank-local "
+                    "DLO transfer path."
+                )
+
     def _validate_offload(self):
+        self._validate_distributed_layerwise_offload()
         if (
             self.component_residency is not None
             and self.pipeline_config.task_type.is_action_gen()

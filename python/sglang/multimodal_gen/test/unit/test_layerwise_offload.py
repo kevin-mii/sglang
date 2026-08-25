@@ -227,6 +227,8 @@ def _server_args(**kwargs):
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
     )
     defaults.update(kwargs)
     return _TestServerArgs(**defaults)

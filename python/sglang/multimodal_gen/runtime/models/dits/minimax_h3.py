@@ -1743,6 +1743,26 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             return nn.functional.silu(self.time_embedder(timesteps)).to(_BF16_DTYPE)
 
         self.adaln_cache.build(step_timesteps, embed=embed)
+    def get_checkpoint_mmap_transforms(self):
+        """Checkpoint->runtime transforms for direct-mmap host weights.
+
+        The checkpoint stores fused QKV rows grouped per head as [q, k, v]
+        while the runtime layout is [q_all, k_all, v_all] (the same reorder
+        ``_install_qkv_weight_loader`` performs). Every other tensor loads
+        byte-identically at tp=1.
+        """
+        from functools import partial
+
+        transforms = {}
+        for module_name, module in self.named_modules():
+            if isinstance(module, MiniMaxH3Attention):
+                transforms[f"{module_name}.qkv_proj.weight"] = partial(
+                    _reorder_grouped_qkv_to_qkv,
+                    num_query_groups=module.total_num_heads,
+                    heads_per_group=1,
+                    head_dim=module.head_dim,
+                )
+        return transforms
 
     def _can_batch_block_adaln(self) -> bool:
         return (

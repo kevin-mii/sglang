@@ -220,6 +220,59 @@ def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
         register_fsdp_forward_method(model, name)
 
 
+def _maybe_build_checkpoint_mmap_plan(
+    model: nn.Module,
+    weight_dir_list: list[str],
+    param_names_mapping_fn,
+    *,
+    use_fsdp: bool,
+    quant_config,
+):
+    """Preflight checkpoint-mmap host weights; None means ordinary loading.
+
+    Every gate is fail-closed: features that rewrite weight bytes during the
+    ordinary load (FSDP/DTensor, quantization, tp>1 sharding, state-dict
+    preprocessing) disqualify direct file backing.
+    """
+    from sglang.multimodal_gen.runtime.loader.checkpoint_mmap import (
+        build_checkpoint_mmap_plan,
+    )
+
+    fallback_reason = None
+    if use_fsdp:
+        fallback_reason = "FSDP shards parameters into DTensors"
+    elif quant_config is not None:
+        fallback_reason = "quantization rewrites weights after loading"
+    elif getattr(model, "preprocess_loaded_state_dict", None) is not None:
+        fallback_reason = "the model preprocesses its loaded state dict"
+    else:
+        tp_world_size = 1
+        if torch.distributed.is_initialized():
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_tp_world_size,
+                model_parallel_is_initialized,
+            )
+
+            if model_parallel_is_initialized():
+                tp_world_size = get_tp_world_size()
+        if tp_world_size > 1:
+            fallback_reason = "tensor parallelism shards checkpoint tensors"
+
+    plan = None
+    if fallback_reason is None:
+        plan, fallback_reason = build_checkpoint_mmap_plan(
+            model, weight_dir_list, param_names_mapping_fn
+        )
+    if plan is None:
+        logger.info(
+            "Checkpoint-mmap host weights unavailable for %s (%s); using the "
+            "ordinary loader.",
+            model.__class__.__name__,
+            fallback_reason,
+        )
+    return plan
+
+
 # TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
@@ -349,88 +402,110 @@ def maybe_load_fsdp_model(
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
 
     # 2. load model from disk
-    preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
-    bnb_quant_states = None
-    preconverted_state_dict = None
-    is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
+    checkpoint_mmap_plan = None
     if (
-        not weight_load_plan.load_full_state_dict_on_device
-        and use_fsdp
-        and weight_dir_list
+        weight_load_plan.try_checkpoint_mmap
         and weights_iterator is None
-        and preprocess_loaded_state_dict is None
         and checkpoint_key_filter is None
-        and not is_bnb_quantized
     ):
-        preconverted_state_dict = (
-            rank_local_checkpoint.try_load_rank_local_fsdp_state_dict(
-                model,
-                weight_dir_list,
-                param_names_mapping_fn,
-            )
+        checkpoint_mmap_plan = _maybe_build_checkpoint_mmap_plan(
+            model,
+            weight_dir_list,
+            param_names_mapping_fn,
+            use_fsdp=use_fsdp,
+            quant_config=init_params.get("quant_config"),
         )
-    elif (
-        not weight_load_plan.load_full_state_dict_on_device
-        and not use_fsdp
-        and weight_dir_list
-        and weights_iterator is None
-        and preprocess_loaded_state_dict is None
-        and checkpoint_key_filter is None
-        and not is_bnb_quantized
-    ):
-        preconverted_state_dict = (
-            rank_local_checkpoint.try_load_rank_local_tp_state_dict(
-                model,
-                weight_dir_list,
-                param_names_mapping_fn,
-            )
+    model.checkpoint_mmap_plan = checkpoint_mmap_plan
+    if checkpoint_mmap_plan is not None:
+        from sglang.multimodal_gen.runtime.loader.checkpoint_mmap import (
+            bind_checkpoint_mmap_views,
         )
 
-    if preconverted_state_dict is None:
-        if weights_iterator is not None:
-            weight_iterator = weights_iterator
-        elif weight_load_plan.load_full_state_dict_on_device:
-            weight_iterator = safetensors_weights_iterator(
-                weight_dir_list,
-                key_filter=checkpoint_key_filter,
-                weight_load_plan=weight_load_plan,
-            )
-        else:
-            weight_iterator = safetensors_weights_iterator(
-                weight_dir_list,
-                key_filter=checkpoint_key_filter,
-            )
-        if preprocess_loaded_state_dict is not None:
-            weight_iterator = preprocess_loaded_state_dict(weight_iterator)
-        if is_bnb_quantized:
-            normal_weights, raw_quant_state = split_bitsandbytes_4bit_state(
-                weight_iterator
-            )
-            bnb_quant_states = build_bitsandbytes_4bit_quant_states(
-                [name for name, _ in normal_weights],
-                raw_quant_state,
-                device,
-                param_names_mapping_fn,
-            )
-            weight_iterator = iter(normal_weights)
+        bind_checkpoint_mmap_views(model, checkpoint_mmap_plan)
     else:
-        weight_iterator = iter(())
+        preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
+        bnb_quant_states = None
+        preconverted_state_dict = None
+        is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
+        if (
+            not weight_load_plan.load_full_state_dict_on_device
+            and use_fsdp
+            and weight_dir_list
+            and weights_iterator is None
+            and preprocess_loaded_state_dict is None
+            and checkpoint_key_filter is None
+            and not is_bnb_quantized
+        ):
+            preconverted_state_dict = (
+                rank_local_checkpoint.try_load_rank_local_fsdp_state_dict(
+                    model,
+                    weight_dir_list,
+                    param_names_mapping_fn,
+                )
+            )
+        elif (
+            not weight_load_plan.load_full_state_dict_on_device
+            and not use_fsdp
+            and weight_dir_list
+            and weights_iterator is None
+            and preprocess_loaded_state_dict is None
+            and checkpoint_key_filter is None
+            and not is_bnb_quantized
+        ):
+            preconverted_state_dict = (
+                rank_local_checkpoint.try_load_rank_local_tp_state_dict(
+                    model,
+                    weight_dir_list,
+                    param_names_mapping_fn,
+                )
+            )
 
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        weight_load_plan.checkpoint_load_device,
-        param_dtype,
-        strict=strict,
-        cpu_offload=load_on_cpu,
-        param_names_mapping=param_names_mapping_fn,
-        keep_checkpoint_mapping=keep_checkpoint_mapping,
-        preconverted_state_dict=preconverted_state_dict,
-    )
-    if bnb_quant_states:
-        attach_bitsandbytes_4bit_quant_states(
-            dict(model.named_parameters()), bnb_quant_states
+        if preconverted_state_dict is None:
+            if weights_iterator is not None:
+                weight_iterator = weights_iterator
+            elif weight_load_plan.load_full_state_dict_on_device:
+                weight_iterator = safetensors_weights_iterator(
+                    weight_dir_list,
+                    key_filter=checkpoint_key_filter,
+                    weight_load_plan=weight_load_plan,
+                )
+            else:
+                weight_iterator = safetensors_weights_iterator(
+                    weight_dir_list,
+                    key_filter=checkpoint_key_filter,
+                )
+            if preprocess_loaded_state_dict is not None:
+                weight_iterator = preprocess_loaded_state_dict(weight_iterator)
+            if is_bnb_quantized:
+                normal_weights, raw_quant_state = split_bitsandbytes_4bit_state(
+                    weight_iterator
+                )
+                bnb_quant_states = build_bitsandbytes_4bit_quant_states(
+                    [name for name, _ in normal_weights],
+                    raw_quant_state,
+                    device,
+                    param_names_mapping_fn,
+                )
+                weight_iterator = iter(normal_weights)
+        else:
+            weight_iterator = iter(())
+
+        load_model_from_full_model_state_dict(
+            model,
+            weight_iterator,
+            weight_load_plan.checkpoint_load_device,
+            param_dtype,
+            strict=strict,
+            cpu_offload=load_on_cpu,
+            param_names_mapping=param_names_mapping_fn,
+            keep_checkpoint_mapping=keep_checkpoint_mapping,
+            preconverted_state_dict=preconverted_state_dict,
         )
+        if bnb_quant_states:
+            attach_bitsandbytes_4bit_quant_states(
+                dict(model.named_parameters()), bnb_quant_states
+            )
+
 
     # 3. postprocessing
     if weight_postprocess_device is not None:

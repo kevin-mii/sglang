@@ -888,6 +888,67 @@ MODELS = {
             "--performance-mode=manual",
         ],
     },
+    # Skill-only extra preset: distributed layerwise offload, latency route
+    # (DP1 x SP8 AllGather — each rank hosts 1/8 of every DiT layer and full
+    # layers are reconstructed over NVLink at prefetch time).
+    "minimax-h3-t2va-dlo-sp8": {
+        "path": "MiniMaxAI/MiniMax-H3",
+        "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+        "seed": 1101,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            },
+            "audio_flow_shift": 3.0,
+            "flow_shift": 12.0,
+            "num_inference_steps": 50,
+        },
+        "extra_args": [
+            "--model-variant=fl2va",
+            "--num-gpus=8",
+            "--tp-size=1",
+            "--ulysses-degree=8",
+            "--enable-distributed-layerwise-offload",
+            "--dit-offload-prefetch-size=1",
+            "--enable-torch-compile=false",
+        ],
+        "force_eager": True,
+    },
+    # Skill-only extra preset: distributed layerwise offload, rank-local
+    # transfer (no weight AllGather; complete layers stream through the
+    # bounded device slots on each rank independently).
+    "minimax-h3-t2va-dlo-rank-local": {
+        "path": "MiniMaxAI/MiniMax-H3",
+        "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+        "seed": 1101,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            },
+            "audio_flow_shift": 3.0,
+            "flow_shift": 12.0,
+            "num_inference_steps": 50,
+        },
+        "extra_args": [
+            "--model-variant=fl2va",
+            "--num-gpus=8",
+            "--tp-size=1",
+            "--ulysses-degree=8",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-no-use-allgather",
+            "--dit-offload-prefetch-size=1",
+            "--enable-torch-compile=false",
+        ],
+        "force_eager": True,
+    },
     "ltx2": {
         "path": "Lightricks/LTX-2",
         "prompt": "A cat and a dog baking a cake together in a kitchen.",
