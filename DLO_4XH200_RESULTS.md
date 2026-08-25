@@ -164,7 +164,33 @@ completed in 2.9 s wall vs ~1.5 s per single request — both replicas denoising
 simultaneously, each running AllGather on its own communicator, with no
 interference, deadlock, or output divergence (all 4 byte-identical).
 
-## 7. Reference numbers (vLLM-Omni blog — different hardware, NOT comparable)
+## 7. H3 serving determinism: first-request audio divergence (root-caused, fixed)
+
+Symptom (found during DP validation, reproduced on unmodified main at dp=1,
+warmup off): the first same-seed T2VA request of a server process produces one
+MP4 (`3c8a9ea6...`), every later request a different stable one
+(`70d42fc8...`). Localization: video streams are pixel-identical (SSIM 1.0);
+only the audio stream differs. Instrumentation showed the audio latent entering
+the audio-VAE decode, the VAE's full state dict, and every global numeric flag
+(TF32, matmul precision, cudnn.benchmark, deterministic) are identical across
+requests — same input, same weights, different output. Cause: cuDNN selects
+convolution algorithms from free-workspace/allocator state, which differs
+between the process's first decode and all later ones; the BigVGAN audio
+vocoder is sensitive to the resulting kernel change (cudnn.allow_tf32 was also
+enabled). The ref2va audio *encode* already guards against exactly this with a
+determinism context (TF32 off, cuDNN disabled, math SDP); the decode path had
+no such guard.
+
+Fix (branch `fix/minimax-h3-dp-replica-group`): wrap the audio-VAE decode in a
+deterministic-algorithm scope local to the H3 decoding stage (cudnn
+deterministic on, TF32 off, benchmark off — cuDNN stays enabled). Measured
+A/B: four sequential same-seed server requests byte-identical at an unchanged
+2.1 s decoding stage; the heavier encode-style cudnn-off scope also passes but
+costs 4.7 s, so it is kept only as the documented escalation path. The
+canonical H3 audio bytes change once with this fix (deterministic across
+requests and processes thereafter); video is untouched (SSIM 1.0).
+
+## 8. Reference numbers (vLLM-Omni blog — different hardware, NOT comparable)
 
 MiniMax-H3 768x1344, 124 frames, 50 steps on **8x B300**: DP1xSP8 AllGather wave
 P50 34.55 s, 26.37 GiB peak/GPU, 68.08 Wh; DP8xSP1 rank-local 183.78 videos/h,
