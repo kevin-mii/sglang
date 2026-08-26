@@ -1374,7 +1374,7 @@ sampled peak per GPU.
 | --- | ---: | ---: | ---: | --- |
 | prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Selected recipe |
 | prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
-| Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
+| Ulysses2, prefetch 2, resident 10 | — | — | — | Rejected: did not reach warmup |
 
 ### Consumer GPU tuning
 
@@ -1400,7 +1400,7 @@ same data in one view.
 
 **Two budgets, and what each one buys**
 
-| | 12 GB VRAM + 32 GB host | host free, VRAM 16 GB |
+| | 12 GB VRAM + 32 GB host | 16 GB VRAM + ample host |
 | --- | ---: | ---: |
 | Recipe | A | B |
 | Peak VRAM | ≤ 12 GiB | ≤ 16 GiB (OOMs at 12) |
