@@ -651,7 +651,7 @@ may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
 
 The following FL2VA adapters have distinct purposes:
 
-| Recipe | Repository and pinned file | Request setting | Prompt requirement |
+| Recipe | Repository and <br />pinned file | Request setting | Prompt <br />requirement |
 | --- | --- | --- | --- |
 | Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
 | Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
@@ -1324,7 +1324,7 @@ hardware: 8× H200 single-node (Ulysses8, no Ring) versus the same 16-GPU
 cross-node command above (Ulysses8 × Ring2), holding prompt, seed, and
 step count fixed:
 
-| Task | Single-node (Ulysses8) | Cross-node (Ulysses8 × Ring2) | Change |
+| Task | Single-node <br />(Ulysses8) | Cross-node <br />(Ulysses8 × Ring2) | Change |
 | --- | ---: | ---: | ---: |
 | T2VA denoise/step | 0.749 s | 0.477 s | −36.3% |
 | Ref2VA/V2V denoise/step | 2.572 s | 1.494 s | −41.9% |
@@ -1524,7 +1524,7 @@ engines here run under the same hard allocator cap
 (`set_per_process_memory_fraction`), where its peak stays at 12.1–12.3 GiB.
 Under that cap, Recipe A wins the whole request at every host size:
 
-| 12 GB VRAM, both engines hard-capped | sglang Recipe A (TE + denoise + decode) | ComfyUI, bf16 (warm) |
+| 12 GB VRAM, <br />both engines <br />hard-capped | sglang Recipe A <br />(TE + denoise + decode) | ComfyUI, bf16 (warm) |
 | --- | ---: | ---: |
 | 32 GB host | 12.4 + 212.8 + 9.4 ≈ **235 s** | 276–302 s |
 | 48 GB host | 15.8 + 192.1 + 10.0 ≈ **218 s** | 246–267 s |
