@@ -182,7 +182,7 @@ Extra build requirements: FP8 Balanced and High Throughput need the **DeepEP v2 
 
 The PD role selector adds the role and transfer flags to the selected base recipe. It does not resize the prefill and decode workers. Use separate workers with the layouts below for the measured GB300 operating points:
 
-| Checkpoint and operating point | Prefill workers | Decode worker | Capacity setting |
+| Checkpoint and <br />operating point | Prefill workers | Decode worker | Capacity setting |
 |---|---|---|---|
 | FP8, high throughput | 2 × TP1 / PP16 | DP4-attention / TP4 / EP16, DeepEP v2 + EPLB | Keep frontend concurrency above the decode MRR so prefill remains queued |
 | NVFP4, high throughput | 2 × TP1 / PP6 | DP2-attention / TP4 / EP8, FlashInfer one-sided A2A | Prefill MRR 128 per worker; decode MRR 512; frontend concurrency 1536 |

@@ -95,7 +95,7 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 
 MiMo-V2.5-Pro can also be served on TPU via [sgl-jax](https://github.com/sgl-project/sglang-jax). The runtime is a separate JAX-based stack (`sgl_jax.launch_server`); pick **TPU v7x** or **TPU v6e** in the panel above to generate the launch command. Verified topologies:
 
-| TPU Type | Topology | Chips/Node | Nodes | Total Chips | JAX Devices/Chip | Total JAX Devices (= `--tp-size`) |
+| TPU Type | Topology | Chips/<br />Node | Nodes | Total <br />Chips | JAX <br />Devices/<br />Chip | Total JAX <br />Devices <br />`--tp-size` |
 | --- | --- | --- | --- | --- | --- | --- |
 | **v7x** | 2×2×4 | 4 | 4 | 16 | 2 | 32 |
 | **v6e** | 4×4×4 | 4 | 16 | 64 | 1 | 64 |
@@ -802,7 +802,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results** — single-node prefill throughput, cache-miss:
 
-| Input length | Output length | Single-node prefill throughput |
+| Input length | Output length | Single-node prefill <br />throughput |
 | ------------ | ------------- | ------------------------------ |
 | 4K           | 1             | 30.80K tok/s                   |
 | 8K           | 1             | 30.65K tok/s                   |
@@ -823,7 +823,7 @@ Test setting: fixed **16K input / 1K output**, varying batch size per DP rank, w
 
 - **Test Results** — single-node decode throughput:
 
-| BS per DP rank | MTP      | MTP accept length | Per-request TPS | Single-node decode throughput |
+| BS per DP rank | MTP      | MTP accept <br />length | Per-request <br />TPS | Single-node <br />decode <br />throughput |
 | -------------- | -------- | ----------------- | --------------- | ----------------------------- |
 | 64             | disabled | -                 | 29.3            | 1875 tok/s                    |
 | 64             | 3-layer  | 3                 | 60.5            | 3873 tok/s                    |
@@ -834,7 +834,7 @@ Test setting: fixed **16K input / 1K output**, varying batch size per DP rank, w
 
 **Summary — MTP on / off:**
 
-| BS per DP rank | Without MTP | 3-layer MTP, accept=3 | 3-layer MTP, accept=4 |
+| BS per DP rank | Without MTP | 3-layer MTP, <br />accept=3 | 3-layer MTP, <br />accept=4 |
 | -------------- | ----------- | --------------------- | --------------------- |
 | 64             | 1875 tok/s  | 3873 tok/s (2.07×)    | 5103 tok/s (2.72×)    |
 | 96             | 2564 tok/s  | 4840 tok/s (1.89×)    | 6225 tok/s (2.43×)    |
