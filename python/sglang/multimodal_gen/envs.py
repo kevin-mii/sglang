@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_FINAL_LAYOUT_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
@@ -278,6 +279,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory instead of a file-backed cache mapping the page cache can drop.
     "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: load the DiT ordinarily on every rank instead of publishing
+    # the finalized weights once per node and mmap-binding the other ranks.
+    "SGLANG_DIFFUSION_DISABLE_FINAL_LAYOUT_STORE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_FINAL_LAYOUT_STORE"
     ),
     # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
     # of the file-backed LoRA merge cache.

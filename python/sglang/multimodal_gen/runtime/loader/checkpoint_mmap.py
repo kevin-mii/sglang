@@ -68,6 +68,9 @@ class CheckpointMmapPlan(msgspec.Struct):
 
     bindings: Dict[str, TensorBinding]
     transforms: Dict[str, Any]
+    # Final-layout artifacts store post-load tensors under runtime names, so
+    # binding must not re-apply model-declared checkpoint transforms.
+    final_layout: bool = False
 
 
 @runtime_checkable
@@ -89,9 +92,7 @@ def _required_tensors(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
         for buffer_name, buffer in module._buffers.items():
             if buffer is None or buffer_name in module._non_persistent_buffers_set:
                 continue
-            full_name = (
-                f"{module_name}.{buffer_name}" if module_name else buffer_name
-            )
+            full_name = f"{module_name}.{buffer_name}" if module_name else buffer_name
             persistent[full_name] = buffer
     required.update(persistent)
     return required
@@ -236,6 +237,46 @@ def _build_plan(
     return CheckpointMmapPlan(bindings=bindings, transforms=deferred)
 
 
+def build_final_layout_plan(
+    model: torch.nn.Module, artifact_files: List[str]
+) -> Tuple[CheckpointMmapPlan | None, str | None]:
+    """Preflight a final-layout artifact: runtime names, post-load tensors.
+
+    Loader-policy and transform checks do not apply — the artifact was
+    produced from a fully finalized model, so a matching name IS the final
+    tensor. Dtypes are taken from the artifact rather than checked against the
+    meta-built model: ``post_load_weights`` dtype adjustments already happened
+    before publication, and re-running them on bound views is an idempotent
+    no-op.
+    """
+    required = _required_tensors(model)
+    bindings: Dict[str, TensorBinding] = {}
+    for file_path in artifact_files:
+        with safe_open(file_path, framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                if name not in required:
+                    continue
+                if name in bindings:
+                    return None, f"{name} appears in more than one artifact shard"
+                shape = tuple(handle.get_slice(name).get_shape())
+                if shape != tuple(required[name].shape):
+                    return None, (
+                        f"{name} shape mismatch: artifact {shape} vs runtime "
+                        f"{tuple(required[name].shape)}"
+                    )
+                bindings[name] = TensorBinding(checkpoint_key=name, file_path=file_path)
+    missing = [name for name in required if name not in bindings]
+    if missing:
+        return None, (
+            f"{len(missing)} required tensors missing from the artifact "
+            f"(first 5: {missing[:5]})"
+        )
+    return (
+        CheckpointMmapPlan(bindings=bindings, transforms={}, final_layout=True),
+        None,
+    )
+
+
 def bind_checkpoint_mmap_views(
     model: torch.nn.Module, plan: CheckpointMmapPlan
 ) -> None:
@@ -250,7 +291,7 @@ def bind_checkpoint_mmap_views(
     from safetensors import safe_open as _safe_open
 
     declared_transforms: Dict[str, Any] = {}
-    if isinstance(model, SupportsCheckpointMmapTransforms):
+    if not plan.final_layout and isinstance(model, SupportsCheckpointMmapTransforms):
         declared_transforms = dict(model.get_checkpoint_mmap_transforms())
 
     file_handles: Dict[str, Any] = {}
@@ -268,10 +309,7 @@ def bind_checkpoint_mmap_views(
         if transform is not None and runtime_name not in plan.transforms:
             # Not streamed by the offload manager -> runtime layout now.
             transformed = transform(tensor)
-            if (
-                transformed.dtype != tensor.dtype
-                or transformed.shape != tensor.shape
-            ):
+            if transformed.dtype != tensor.dtype or transformed.shape != tensor.shape:
                 raise ValueError(
                     f"mmap transform changed tensor metadata for {runtime_name}: "
                     f"{tensor.dtype}/{tuple(tensor.shape)} -> "

@@ -274,6 +274,117 @@ def _maybe_build_checkpoint_mmap_plan(
     return plan
 
 
+# Bounded by how long one rank can take to canonically load and publish the
+# largest supported DiT; falls back to the ordinary loader on expiry.
+_FINAL_LAYOUT_WAIT_S = 3600.0
+
+
+def _maybe_enter_final_layout_store(
+    model: nn.Module,
+    weight_dir_list: list,
+    *,
+    use_fsdp: bool,
+    quant_config: Any | None,
+):
+    """Try the final-layout artifact when direct checkpoint-mmap declined.
+
+    Returns ``(plan, publish_fn)``: a bind-ready plan when the artifact exists
+    (or appears while a lease-holding peer publishes it), else a publish
+    callback for the rank that won the lease and must publish after its
+    canonical load finalizes. Both are None when the store does not apply.
+    """
+    from sglang.multimodal_gen import envs
+    from sglang.multimodal_gen.runtime.loader import final_layout_store
+    from sglang.multimodal_gen.runtime.loader.checkpoint_mmap import (
+        build_final_layout_plan,
+    )
+
+    if (
+        envs.SGLANG_DIFFUSION_DISABLE_FINAL_LAYOUT_STORE
+        or use_fsdp
+        or quant_config is not None
+        or not weight_dir_list
+    ):
+        return None, None
+    if torch.distributed.is_initialized():
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_tp_world_size,
+            model_parallel_is_initialized,
+        )
+
+        if model_parallel_is_initialized() and get_tp_world_size() > 1:
+            return None, None
+
+    identity = final_layout_store.build_identity(model, weight_dir_list)
+
+    def plan_from_ready(files) -> Any | None:
+        plan, reason = build_final_layout_plan(model, files)
+        if plan is None:
+            logger.warning(
+                "Final-layout artifact at %s does not cover %s (%s); using "
+                "the ordinary loader.",
+                final_layout_store.artifact_dir(identity),
+                model.__class__.__name__,
+                reason,
+            )
+        return plan
+
+    files = final_layout_store.artifact_files(identity)
+    if files is not None:
+        return plan_from_ready(files), None
+
+    lease = final_layout_store.FinalLayoutLease(identity)
+    if not lease.acquire():
+        logger.info(
+            "Waiting for a peer rank to publish the final-layout artifact " "for %s.",
+            model.__class__.__name__,
+        )
+        files = final_layout_store.wait_for_artifact(
+            identity, timeout_s=_FINAL_LAYOUT_WAIT_S
+        )
+        if files is None:
+            logger.warning(
+                "Final-layout artifact for %s did not appear within %.0fs; "
+                "using the ordinary loader.",
+                model.__class__.__name__,
+                _FINAL_LAYOUT_WAIT_S,
+            )
+            return None, None
+        return plan_from_ready(files), None
+
+    # Lease holder: re-check under the lock, then load canonically and
+    # publish once the weights are final.
+    files = final_layout_store.artifact_files(identity)
+    if files is not None:
+        lease.release()
+        return plan_from_ready(files), None
+
+    def publish() -> None:
+        try:
+            if not final_layout_store.publish_final_layout_artifact(model, identity):
+                return
+            published = final_layout_store.artifact_files(identity)
+            if published is None:
+                return
+            plan = plan_from_ready(published)
+            if plan is None:
+                return
+            # Rebind the publisher to its own artifact: the views hold the
+            # exact bytes just written, so the swap frees the materialized
+            # copy and makes every rank's host footprint symmetric.
+            from sglang.multimodal_gen.runtime.loader.checkpoint_mmap import (
+                bind_checkpoint_mmap_views,
+            )
+
+            bind_checkpoint_mmap_views(model, plan)
+            model.checkpoint_mmap_plan = plan
+            trim_host_allocator()
+        finally:
+            lease.release()
+
+    return None, publish
+
+
 # TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
@@ -416,6 +527,19 @@ def maybe_load_fsdp_model(
             use_fsdp=use_fsdp,
             quant_config=init_params.get("quant_config"),
         )
+    publish_final_layout = None
+    if (
+        checkpoint_mmap_plan is None
+        and weight_load_plan.try_checkpoint_mmap
+        and weights_iterator is None
+        and checkpoint_key_filter is None
+    ):
+        checkpoint_mmap_plan, publish_final_layout = _maybe_enter_final_layout_store(
+            model,
+            weight_dir_list,
+            use_fsdp=use_fsdp,
+            quant_config=init_params.get("quant_config"),
+        )
     model.checkpoint_mmap_plan = checkpoint_mmap_plan
     if checkpoint_mmap_plan is not None:
         from sglang.multimodal_gen.runtime.loader.checkpoint_mmap import (
@@ -424,10 +548,14 @@ def maybe_load_fsdp_model(
 
         bind_checkpoint_mmap_views(model, checkpoint_mmap_plan)
     else:
-        preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
+        preprocess_loaded_state_dict = getattr(
+            model, "preprocess_loaded_state_dict", None
+        )
         bnb_quant_states = None
         preconverted_state_dict = None
-        is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
+        is_bnb_quantized = _is_bitsandbytes_quant_config(
+            init_params.get("quant_config")
+        )
         if (
             not weight_load_plan.load_full_state_dict_on_device
             and use_fsdp
@@ -507,7 +635,6 @@ def maybe_load_fsdp_model(
                 dict(model.named_parameters()), bnb_quant_states
             )
 
-
     # 3. postprocessing
     if weight_postprocess_device is not None:
         # move to device to perform postprocessing
@@ -533,6 +660,9 @@ def maybe_load_fsdp_model(
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
+
+    if publish_final_layout is not None:
+        publish_final_layout()
 
     # 4. deferred cpu offload
     if defer_cpu_placement:
