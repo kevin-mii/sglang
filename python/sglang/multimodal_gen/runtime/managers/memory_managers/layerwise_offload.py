@@ -12,7 +12,10 @@ from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
+from sglang.multimodal_gen.runtime.loader.utils import (
+    MappedRegions,
+    trim_host_allocator,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
@@ -1873,6 +1876,9 @@ class LayerwiseOffloadableModuleMixin:
 
             for manager in enabled_managers:
                 manager._finalize_initialization()
+
+            if enabled_managers:
+                trim_host_allocator()
 
         managers = self.layerwise_offload_managers
         prefetch_sizes = ", ".join(

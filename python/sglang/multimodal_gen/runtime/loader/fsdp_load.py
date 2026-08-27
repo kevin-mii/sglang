@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
     set_default_torch_dtype,
+    trim_host_allocator,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -536,6 +537,11 @@ def maybe_load_fsdp_model(
     # 4. deferred cpu offload
     if defer_cpu_placement:
         model.to("cpu")
+
+    # Loading materializes checkpoint shards in anonymous host memory; glibc
+    # keeps the freed arenas mapped, so worker RSS stays at the load high-water
+    # mark unless the pages are handed back.
+    trim_host_allocator()
 
     return model
 

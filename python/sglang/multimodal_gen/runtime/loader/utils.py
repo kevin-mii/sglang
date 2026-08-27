@@ -29,6 +29,27 @@ _QUANTIZED_DTYPES = {
 }
 
 
+def trim_host_allocator() -> None:
+    """Return freed load-transient pages to the OS.
+
+    Loading and offload-pinning churn through anonymous host memory; glibc
+    keeps the freed arenas mapped, so worker RSS stays at the high-water mark
+    unless malloc_trim hands the pages back.
+    """
+    import ctypes
+    import gc
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        # Non-glibc platforms have no malloc_trim; RSS trimming is best-effort.
+        pass
+
+
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
