@@ -235,6 +235,13 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
         self._allocate_shared_buffers()
         if self._shard_group is not None:
             self._warn_if_sharding_ineffective()
+            if not self._cpu_sources:
+                # AllGather mode consumed the checkpoint-mmap views only as the
+                # source for each rank's pinned shard; dropping the loader's
+                # handle anchor lets files with no remaining views unmap.
+                # Tensors still bound to views (other managers' rank-local
+                # sources, non-streamed params) hold their own buffer refs.
+                self.model.__dict__.pop("_checkpoint_mmap_file_handles", None)
 
     def _allocate_shared_buffers(self) -> None:
         """Allocate the persistent device slots (and host staging) once.
