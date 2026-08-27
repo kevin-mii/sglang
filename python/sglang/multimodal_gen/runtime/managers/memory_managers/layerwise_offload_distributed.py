@@ -87,6 +87,10 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
         # Bounded pinned host slots for mmap -> device staging (rank-local).
         self._staging_buffers: List[Dict[torch.dtype, torch.Tensor]] | None = None
         self._staging_events: List[Any] = []
+        # Layers whose mmap pages are cudaHostRegister'ed read-only: prefetch
+        # DMAs the views straight into the device slots, skipping the per-step
+        # staging pack. Registered for the process lifetime.
+        self._direct_h2d_layers: set = set()
         # Monotone counter assigning device slots in fetch order, so the slot a
         # prefetch reuses always belonged to a layer whose forward was already
         # enqueued — correct for any num_layers (including wraparound).
@@ -232,6 +236,8 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
         )
 
     def _post_initialize_storage(self) -> None:
+        if self._shard_group is None and self._cpu_sources:
+            self._register_mmap_sources_for_direct_h2d()
         self._allocate_shared_buffers()
         if self._shard_group is not None:
             self._warn_if_sharding_ineffective()
@@ -257,7 +263,10 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
             for dtype, (total_numel, shard_numel, padded_numel) in layer_sizes.items():
                 max_padded[dtype] = max(max_padded.get(dtype, 0), padded_numel)
                 max_shard[dtype] = max(max_shard.get(dtype, 0), shard_numel)
-                if layer_idx in self._cpu_sources:
+                if (
+                    layer_idx in self._cpu_sources
+                    and layer_idx not in self._direct_h2d_layers
+                ):
                     max_staging[dtype] = max(max_staging.get(dtype, 0), total_numel)
         if not max_padded:
             return
@@ -318,6 +327,106 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
         super()._wait_transfer_streams()
         if self.comm_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.comm_stream)
+
+    def _register_mmap_sources_for_direct_h2d(self) -> None:
+        """cudaHostRegister the mmap views so prefetch can DMA them directly.
+
+        Registration is read-only (the mappings are immutable checkpoint
+        pages) and all-or-nothing: any failure rolls back and every layer
+        keeps the pinned-staging path. Only transform-free layers qualify —
+        deferred transforms must run on the CPU at stage time. The registered
+        bytes are pinned page cache, so they are charged to the host pin
+        budget like any other pinned hosting.
+        """
+        if (
+            not self.pin_cpu_memory
+            or not torch.cuda.is_available()
+            or self._mmap_plan is None
+            or not getattr(self._mmap_plan, "final_layout", False)
+        ):
+            # Raw-checkpoint plans interleave views with eagerly-transformed
+            # private tensors in the same pages; page-granular registration
+            # would leave tensors partially registered and later copies fail.
+            # Final-layout artifacts bind every tensor as a view, so whole
+            # per-file spans are safely coverable.
+            return
+        # The plan (and therefore the registered spans) covers the whole
+        # model; the first manager registers and later managers (other layer
+        # groups of the same DiT) adopt, since re-registering overlapping
+        # pages fails.
+        if self.model.__dict__.get("_dlo_direct_h2d_registered", False):
+            self._direct_h2d_layers = set(self._cpu_sources)
+            return
+
+        source_views = {
+            name: view
+            for by_dtype in self._cpu_sources.values()
+            for sources in by_dtype.values()
+            for name, view, _ in sources
+        }
+        model_tensors = dict(self.model.named_parameters())
+        model_tensors.update(dict(self.model.named_buffers()))
+
+        page = 4096
+        spans: Dict[str, List[int]] = {}
+        for name, binding in self._mmap_plan.bindings.items():
+            view = source_views.get(name)
+            if view is None:
+                view = model_tensors.get(name)
+            if view is None or view.device.type != "cpu" or view.is_meta:
+                continue
+            start = view.data_ptr()
+            end = start + view.numel() * view.element_size()
+            span = spans.setdefault(binding.file_path, [start, end])
+            span[0] = min(span[0], start)
+            span[1] = max(span[1], end)
+
+        merged = [
+            (start // page * page, -(-end // page) * page)
+            for start, end in spans.values()
+        ]
+        if not merged:
+            return
+        eligible = set(self._cpu_sources)
+        total_bytes = sum(end - start for start, end in merged)
+        if self._pin_budget is not None and not self._pin_budget.request(
+            component_name=f"{self._pin_component_name}.mmap_register",
+            weight_bytes=total_bytes,
+        ):
+            return
+
+        cudart = torch.cuda.cudart()
+        registered: List[Tuple[int, int]] = []
+        # cudaHostRegisterReadOnly: the only flag valid for PROT_READ mappings.
+        flags = 0x08
+        for start, end in merged:
+            error = cudart.cudaHostRegister(start, end - start, flags)
+            if error != 0:
+                for done_start, _ in registered:
+                    cudart.cudaHostUnregister(done_start)
+                # The failed call leaves a sticky last-error that torch would
+                # raise from the next unrelated CUDA op.
+                cudart.cudaGetLastError()
+                logger.info(
+                    "Direct H2D unavailable for %s (cudaHostRegister error %s "
+                    "on a %.1f MiB range); keeping the pinned-staging path.",
+                    self._pin_component_name,
+                    error,
+                    (end - start) / (1 << 20),
+                )
+                return
+            registered.append((start, end))
+
+        self._direct_h2d_layers = eligible
+        self.model._dlo_direct_h2d_registered = True
+        logger.info(
+            "Registered %.2f GiB of checkpoint-mmap pages read-only across %d "
+            "range(s); %d/%d mmap layers prefetch by direct H2D.",
+            total_bytes / (1 << 30),
+            len(registered),
+            len(eligible),
+            len(self._cpu_sources),
+        )
 
     def _stage_mmap_sources(
         self, layer_idx: int, slot: int
@@ -401,8 +510,9 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
             self._ring_fetch_counter += 1
 
         mmap_layer = layer_idx in self._cpu_sources
+        direct_h2d = layer_idx in self._direct_h2d_layers
         staged: Dict[torch.dtype, torch.Tensor] = {}
-        if mmap_layer and not dedicated:
+        if mmap_layer and not dedicated and not direct_h2d:
             staged = self._stage_mmap_sources(layer_idx, slot)
 
         self.copy_stream.wait_stream(torch.get_device_module().current_stream())
@@ -433,7 +543,13 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
                         gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
                         staged_shards[dtype] = gpu_shard
                     elif mmap_layer:
-                        if dedicated:
+                        if direct_h2d and not dedicated:
+                            # Registered pages: DMA each view straight into the
+                            # slot, no host pack.
+                            self._copy_mmap_sources_to_device(
+                                layer_idx, dtype, gpu_out, non_blocking=non_blocking
+                            )
+                        elif dedicated:
                             self._copy_mmap_sources_to_device(
                                 layer_idx, dtype, gpu_out, non_blocking=False
                             )
@@ -493,7 +609,7 @@ class DistributedLayerwiseOffloadManager(LayerwiseOffloadManager):
             self.comm_stream if self._shard_group is not None else self.copy_stream
         )
         self._prefetch_events[layer_idx] = event
-        if mmap_layer and not dedicated:
+        if mmap_layer and not dedicated and not direct_h2d:
             self._staging_events[slot] = event
 
         self._gpu_layers.add(layer_idx)
