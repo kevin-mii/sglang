@@ -1467,6 +1467,17 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        # Follow the graph-mode collective contract documented in
+        # graph_capture(): torch.distributed collectives must stay out of
+        # captured graphs (ProcessGroupNCCL work events abort HIP graph
+        # capture with "operation not permitted on an event last recorded in
+        # a capturing stream"), while PyNccl is enabled exactly inside
+        # graph_capture(). Dispatch to PyNccl whenever it is active, e.g. for
+        # the DSpark draft sampler's in-graph TP sync.
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.broadcast(input_, src=src)
+            return input_
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
