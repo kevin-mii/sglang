@@ -136,3 +136,24 @@ expert's pre-shuffle w13 rows + scales from the loader and diff against
 harness prep of the same tensors; then either add the missing permute for
 the interleave path or teach the tuner the runtime layout. Payoff once
 solved: ~5-8% of the bs=32 decode step (MoE is 22.5%); ~0 at bs=1.
+
+## DSV4-Pro-0813 (2026-09-01)
+
+Same methodology, run against `deepseek-ai/DeepSeek-V4-Pro-0813` (fp8
+block-quant checkpoint; experts requantized to mxfp4 on gfx95 -> same
+a8w4 runtime family, so the fmoe csv-tuning block above applies to Pro
+unchanged).
+
+- `dsv4_pro_tp8_a8w8_blockscale_bpreshuffle_tuned_gemm.csv`: all 27 M
+  for the one untuned Pro TP8 dense shape family N=7168 K=21504
+  (errRatio 0). Install by appending to aiter's
+  `dsv4_a8w8_blockscale_bpreshuffle_tuned_gemm.csv` (idempotent check
+  first) and removing `/tmp/aiter_configs/`.
+- Upstream gap found while validating the dp8+TBO lane: DSpark verify
+  cannot be split by two-batch overlap —
+  `batch_overlap/two_batch_overlap.py:split_spec_info` reads
+  `spec_info.retrieve_index`, which `DFlashVerifyInput` does not have
+  (EAGLE-only assumption). Until fixed, TBO lanes are target-only for
+  DSpark models; at 80-way concurrency DSpark (chat ~3.7k tok/s) beats
+  the TBO lane without it (2.6k), so the standing Pro config keeps spec
+  and skips TBO.
