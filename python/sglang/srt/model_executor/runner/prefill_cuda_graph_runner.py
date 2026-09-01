@@ -551,6 +551,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.attn_metadata_buffers: Optional[Dict[int, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
+        self._bcg_replay_max_seq_len: Optional[int] = (
+            model_runner.attn_backend.bcg_replay_max_seq_len
+            if self.use_captured_attn_metadata
+            else None
+        )
 
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
@@ -1141,6 +1146,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
+        max_seq_len: Optional[int] = None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1172,6 +1178,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
+            return False
+        # Captured BCG metadata covers a bounded seq len (page-table width is
+        # frozen at capture); longer batches replay eagerly.
+        if (
+            max_seq_len is not None
+            and self._bcg_replay_max_seq_len is not None
+            and max_seq_len > self._bcg_replay_max_seq_len
+        ):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
@@ -1224,6 +1238,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.model_runner.lora_manager.can_use_prefill_cuda_graph(
                     forward_batch
                 )
+            ),
+            max_seq_len=(
+                int(forward_batch.seq_lens_cpu.max())
+                if self._bcg_replay_max_seq_len is not None
+                and forward_batch.seq_lens_cpu is not None
+                and forward_batch.seq_lens_cpu.numel() > 0
+                else None
             ),
         ):
             return False

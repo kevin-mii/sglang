@@ -150,6 +150,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Longest seq len the backend's captured BCG metadata covers; batches
+    # with a longer seq fall back to eager prefill. None means unlimited.
+    bcg_replay_max_seq_len: Optional[int] = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
