@@ -79,6 +79,8 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_gfx95_supported,
+    is_hip,
     is_npu,
     is_pin_memory_available,
 )
@@ -268,10 +270,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
+        self._fold_state_logged = False
+        # gfx95: the epilogue's in-graph tp_sync broadcasts capture through the
+        # PyNccl dispatch in GroupCoordinator.broadcast; its kernels are Triton.
         if (
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or (is_hip() and is_gfx95_supported()))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -750,6 +755,19 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+        if not self._fold_state_logged:
+            self._fold_state_logged = True
+            logger.info(
+                "DSpark accept fold state: folded_accept=%s (fold_eligible=%s, "
+                "run_compact=%s, can_run_cuda_graph=%s, epilogue=%s, "
+                "proposal_folded=%s)",
+                folded_accept,
+                fold_eligible,
+                run_compact,
+                can_run_cuda_graph,
+                epilogue is not None,
+                proposal.folded,
+            )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
