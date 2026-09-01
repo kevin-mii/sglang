@@ -39,11 +39,19 @@ Measured (bs=1, il=24k, DSpark block 4, 8x MI350X VF): 256 -> 273 tok/s
 heuristic FlyDSL fallback. Tuned token grid: pow2 1..16384 (runtime token
 lookups are pow2-bucketed).
 
-Reproduce:
+**Status: tuned, but REVERTED — do not install.**
 
-```bash
-python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp4-flydsl \
-  -i dsv4_flash_tp8_untuned_fmoe_shapes.csv -o <tuned>.csv --mp 8
-```
-
-Install as `aiter/configs/model_configs/dsv4_flash_fp8fp4_tp8_tuned_fmoe.csv`.
+- `--mxfp4-flydsl` is the wrong tuner family (a4w4; all candidates fail on a
+  missing codegen'd `aux_sortzi_NE257_TOPK7` sorting instance).
+- Default mode (`gemm_moe_tune.py -i ... -o ... --mp 8`) tunes the runtime's
+  afp8_wfp4 FlyDSL candidates and produced rows for all 15 token sizes with
+  reported err 0.0-5.5% — but installing them **breaks the model end to end**:
+  DSpark accept length drops 3.08 → 1.00 and GSM8K-20 drops to 0.05 (garbage
+  output). The tuner's isolated validation does not cover the runtime's
+  fused-shared-expert layout for this shape. Evidence kept as
+  `dsv4_flash_tp8_tuned_fmoe.csv.BROKEN-DO-NOT-USE`.
+- Measured upside was small anyway: the heuristic FlyDSL fallback picks
+  (t32x128x256 pm1) are within ~10% of the tuner's best at decode token sizes
+  (~0.06 ms of a 12 ms verify step, ≈0.5% e2e). Needs aiter-side
+  investigation (tuner layout coverage for expert=N+1 fused-shared shapes)
+  before retrying; not worth blocking this branch on.
