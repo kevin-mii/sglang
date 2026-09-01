@@ -87,3 +87,21 @@ happens to only pick kernels compatible with the non-interleaved layout, and
 the tuner's layout/opus-family winners mis-read it -> garbage. Fix belongs in
 aiter's fmoe tuner (prep weights to match the runtime a8w4 layout, or emit
 the layout as a csv column the runtime dispatch checks).
+
+**Layout-flip experiment (2026-09-01, reverted):** flipping sglang's a8w4
+expert-weight shuffle to interleaved (verified byte-identical to the tuner's
+`shuffle_weight_a16w4` prep; `shuffle_weight(is_guinterleave=True)` == it)
+plus deploying the tuned csv via `AITER_CONFIG_FMOE` crashes the server with
+`HSA_STATUS_ERROR_EXCEPTION` (hardware page fault) in the first prefill —
+including with all opus rows swapped for harness-validated plain/flydsl
+alternatives, i.e. the flydsl `moe2_layout` family itself faults under real
+serving at small token counts while passing the isolated harness with the
+same shape and weight layout. There is therefore a SECOND divergence layer
+between the tuner harness and sglang's runtime `fused_moe` invocation
+(suspects: scale tensor dtype/2D-vs-flat layout, hidden/intermediate pad
+args, moe_sorting buffer sizing). Notes for whoever picks this up: the
+runtime layout is a hybrid (weights non-interleaved via
+`shuffle_gu_intv = gu_intv and not _use_aiter_a8w4`, scales interleaved),
+the tuner has no layout axis at all, and the fast family is interleave-only.
+Expected payoff once fixed: ~5-8% of the bs=32 decode step (MoE is 22.5%);
+~0 at bs=1 (heuristic already optimal in the compatible family).
