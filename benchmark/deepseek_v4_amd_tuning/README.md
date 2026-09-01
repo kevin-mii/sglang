@@ -96,12 +96,43 @@ plus deploying the tuned csv via `AITER_CONFIG_FMOE` crashes the server with
 including with all opus rows swapped for harness-validated plain/flydsl
 alternatives, i.e. the flydsl `moe2_layout` family itself faults under real
 serving at small token counts while passing the isolated harness with the
-same shape and weight layout. There is therefore a SECOND divergence layer
-between the tuner harness and sglang's runtime `fused_moe` invocation
-(suspects: scale tensor dtype/2D-vs-flat layout, hidden/intermediate pad
-args, moe_sorting buffer sizing). Notes for whoever picks this up: the
-runtime layout is a hybrid (weights non-interleaved via
-`shuffle_gu_intv = gu_intv and not _use_aiter_a8w4`, scales interleaved),
-the tuner has no layout axis at all, and the fast family is interleave-only.
-Expected payoff once fixed: ~5-8% of the bs=32 decode step (MoE is 22.5%);
-~0 at bs=1 (heuristic already optimal in the compatible family).
+same shape and weight layout. **Full root-cause session (2026-09-01, second pass with gh research).**
+Upstream already has the two fixable pieces in flight:
+- [ROCm/aiter#4998](https://github.com/ROCm/aiter/pull/4998) (open): the
+  FlyDSL v2 stage2 wrapper (`_flydsl_v2_stage2_wrapper`) passes dynamic
+  per-call tensors through an `@lru_cache`d uint8-view helper
+  (`_mxfp4_scale_u8`); tensor hashing is id-based, so multi-layer serving
+  returns stale views of freed GPU memory. Found independently by a Kimi-K3 +
+  SGLang TP8 deployment (their symptom: OOM after aiter#4642 moved K3 to
+  `flydsl_moe2_layout_*`). **This was our HSA hardware fault** — applying the
+  PR's 13-line fix (patch: `aiter_opus/fused_moe_pr4998_stale_view_fix.patch`,
+  applied in the container) eliminates the crash entirely.
+- [ROCm/aiter#4300](https://github.com/ROCm/aiter/pull/4300) (open, verified
+  on dsv4_fp8fp4): aiter's own run_config had drifted from test_moe_2stage
+  the same way; its fix list confirms the canonical a8w4 harness contract
+  (gate_mode=INTERLEAVE + `shuffle_weight_a16w4` weights +
+  `AITER_BF16_FP8_MOE_BOUND=0`).
+
+Result matrix after applying #4998 (server no longer crashes; GSM8K-20 as the
+garbage detector; "flip" = `shuffle_weight(is_guinterleave=True)`, verified
+byte-identical to the tuner's `shuffle_weight_a16w4` prep):
+- stock layout, no csv (production heuristic): 0.95 (correct)
+- stock layout + tuned csv: 0.05
+- flipped weights + csv: 0.05
+- flipped weights + csv + gate_mode=INTERLEAVE: 0.10
+- harness, synthetic weights, same csv rows, same shape, forced shared
+  routing: ~1e-4 logits diff (correct)
+
+So the layout family mis-reads sglang's DSV4 expert weights under EVERY
+layout combination tried, while the heuristic asm family reads them
+correctly, and the harness validates the same kernels on synthetic weights.
+The remaining divergence is the EFFECTIVE weight/scale layout produced by
+`Fp8MoEMethod`'s fp4-expert branch vs the harness prep — note
+`Mxfp4MoEMethod` runs a checkpoint gate/up de-interleave permute
+(`if gate_up_interleaved:` before its shuffles) that `Fp8MoEMethod`'s
+fp4-expert branch does not, so the DSV4 checkpoint's native gate/up row
+order likely differs from the harness's synthetic GGUU. Pickup: dump one
+expert's pre-shuffle w13 rows + scales from the loader and diff against
+harness prep of the same tensors; then either add the missing permute for
+the interleave path or teach the tuner the runtime layout. Payoff once
+solved: ~5-8% of the bs=32 decode step (MoE is 22.5%); ~0 at bs=1.
