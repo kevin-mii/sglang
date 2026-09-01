@@ -778,9 +778,11 @@ class C4IndexerBackendMixin:
         # are dead work. Emit the identity fill directly and skip them. The
         # prepare step above already ran, so the indexer K-cache side effects
         # for future steps are preserved. Prefill/extend only: decode replays
-        # captured graphs where this data-dependent branch cannot fold.
+        # captured graphs where this data-dependent branch cannot fold, and
+        # breakable prefill graphs would freeze this branch at capture time.
         if (
             forward_batch.forward_mode.is_extend()
+            and not is_in_breakable_cuda_graph()
             and not forward_batch.forward_mode.is_target_verify()
             and indexer_metadata.max_c4_seq_len
             <= core_metadata.c4_sparse_page_indices.shape[1]
