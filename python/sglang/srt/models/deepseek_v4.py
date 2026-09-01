@@ -354,6 +354,51 @@ if _wo_a_aiter_batched_gemm_enabled:
 # instead of re-raising (and re-logging) on every layer/token.
 _wo_a_aiter_batched_gemm_disabled = False
 
+# None until the first large-prefill probe resolves it to "einsum" or "aiter".
+_wo_a_prefill_backend: Optional[str] = None
+# Arbitrary; large enough that the probe reflects real chunked-prefill shapes.
+_WO_A_PREFILL_PROBE_MIN_TOKENS = 2048
+
+
+def _wo_a_aiter_bgemm(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+    # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N], batch = G.
+    xq = o.transpose(0, 1).contiguous()
+    y = _wo_a_batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
+    return y.transpose(0, 1).contiguous()
+
+
+def _probe_wo_a_prefill_backend(o: torch.Tensor, wo_a: torch.Tensor) -> str:
+    """Time einsum (hipblaslt) vs the aiter bgemm on live tensors, once.
+
+    In a busy server process hipblaslt can latch a pathological algorithm for
+    this bmm (measured 10x vs the same shape in isolation on gfx950) and which
+    ranks are affected varies by boot, so a static choice is wrong either way;
+    the probe keeps the per-process winner.
+    """
+    import time
+
+    def _time(fn) -> float:
+        fn()
+        fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / 3
+
+    t_einsum = _time(lambda: torch.einsum("tgd,grd->tgr", o, wo_a))
+    t_aiter = _time(lambda: _wo_a_aiter_bgemm(o, wo_a))
+    backend = "aiter" if t_aiter < t_einsum else "einsum"
+    logger.info(
+        "wo_a prefill probe (T=%d): einsum %.0f us, aiter bgemm %.0f us -> %s",
+        o.shape[0],
+        t_einsum * 1e6,
+        t_aiter * 1e6,
+        backend,
+    )
+    return backend
+
 
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
@@ -363,27 +408,29 @@ def _apply_wo_a_bf16_matmul(
     ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
     ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
 
-    Dispatch contract: on the decode path, when the reroute is enabled
+    Dispatch contract: when the reroute is enabled
     (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
-    been disabled by a prior runtime failure, call the pre-imported aiter
-    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
-    gate off, or after a failure -- use the numerically-equivalent
-    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
-    disables the reroute for the process (logged once).
+    been disabled by a prior runtime failure, decode always uses the
+    pre-imported aiter ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``), and
+    prefill uses whichever of einsum/aiter the one-shot probe
+    (``_probe_wo_a_prefill_backend``) measured faster in this process.
+    Otherwise -- any gate off, before the probe, or after a failure -- use the
+    numerically-equivalent ``torch.einsum("tgd,grd->tgr", ...)``. The first
+    runtime kernel failure disables the reroute for the process (logged once).
     """
-    global _wo_a_aiter_batched_gemm_disabled
-    if (
-        is_decode
-        and _wo_a_aiter_batched_gemm_enabled
-        and not _wo_a_aiter_batched_gemm_disabled
-    ):
+    global _wo_a_aiter_batched_gemm_disabled, _wo_a_prefill_backend
+    if _wo_a_aiter_batched_gemm_enabled and not _wo_a_aiter_batched_gemm_disabled:
         try:
-            # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
-            # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
-            # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
-            xq = o.transpose(0, 1).contiguous()
-            y = _wo_a_batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
-            return y.transpose(0, 1).contiguous()
+            if is_decode:
+                return _wo_a_aiter_bgemm(o, wo_a)
+            if (
+                _wo_a_prefill_backend is None
+                and o.shape[0] >= _WO_A_PREFILL_PROBE_MIN_TOKENS
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                _wo_a_prefill_backend = _probe_wo_a_prefill_backend(o, wo_a)
+            if _wo_a_prefill_backend == "aiter":
+                return _wo_a_aiter_bgemm(o, wo_a)
         except Exception as err:
             _wo_a_aiter_batched_gemm_disabled = True
             logger.warning(
