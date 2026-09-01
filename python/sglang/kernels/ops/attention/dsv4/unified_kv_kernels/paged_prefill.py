@@ -317,16 +317,16 @@ def sparse_attn_v4_paged_prefill(
       out: [T, H, D] same dtype as q.
     """
     if _HAS_OPUS:
-        # OPUS contract differs from the Triton kernel in two ways the Triton
-        # path tolerates implicitly:
-        #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but
-        #    indexes assuming [T,H,D] contiguous); a non-contiguous head stride
-        #    silently reads wrong/out-of-bounds addresses. q from the model is
-        #    often a view, so force contiguity.
-        #  - it requires ``attn_sink.size(0) == H``; attn_sink is the full
-        #    per-head Parameter, so slice to the H query heads.
-        q = q.contiguous()
+        # OPUS reads q and writes out through ONE shared stride set taken from
+        # q (kargs.stride_qo_*), so any q with stride(2) == 1 works as long as
+        # out mirrors q's layout exactly (verified bit-exact against the
+        # contiguous path on gfx950). Only innermost-strided q needs a copy;
+        # aiter's own out=None allocation is torch.empty_like, which silently
+        # drops view strides, so a strided q must pass an explicit out.
+        if q.stride(2) != 1:
+            q = q.contiguous()
         H = q.shape[1]
+        # attn_sink is the full per-head Parameter; OPUS requires size(0) == H.
         if attn_sink.shape[0] != H:
             attn_sink = attn_sink[:H].contiguous()
         if (
@@ -335,6 +335,11 @@ def sparse_attn_v4_paged_prefill(
             and kv.stride(1) == 1
         ):
             kv = kv.as_strided(kv.shape, (kv.shape[1], 1))
+        out = None
+        if not q.is_contiguous():
+            out = torch.empty_strided(
+                q.shape, q.stride(), dtype=q.dtype, device=q.device
+            )
         return pa_sparse_prefill_opus(
             q,
             unified_kv,
@@ -345,6 +350,7 @@ def sparse_attn_v4_paged_prefill(
             kv_indptr_extend,
             attn_sink,
             softmax_scale,
+            out=out,
         )
     return _sparse_attn_v4_paged_prefill_triton(
         q,
