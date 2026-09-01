@@ -317,12 +317,14 @@ def sparse_attn_v4_paged_prefill(
       out: [T, H, D] same dtype as q.
     """
     if _HAS_OPUS:
-        # OPUS reads q and writes out through ONE shared stride set taken from
-        # q (kargs.stride_qo_*), so any q with stride(2) == 1 works as long as
-        # out mirrors q's layout exactly (verified bit-exact against the
-        # contiguous path on gfx950). Only innermost-strided q needs a copy;
-        # aiter's own out=None allocation is torch.empty_like, which silently
-        # drops view strides, so a strided q must pass an explicit out.
+        # OPUS supports any q with stride(2) == 1. Stock aiter reads q and
+        # writes out through ONE shared stride set taken from q
+        # (kargs.stride_qo_*), so out must mirror q's layout exactly (verified
+        # bit-exact on gfx950); aiter's own out=None allocation is
+        # torch.empty_like, which silently drops view strides, so a strided q
+        # must pass an explicit out. With the separate-out-strides aiter patch
+        # (benchmark/deepseek_v4_amd_tuning/aiter_opus/) any out layout works,
+        # and the mirrored out below stays valid there too.
         if q.stride(2) != 1:
             q = q.contiguous()
         H = q.shape[1]
