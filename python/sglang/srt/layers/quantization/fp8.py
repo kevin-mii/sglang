@@ -155,6 +155,7 @@ if _use_aiter or _use_hip_int4:
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
         aiter_w8a8_block_fp8_linear,
+        block_quant_dequant,
         use_aiter_triton_gemm_w8a8_tuned_gfx950,
     )
 
@@ -728,6 +729,27 @@ class Fp8LinearMethod(LinearMethodBase):
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
+            ptpc_decode_m = envs.SGLANG_OPT_BLOCK_FP8_DENSE_PTPC_DECODE_M.get()
+            if ptpc_decode_m > 0 and self.weight_block_size is not None:
+                # Cached rowwise-fp8 copy for the small-M decode fast path in
+                # aiter_w8a8_block_fp8_linear; must be built from the
+                # still-unshuffled block layout, and the attrs survive the
+                # in-place bpreshuffle below (copy_ keeps the object).
+                w32 = block_quant_dequant(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data.to(torch.float32),
+                    self.weight_block_size,
+                    torch.float32,
+                )
+                row_scale = (
+                    w32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
+                )
+                layer.weight._ptpc_weight = shuffle_weight(
+                    (w32 / row_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+                    (16, 16),
+                )
+                layer.weight._ptpc_scale = row_scale.to(torch.float32)
+                del w32
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
                 # TODO(1am9trash), to deal with case that this branch chance
