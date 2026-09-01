@@ -674,6 +674,44 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    def _fill_sequential_c4_indices(
+        self,
+        *,
+        indexer_metadata: "PagedIndexerMetadata",
+        core_metadata,
+        num_queries: int,
+    ) -> None:
+        """Write the identity selection topk_transform would produce when
+        seq_lens <= TOPK: raw index i maps through the page table as
+        (physical_page << page_bits) | offset, -1 beyond each query's
+        c4_seq_len. Mirrors _topk_transform_512_vectorized's sequential
+        branch."""
+        out = core_metadata.c4_sparse_page_indices
+        topk = out.shape[1]
+        device = out.device
+        page_size = indexer_metadata.c4_page_size
+        page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+        page_mask = page_size - 1
+
+        c4_seq_lens = indexer_metadata.c4_seq_lens
+        page_table = indexer_metadata.page_table
+        rows = min(num_queries, out.shape[0], c4_seq_lens.shape[0])
+
+        seq = torch.arange(topk, device=device, dtype=torch.int32)
+        valid = seq.unsqueeze(0) < c4_seq_lens[:rows].view(rows, 1)
+        # Positions past each query's seq_len are masked to -1 below, so the
+        # clamp only keeps the gather in-bounds when topk spans more pages
+        # than the table holds.
+        page_idx = (
+            (seq >> page_bits).clamp(max=page_table.shape[1] - 1).unsqueeze(0)
+        ).expand(rows, -1)
+        physical = torch.gather(page_table[:rows], 1, page_idx.long())
+        page_indices = ((physical << page_bits) | (seq & page_mask)).to(torch.int32)
+        page_indices = page_indices.masked_fill(~valid, -1)
+        out[:rows].copy_(page_indices)
+        if out.shape[0] > rows:
+            out[rows:].fill_(-1)
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -733,6 +771,30 @@ class C4IndexerBackendMixin:
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
             )
+
+        # Short-context fast path: when every query's compressed context fits
+        # in TOPK, topk_transform provably emits sequential identity indices
+        # (its needs_sequential branch), so the mqa-logits scoring and top-k
+        # are dead work. Emit the identity fill directly and skip them. The
+        # prepare step above already ran, so the indexer K-cache side effects
+        # for future steps are preserved. Prefill/extend only: decode replays
+        # captured graphs where this data-dependent branch cannot fold.
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and indexer_metadata.max_c4_seq_len
+            <= core_metadata.c4_sparse_page_indices.shape[1]
+            and not self.debug_use_external_c4_sparse_indices
+            and get_global_indexer_capturer() is None
+            and self.hisparse_coordinator is None
+            and core_metadata.c4_sparse_raw_indices is None
+        ):
+            self._fill_sequential_c4_indices(
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+                num_queries=num_queries,
+            )
+            return
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
