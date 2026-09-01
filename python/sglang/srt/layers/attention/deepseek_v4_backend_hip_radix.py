@@ -551,6 +551,12 @@ class DeepseekV4HipRadixBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        bcg_seq_cap = envs.SGLANG_OPT_DSV4_BCG_METADATA_MAX_SEQ_LEN.get()
+        self.bcg_replay_max_seq_len = (
+            min(self.MAX_SEQ_LEN_FOR_CAPTURE, bcg_seq_cap)
+            if bcg_seq_cap > 0
+            else self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -1264,7 +1270,7 @@ class DeepseekV4HipRadixBackend(
         assert forward_batch.seq_lens_cpu is not None
         assert extend_seq_lens_cpu is not None
         return self.init_forward_metadata_prefill(
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.bcg_replay_max_seq_len,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=forward_batch.seq_lens_cpu.tolist(),
