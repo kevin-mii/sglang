@@ -55,3 +55,20 @@ lookups are pow2-bucketed).
   (~0.06 ms of a 12 ms verify step, ≈0.5% e2e). Needs aiter-side
   investigation (tuner layout coverage for expert=N+1 fused-shared shapes)
   before retrying; not worth blocking this branch on.
+
+**Retry with the M3 methodology (2026-09-01)** — retuned with
+`-o2 <profile_all> --errRatio 0.005`, then hand-selected per-token rows
+restricted to the runtime-proven plain `flydsl_moe2_afp8_wfp4_bf16_*` family
+(the M3 playbook; deploy would be via `AITER_CONFIG_FMOE=<single csv>`, never
+model_configs appends). Outcome (`dsv4_flash_tp8_fmoe_profile_all.csv`):
+- decode tokens (1-8): best plain-family candidates run 24-37 us vs ~17 us
+  for the current heuristic picks — installing them would REGRESS decode.
+  Every tuner candidate faster than the heuristic is in the broken
+  layout/opus family.
+- prefill tokens (>=4096): only cktile-stage1 rows beat the heuristic and
+  only by ~8% of MoE-kernel time (~3-4 ms of a 438 ms prefill) — not worth
+  the correctness risk of another unproven family.
+Conclusion: with aiter `c16d44b9` the heuristic already sits at the working
+family's optimum; the real fix is aiter-side (make the v2 layout family
+correct for expert=N+1 fused-shared shapes — it is ~40% faster at decode).
+No csv is installed.
