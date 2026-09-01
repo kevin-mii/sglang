@@ -72,3 +72,18 @@ Conclusion: with aiter `c16d44b9` the heuristic already sits at the working
 family's optimum; the real fix is aiter-side (make the v2 layout family
 correct for expert=N+1 fused-shared shapes — it is ~40% faster at decode).
 No csv is installed.
+
+**Root cause (2026-09-01, isolated in aiter's own harness):** the layout
+family is NOT numerically broken — `op_tests/test_moe_2stage.py` validates the
+exact broken csv rows at 4096/256/257/7 to ~1e-4 logits diff, including with
+runtime-style forced shared-expert routing. The divergence is the **weight
+shuffle layout**: for a8w4 (fp8 act x fp4x2 weight) sglang's Fp8MoEMethod
+shuffles expert weights **non-interleaved**
+(`fp8.py: shuffle_gu_intv = gu_intv and not _use_aiter_a8w4`), while aiter's
+tuner/test harness preps a8w4 weights **gate-up-interleaved**
+(`shuffle_weight_a16w4(..., gate_up=True)`). Tuner winners are therefore
+selected under a layout the runtime doesn't have; the runtime heuristic
+happens to only pick kernels compatible with the non-interleaved layout, and
+the tuner's layout/opus-family winners mis-read it -> garbage. Fix belongs in
+aiter's fmoe tuner (prep weights to match the runtime a8w4 layout, or emit
+the layout as a csv column the runtime dispatch checks).
