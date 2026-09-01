@@ -895,10 +895,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        # The runtime draft block (--speculative-dspark-block-size) can be
+        # smaller than the checkpoint-resolved self.gamma; the tap and the
+        # sampled tokens carry the runtime block, so size the view from them.
+        block = int(sampled_tokens.shape[1])
+        x_post_hc = x_post_hc.view(bs, block, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : block - 1]], dim=1
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
