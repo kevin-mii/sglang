@@ -879,6 +879,11 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Batches of at most this many tokens run block-fp8 dense linears through a
+    # cached rowwise-fp8 weight copy on aiter's per-token x per-channel
+    # bpreshuffle GEMM; larger M keeps the block-scale GEMMs. Coarsens the
+    # 128x128 weight scales to per-row -- gate accuracy before adopting. 0 off.
+    SGLANG_OPT_BLOCK_FP8_DENSE_PTPC_DECODE_M = EnvInt(0)
 
     # ===================================================================
     # Apple Silicon and MLX

@@ -70,6 +70,7 @@ _use_aiter = (
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+_BLOCK_FP8_DENSE_PTPC_DECODE_M = envs.SGLANG_OPT_BLOCK_FP8_DENSE_PTPC_DECODE_M.get()
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
 # fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
 # (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192 at TP8; at TP4 the
@@ -1175,6 +1176,25 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    # Skinny-M fast path: dense linears may carry a cached rowwise-fp8 copy
+    # (SGLANG_OPT_BLOCK_FP8_DENSE_PTPC_DECODE_M, built in Fp8LinearMethod); the
+    # aiter per-token x per-channel GEMM beats the block-scale GEMMs at
+    # decode-sized M. Optional dynamic attr on the weight Parameter, so getattr
+    # is the narrowing here.
+    if input_scale is None and _BLOCK_FP8_DENSE_PTPC_DECODE_M > 0:
+        ptpc_weight = getattr(weight, "_ptpc_weight", None)
+        if (
+            ptpc_weight is not None
+            and input_2d.shape[0] <= _BLOCK_FP8_DENSE_PTPC_DECODE_M
+        ):
+            out = apply_fp8_ptpc_linear(
+                input=input_2d,
+                weight=ptpc_weight,
+                weight_scale=weight._ptpc_scale,
+                bias=bias,
+            )
+            return out.to(input.dtype).view(*output_shape)
 
     n, k = weight.shape
 
