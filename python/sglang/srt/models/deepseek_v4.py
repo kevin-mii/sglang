@@ -367,14 +367,11 @@ def _wo_a_aiter_bgemm(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
     return y.transpose(0, 1).contiguous()
 
 
+# hipblaslt can latch a pathological algorithm for this bmm in a busy server
+# process (measured 10x vs the same shape in isolation on gfx950), and which
+# ranks are affected varies by boot; probe both on live tensors once and keep
+# the per-process winner.
 def _probe_wo_a_prefill_backend(o: torch.Tensor, wo_a: torch.Tensor) -> str:
-    """Time einsum (hipblaslt) vs the aiter bgemm on live tensors, once.
-
-    In a busy server process hipblaslt can latch a pathological algorithm for
-    this bmm (measured 10x vs the same shape in isolation on gfx950) and which
-    ranks are affected varies by boot, so a static choice is wrong either way;
-    the probe keeps the per-process winner.
-    """
     import time
 
     def _time(fn) -> float:

@@ -147,11 +147,10 @@ class UnifiedKvMetadata:
         )
 
     def refresh_for_bcg_replay_(self, fresh: UnifiedKvMetadata) -> None:
-        """BCG replay refresh: the compressed-store locations feed kernels
-        recorded inside the captured segments, so their capture-time buffers
-        are refreshed in place; the pf_* streams and decode streams are read
-        only by the eager attention break and may be rebound (their length is
-        the real, not padded, token count)."""
+        # c4/c128_out_loc feed kernels recorded inside the captured segments, so
+        # their capture-time buffers refresh in place; the pf_*/decode streams
+        # are read only by the eager attention break and rebind (they are sized
+        # to the real, not padded, token count).
         copy_metadata(
             src=fresh,
             dst=self,
@@ -265,13 +264,10 @@ class DSV4AttnMetadata:
         )
 
     def refresh_for_bcg_replay_(self, fresh: DSV4AttnMetadata) -> None:
-        """BCG replay refresh: the captured prefill segments recorded the
-        addresses of every tensor the in-segment indexer/compressor/store
-        kernels touch, so those are refreshed in place from `fresh` (built
-        against the padded static batch with graph-stable widths). Fields
-        read only by the eager attention break are rebound instead.
-        swa_out_cache_loc is left untouched: the caller refreshes the
-        capture-time buffer in place from the live out_cache_loc."""
+        # Captured prefill segments recorded the addresses of every tensor the
+        # in-segment indexer/compressor/store kernels touch; refresh those in
+        # place from `fresh` (built against the padded static batch), rebind
+        # break-only fields, and leave swa_out_cache_loc for the caller.
         captured_unified = self.unified
         captured_swa_out_cache_loc = self.swa_out_cache_loc
         copy_metadata(
@@ -1268,9 +1264,8 @@ class DeepseekV4HipRadixBackend(
     def _build_prefill_metadata_for_bcg(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
-        """Prefill metadata with graph-stable widths: max_seq_len is pinned so
-        page_table / c128 index widths match across capture and every replay,
-        and the compressor plans are padded to the tier token count."""
+        # max_seq_len is pinned so page_table / c128 index widths match across
+        # capture and every replay; compressor plans pad to the tier token count.
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert forward_batch.seq_lens_cpu is not None
         assert extend_seq_lens_cpu is not None

@@ -3,8 +3,8 @@
 decode-sized batches on the aiter MoE runner, applied to a stock aiter install
 via runtime patches.
 
-With P = M*topk pairs (<=256) the whole sorting job — stable sort-by-expert,
-per-expert block padding, expert-id table, num_valid, moe_buf zero-fill — and
+With P = M*topk pairs (<=256) the whole sorting job -- stable sort-by-expert,
+per-expert block padding, expert-id table, num_valid, moe_buf zero-fill -- and
 the stage1 activation quant fit one Triton launch, replacing aiter's opus sort
 and quant kernels whose fixed launch/ramp overhead dominates at decode sizes.
 
@@ -19,9 +19,9 @@ Output layouts match the aiter kernels bit-for-bit:
 
 Three patch points on the aiter.fused_moe module namespace, all falling back
 to the original functions when the fast path does not apply:
-  * ``fused_moe``            — stashes hidden_states for the sort-time quant
-  * ``_moe_sorting_impl``    — replaces the opus sort at M*topk <= 256
-  * ``fused_dynamic_mxfp8_quant_moe_sort`` — consumes the pre-emitted quant
+  * ``fused_moe``            -- stashes hidden_states for the sort-time quant
+  * ``_moe_sorting_impl``    -- replaces the opus sort at M*topk <= 256
+  * ``fused_dynamic_mxfp8_quant_moe_sort`` -- consumes the pre-emitted quant
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def _moe_sorting_small_kernel(
 
     P = M * TOPK
     offs_p = tl.arange(0, P_POW2)
-    # Sort math is a few P x P vector ops — cheap enough that the quant CTAs
+    # Sort math is a few P x P vector ops -- cheap enough that the quant CTAs
     # recompute it independently instead of waiting on pid 0.
     mask_p = offs_p < P
     # Sentinel expert (larger than any real id) keeps inactive lanes out of
@@ -585,6 +585,8 @@ def apply_aiter_small_moe_sort_patch() -> None:
 
     @functools.wraps(orig_mx_quant)
     def mx_quant_wrapper(input, sorted_ids, *args, **kwargs):
+        # sorted_ids is the only object both wrappers see; the stash exists only
+        # when the fused small-batch sort ran, so getattr is the narrowing.
         pre = getattr(sorted_ids, "_premx_quant", None)
         if pre is not None and pre[0].shape == input.shape:
             del sorted_ids._premx_quant
