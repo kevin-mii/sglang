@@ -604,7 +604,9 @@ inline PrefillPlan plan_compress_prefill(
     }
     counter += extend_len;
   }
-  RuntimeCheck(counter == num_q_tokens);
+  // Graph mode pads plans to num_q_tokens (the capture tier), so a replay
+  // batch may carry fewer real tokens; kernel_1 invalidates the tail rows.
+  RuntimeCheck(use_cuda_graph ? counter <= num_q_tokens : counter == num_q_tokens);
 
   const auto copy_to_device = [stream](void* cuda_ptr, auto* host_ptr, size_t count) {
     const auto size_bytes = count * sizeof(*host_ptr);
@@ -775,7 +777,9 @@ inline PrefillPlan plan_compress_prefill_legacy(
     }
     counter += extend_len;
   }
-  RuntimeCheck(counter == num_q_tokens);
+  // Graph mode pads plans to num_q_tokens (the capture tier), so a replay
+  // batch may carry fewer real tokens; kernel_1 invalidates the tail rows.
+  RuntimeCheck(use_cuda_graph ? counter <= num_q_tokens : counter == num_q_tokens);
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);

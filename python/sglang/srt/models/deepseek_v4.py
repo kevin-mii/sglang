@@ -1653,16 +1653,33 @@ class MQALayer(MqaAttentionBase):
         )
 
         if is_unified_kv_triton():
-            o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
-                k=attn_k,
-                v=attn_k,
-                layer=self.attn_mqa,
-                forward_batch=forward_batch,
-                compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
-                save_kv_cache=kv is not None,
-            )
+            attn_q = q_out if q_out is not None else q
+            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                # Attention must break out of the captured segment: its metadata
+                # tensors are rebuilt at fresh addresses on every replay.
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                )
+                bcg_deepseek_v4_attention_with_output(
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    self.attn_sink,
+                    kv is not None,
+                )
+            else:
+                o = attn_backend.forward(
+                    q=attn_q,
+                    k=attn_k,
+                    v=attn_k,
+                    layer=self.attn_mqa,
+                    forward_batch=forward_batch,
+                    compress_ratio=self.compress_ratio,
+                    attn_sink=self.attn_sink,
+                    save_kv_cache=kv is not None,
+                )
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False

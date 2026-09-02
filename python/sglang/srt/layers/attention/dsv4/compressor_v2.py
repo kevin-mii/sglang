@@ -452,7 +452,8 @@ def create_paged_compressor_data(
             assert extend_lens_cpu is not None
             seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
             extend_lens_planner = torch.tensor(extend_lens_cpu, dtype=torch.int64)
-            num_q_tokens = sum(extend_lens_cpu)
+            if num_q_tokens is None:
+                num_q_tokens = sum(extend_lens_cpu)
         else:
             assert num_q_tokens is not None
             seq_lens_planner = seq_lens.to(torch.int64)
