@@ -146,6 +146,32 @@ class UnifiedKvMetadata:
             assign_fields=["swa_loc"],
         )
 
+    def refresh_for_bcg_replay_(self, fresh: UnifiedKvMetadata) -> None:
+        # c4/c128_out_loc feed kernels recorded inside the captured segments, so
+        # their capture-time buffers refresh in place; the pf_*/decode streams
+        # are read only by the eager attention break and rebind (they are sized
+        # to the real, not padded, token count).
+        copy_metadata(
+            src=fresh,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=["c4_out_loc", "c128_out_loc"],
+            assign_fields=[
+                "swa_loc",
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+            ],
+        )
+
 
 @dataclass
 class DSV4AttnMetadata:
@@ -236,6 +262,54 @@ class DSV4AttnMetadata:
                 "c128_flashmla_metadata",
             ],
         )
+
+    def refresh_for_bcg_replay_(self, fresh: DSV4AttnMetadata) -> None:
+        # Captured prefill segments recorded the addresses of every tensor the
+        # in-segment indexer/compressor/store kernels touch; refresh those in
+        # place from `fresh` (built against the padded static batch), rebind
+        # break-only fields, and leave swa_out_cache_loc for the caller.
+        captured_unified = self.unified
+        captured_swa_out_cache_loc = self.swa_out_cache_loc
+        copy_metadata(
+            src=fresh,
+            dst=self,
+            check_eq_fields=[
+                "c4_sparse_topk",
+                "page_size",
+                "cuda_int32_kwargs",
+            ],
+            copy_fields=[
+                "raw_out_loc",
+                "seq_lens_casual",
+                "positions_casual",
+                "c4_out_loc",
+                "c128_out_loc",
+                "page_table",
+                "swa_page_indices",
+                "swa_topk_lengths",
+                "c128_page_indices",
+                "c128_topk_lengths_clamp1",
+                "c128_topk_lengths_raw",
+                "c4_topk_lengths_raw",
+                "c4_topk_lengths_clamp1",
+                "c4_sparse_topk_lengths",
+                "c4_sparse_topk_lengths_raw",
+                "c4_sparse_page_indices",
+                "c4_sparse_raw_indices",
+            ],
+            assign_fields=[
+                "swa_out_cache_loc",
+                "c1_flashmla_metadata",
+                "c4_flashmla_metadata",
+                "c128_flashmla_metadata",
+                "unified",
+            ],
+        )
+        self.swa_out_cache_loc = captured_swa_out_cache_loc
+        if captured_unified is not None:
+            assert fresh.unified is not None
+            captured_unified.refresh_for_bcg_replay_(fresh.unified)
+            self.unified = captured_unified
 
     def init_compression_metadata(self, unified_swa_pages: int = 0):
         assert self.page_table.dim() == 2
@@ -383,6 +457,14 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
+    def refresh_for_bcg_replay_(self, fresh: DSV4Metadata) -> None:
+        self.core_attn_metadata.refresh_for_bcg_replay_(fresh.core_attn_metadata)
+        maybe_copy_inplace(self.indexer_metadata, src=fresh.indexer_metadata)
+        maybe_copy_inplace(self.c4_compress_metadata, src=fresh.c4_compress_metadata)
+        maybe_copy_inplace(
+            self.c128_compress_metadata, src=fresh.c128_compress_metadata
+        )
+
 
 @dataclass
 class DSV4RawVerifyMetadata:
@@ -439,6 +521,7 @@ class DeepseekV4HipRadixBackend(
     # TboAttnBackend reads this to skip children in the *_graph paths only.
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     def __init__(
         self,
@@ -544,6 +627,7 @@ class DeepseekV4HipRadixBackend(
         compress_gpu_plan: bool = False,
         extend_start_loc: Optional[torch.Tensor] = None,
         attach_decode_streams: bool = False,
+        compress_num_q_tokens: Optional[int] = None,
     ) -> DSV4Metadata:
         if extend_start_loc is not None:
             from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
@@ -628,6 +712,9 @@ class DeepseekV4HipRadixBackend(
                 extend_lens=extend_seq_lens,
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                # BCG passes the padded tier count so plan shapes stay
+                # graph-stable across replays with fewer real tokens.
+                num_q_tokens=compress_num_q_tokens,
             )
         return DSV4Metadata(
             core_attn_metadata,
@@ -1167,6 +1254,59 @@ class DeepseekV4HipRadixBackend(
         self.forward_metadata = metadata
         self.init_forward_metadata_in_graph(forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
+
+    def _build_prefill_metadata_for_bcg(
+        self, forward_batch: ForwardBatch
+    ) -> DSV4Metadata:
+        # max_seq_len is pinned so page_table / c128 index widths match across
+        # capture and every replay; compressor plans pad to the tier token count.
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        assert forward_batch.seq_lens_cpu is not None
+        assert extend_seq_lens_cpu is not None
+        return self.init_forward_metadata_prefill(
+            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens_cpu=forward_batch.seq_lens_cpu.tolist(),
+            out_cache_loc=forward_batch.out_cache_loc,
+            num_tokens=sum(extend_seq_lens_cpu),
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            use_prefill_cuda_graph=True,
+            compress_num_q_tokens=forward_batch.out_cache_loc.shape[0],
+        )
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        metadata = self._build_prefill_metadata_for_bcg(forward_batch)
+        self.forward_metadata = metadata
+        self.init_forward_metadata_in_graph(forward_batch)
+        return metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        fresh = self._build_prefill_metadata_for_bcg(batch)
+        assert isinstance(capture_metadata, DSV4Metadata)
+        capture_metadata.refresh_for_bcg_replay_(fresh)
+        # The in-segment SWA store captured this buffer's address; refresh it
+        # in place from the live (runner-maintained) out_cache_loc.
+        core = capture_metadata.core_attn_metadata
+        if core.swa_out_cache_loc is not None:
+            core.swa_out_cache_loc.copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    batch.out_cache_loc
+                ).to(torch.int32)
+            )
+        self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
