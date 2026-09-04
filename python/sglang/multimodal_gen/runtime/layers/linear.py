@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/linear.py
 
+import functools
+import inspect
 from abc import abstractmethod
 
 import torch
@@ -86,6 +88,16 @@ def adjust_scalar_to_fused_array(
         loaded_weight = loaded_weight[0]
 
     return param[shard_id], loaded_weight
+
+
+@functools.lru_cache(maxsize=None)
+def _loader_takes_tp_rank(param_cls: type, method: str) -> bool:
+    """SRT's vLLM-style parameters (created by the SRT-backed quant methods such
+    as ``mxfp8``) take ``tp_rank`` explicitly; the diffusion parameters do not."""
+    try:
+        return "tp_rank" in inspect.signature(getattr(param_cls, method)).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 class LinearMethodBase(QuantizeMethodBase):
@@ -503,7 +515,12 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-        param.load_column_parallel_weight(loaded_weight=loaded_weight)
+        if _loader_takes_tp_rank(type(param), "load_column_parallel_weight"):
+            param.load_column_parallel_weight(
+                loaded_weight=loaded_weight, tp_rank=self.tp_rank
+            )
+        else:
+            param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
@@ -716,10 +733,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 if loaded_weight.shape == param.data.shape:
                     param.data.copy_(loaded_weight)
                     return
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight, shard_id=0, tp_rank=self.tp_rank
+                )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight, tp_rank=self.tp_rank
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
@@ -737,6 +758,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
+            tp_rank=self.tp_rank,
         )
 
     def _weight_loader_v2_block_quant_scale(
@@ -1179,7 +1201,12 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        if _loader_takes_tp_rank(type(param), "load_row_parallel_weight"):
+            param.load_row_parallel_weight(
+                loaded_weight=loaded_weight, tp_rank=self.tp_rank
+            )
+        else:
+            param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
