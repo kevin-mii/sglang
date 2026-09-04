@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_npu import (
     NPUMXFP4Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_cublaslt import (
+    Mxfp8CublasltConfig,
+)
 
 QuantizationMethods = Literal[
     "auto-round",
@@ -42,6 +45,7 @@ QuantizationMethods = Literal[
     "bitsandbytes",
     "modelslim",
     "mxfp8",
+    "mxfp8_cublaslt",
     "mxfp4",
     "mxfp4_npu",
     "kitchen_int8",
@@ -61,6 +65,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "fp8_per_tensor": Fp8PerTensorConfig,
     "mxfp4": Mxfp4Config,
     "mxfp8": MXFP8Config,
+    "mxfp8_cublaslt": Mxfp8CublasltConfig,
     "mxfp4_npu": NPUMXFP4Config,
     "kitchen_int8": KitchenInt8Config,
 }

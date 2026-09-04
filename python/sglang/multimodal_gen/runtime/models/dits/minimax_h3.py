@@ -22,11 +22,15 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_mxfp8_swizzled,
+    can_use_silu_mul_mxfp8,
     can_use_silu_mul_per_tensor_fp8,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_mxfp8_,
+    silu_mul_mxfp8,
     silu_mul_per_tensor_fp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -365,6 +369,19 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSN
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _mx_prequant_ok(linear: nn.Module | None, h: torch.Tensor) -> bool:
+    """Fuse the adaLN modulation with the MXFP8 quant of ``linear``'s input?"""
+    accepts = getattr(
+        getattr(linear, "quant_method", None), "accepts_mxfp8_input", None
+    )
+    return (
+        accepts is not None
+        and accepts(linear)
+        and h.is_contiguous()
+        and can_use_mxfp8_swizzled(h)
+    )
 
 
 def _modulate_scale_shift(
@@ -1040,8 +1057,12 @@ class MiniMaxH3Attention(nn.Module):
         subblock_sparse_query_block_mask: torch.Tensor | None = None,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
+
+        ``x_prequant``: the same rows already quantized for ``qkv_proj`` by a
+        fused producer (``(fp8, scales)``); ``x`` stays bf16 for everything else.
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1062,7 +1083,7 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
@@ -1186,7 +1207,7 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "mps":
+        if not isinstance(x, tuple) and x.device.type == "mps":
             out = torch.empty_like(x)
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
@@ -1199,9 +1220,25 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
-        if self.fc2.quant_method.accepts_fp8_per_tensor_input(
-            self.fc2
-        ) and can_use_silu_mul_per_tensor_fp8(hidden):
+        accepts_mx = getattr(self.fc2.quant_method, "accepts_mxfp8_input", None)
+        if (
+            accepts_mx is not None
+            and accepts_mx(self.fc2)
+            and can_use_silu_mul_mxfp8(hidden)
+        ):
+            # SwiGLU fused with the block-32 MXFP8 quant; fc2 takes the
+            # prequantized (fp8, swizzled scales) input
+            out, _ = self.fc2(silu_mul_mxfp8(hidden))
+            return out
+        # SRT-backed quant methods (e.g. mxfp8) do not define the hook
+        accepts_prequant = getattr(
+            self.fc2.quant_method, "accepts_fp8_per_tensor_input", None
+        )
+        if (
+            accepts_prequant is not None
+            and accepts_prequant(self.fc2)
+            and can_use_silu_mul_per_tensor_fp8(hidden)
+        ):
             # SwiGLU fused with the per-tensor fp8 absmax; fc2 takes the
             # prequantized (fp8, scale) input
             out, _ = self.fc2(silu_mul_per_tensor_fp8(hidden))
@@ -1417,11 +1454,21 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
-        )
+        h_prequant = None
+        if _mx_prequant_ok(getattr(self.attn, "qkv_proj", None), h):
+            # modulation fused with the MXFP8 quant of the qkv input; the bf16
+            # modulated rows are kept (in place) for the VDN branch projections
+            h, h_q, h_s = indexed_scale_shift_mxfp8_(
+                h, shift_msa, scale_msa, combined_indices, keep_bf16=True
+            )
+            h_prequant = (h_q, h_s)
+        else:
+            h = _modulate_scale_shift(
+                h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+            )
         h = self.attn(
             h,
+            x_prequant=h_prequant,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1441,10 +1488,17 @@ class MiniMaxH3DiTBlock(nn.Module):
 
         residual = x
         h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
-        )
-        h = self.mlp(h)
+        if _mx_prequant_ok(getattr(self.mlp, "fc1", None), h):
+            # modulation fused with the MXFP8 quant; fc1 only needs the fp8 rows
+            _, h_q, h_s = indexed_scale_shift_mxfp8_(
+                h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
+            )
+            h = self.mlp((h_q, h_s))
+        else:
+            h = _modulate_scale_shift(
+                h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+            )
+            h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
         # even while Cache-DiT is attached.
         return _modulate_gate(

@@ -822,6 +822,7 @@ def _needs_device_weight_postprocess(
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
         "fp8_per_tensor": "is_checkpoint_fp8_serialized",
+        "mxfp8_cublaslt": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
         "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
     }
@@ -1056,6 +1057,7 @@ def _resolve_quant_config(
         if server_args.quantization in {
             "fp8",
             "fp8_per_tensor",
+            "mxfp8_cublaslt",
             "mxfp4",
             "kitchen_int8",
         }:
