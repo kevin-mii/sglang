@@ -1,0 +1,225 @@
+<title>VDN-H3 8×B200 Handoff</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F6F5F1; --bg2:#ECEBE5; --ink:#1B211F; --ink2:#3F4844; --mute:#6E7873; --line:#D6D9D2;
+  --sm:#0F7A87; --sm-bg:#DCEFF1; --lin:#B0621F; --lin-bg:#F5E7D8; --ok:#2C7A4B; --warn:#9A5B00; --code:#ECEBE5;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#141817; --bg2:#1C2221; --ink:#E7EAE6; --ink2:#C4CBC6; --mute:#94A09A; --line:#2B332F;
+  --sm:#4FB8C3; --sm-bg:#123A3F; --lin:#E09553; --lin-bg:#3B2A1B; --ok:#5CBF86; --warn:#E0A23A; --code:#1C2221;
+}}
+:root[data-theme="dark"]{
+  --bg:#141817; --bg2:#1C2221; --ink:#E7EAE6; --ink2:#C4CBC6; --mute:#94A09A; --line:#2B332F;
+  --sm:#4FB8C3; --sm-bg:#123A3F; --lin:#E09553; --lin-bg:#3B2A1B; --ok:#5CBF86; --warn:#E0A23A; --code:#1C2221;
+}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:16.5px;line-height:1.55;margin:0}
+.wrap{max-width:76ch;margin:0 auto;padding:36px 22px 90px}
+h1,h2,h3{font-family:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;text-wrap:balance;line-height:1.12;margin:0}
+h1{font-size:2.2rem;font-weight:700;letter-spacing:-0.01em}
+h2{font-size:1.4rem;font-weight:600;margin-top:52px;padding-top:16px;border-top:1px solid var(--line)}
+h3{font-size:1.05rem;font-weight:600;margin-top:26px;color:var(--ink2)}
+p{margin:12px 0}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:0.72rem;letter-spacing:0.08em;text-transform:uppercase;color:var(--mute);margin-bottom:10px}
+.lede{font-size:1.08rem;color:var(--ink2)}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px 22px;margin:22px 0 0;padding:14px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:0.92rem}
+.meta b{display:block;font-family:"IBM Plex Mono",monospace;font-size:0.68rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--mute);font-weight:500;margin-bottom:2px}
+code,pre{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+code{font-size:0.86em;background:var(--code);padding:1px 5px;border-radius:3px}
+pre{background:var(--code);padding:13px 15px;border-radius:4px;overflow-x:auto;font-size:0.8rem;line-height:1.5;margin:12px 0}
+pre code{background:none;padding:0}
+ul,ol{padding-left:1.3em;margin:10px 0} li{margin:6px 0} li::marker{color:var(--mute)}
+.tbl{overflow-x:auto;margin:14px 0}
+table{border-collapse:collapse;width:100%;font-size:0.9rem;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:"IBM Plex Sans Condensed",sans-serif;font-weight:600;font-size:0.8rem;letter-spacing:0.02em;color:var(--mute);border-bottom:2px solid var(--line)}
+td.n,th.n{text-align:right}
+.tag{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:0.68rem;letter-spacing:0.05em;padding:2px 7px;border-radius:3px;border:1px solid var(--line);color:var(--mute);vertical-align:2px;margin-left:6px}
+.tag.done{color:var(--ok);border-color:var(--ok)} .tag.todo{color:var(--warn);border-color:var(--warn)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0}
+@media (max-width:640px){.two{grid-template-columns:1fr}}
+.branch{padding:12px 14px;border-left:4px solid;background:var(--bg2)}
+.branch.sm{border-color:var(--sm)} .branch.lin{border-color:var(--lin)}
+.branch h3{margin-top:0;font-size:0.95rem} .branch.sm h3{color:var(--sm)} .branch.lin h3{color:var(--lin)}
+.branch ul{margin:6px 0 0;font-size:0.92rem}
+.fig{margin:20px 0;padding:14px;background:var(--bg2);border-radius:4px}
+.fig svg{display:block;width:100%;height:auto;max-width:680px;margin:0 auto}
+.cap{font-size:0.85rem;color:var(--mute);margin-top:8px}
+.note{border-left:3px solid var(--line);padding:6px 14px;color:var(--ink2);margin:14px 0;font-size:0.95rem}
+a{color:var(--sm)}
+</style>
+<div class="wrap">
+<div class="eyebrow">sglang diffusion · VDN-H3 · handoff to an 8× B200 box</div>
+<h1>VDN-H3 8×B200 Handoff</h1>
+<p class="lede">State of the VDN-H3 port on branch <code>VDN-h3</code>, everything needed to reproduce it on a new box, and the two remaining performance projects in priority order: branch-parallel Ulysses (needs 8 GPUs) and the fp8 GEMM path (SGLang-wide). Every number below was measured on the 4× B200 devbox; nothing is estimated unless marked.</p>
+<div class="meta">
+  <div><b>Branch</b><code>kevin-mii/sglang</code> · <code>VDN-h3</code>, 30 commits on top of <code>origin/main</code> 05dbe64dff (FastH3 f586654518 merged). Pushed through <code>ec3f4373ec</code>; the last few commits may still be local, see “pushing”.</div>
+  <div><b>Overlay</b><code>kevin-mi/VDN-H3-overlay</code> @ <code>2bf8c73689d5</code>, pinned in <code>runtime/utils/model_overlay.py</code>; verified end-to-end from the hub (182 s materialization).</div>
+  <div><b>Weights</b><code>OpenVDN/vdn-minimax-h3</code> (deltas) + <code>MiniMaxAI/MiniMax-H3</code> (text encoder, base VAEs); the materializer prefuses both LoRAs into 62 GB of new shards.</div>
+  <div><b>Reference stack</b><a href="https://github.com/OpenVDN/vdn-minimax-h3">OpenVDN/vdn-minimax-h3</a>: torch 2.13 cu129, flash-attn-4 b26, patched diffusers (<code>scripts/setup_diffusers.sh</code>), torchvision must be the cu129 wheel.</div>
+</div>
+
+<h2>1. Where it stands</h2>
+<p>Paper workload throughout: 1344×768, 345 frames (14.375 s at 24 fps, latent_t 102, ~104k packed rows), <code>task: "t2va"</code>, 8 DiT forwards (<code>num_inference_steps: 9</code>), seed 1000, eager. “s/NFE” is the steady per-forward time.</p>
+<div class="tbl"><table>
+<thead><tr><th>Config</th><th class="n">GPUs</th><th class="n">s/NFE</th><th class="n">8-NFE denoise</th><th class="n">Peak/GPU</th></tr></thead>
+<tbody>
+<tr><td>OpenVDN published, FP8, Ulysses 5+3 branch-parallel</td><td class="n">8× B200</td><td class="n">1.40</td><td class="n">11.2 s</td><td class="n">–</td></tr>
+<tr><td>OpenVDN released stack, FP8, standard Ulysses / 3+1</td><td class="n">4× B200</td><td class="n">2.68 / 2.61</td><td class="n">21.4 / 20.9 s</td><td class="n">–</td></tr>
+<tr><td><b>SGLang VDN-H3, FP8, Ulysses4</b></td><td class="n">4× B200</td><td class="n"><b>2.34</b></td><td class="n"><b>18.7 s</b></td><td class="n">63.0 GB</td></tr>
+<tr><td>SGLang VDN-H3, BF16, Ulysses4</td><td class="n">4× B200</td><td class="n">2.53</td><td class="n">20.3 s</td><td class="n">97.9 GB</td></tr>
+<tr><td>OpenVDN released stack, FP8 / BF16 tuned</td><td class="n">1× B200</td><td class="n">6.47 / 7.91</td><td class="n">51.7 / 63.3 s</td><td class="n">–</td></tr>
+<tr><td>SGLang VDN-H3, FP8 (DiT resident) / BF16 (offload)</td><td class="n">1× B200</td><td class="n">7.49 / 7.86</td><td class="n">61.1 / 64.1 s</td><td class="n">63.9 / 147.6 GB</td></tr>
+<tr><td>SGLang base MiniMax-H3, dense FA (same weights, LoRAs folded)</td><td class="n">4× B200</td><td class="n">3.87</td><td class="n">29.1 s</td><td class="n">–</td></tr>
+</tbody></table></div>
+<p>Per GPU-second per forward: SGLang 4× B200 FP8 spends 9.4, the published 8× B200 number spends 11.2. Correctness: block-level parity against OpenVDN’s <code>HybridAttention</code> on blocks 0 / 25 / 49 with the real prefused weights is relative L2 5e-3 to 7e-3 for both the dense base+LoRA smoke and the hybrid path; 1-GPU vs 4-GPU outputs agree at the same PSNR (23 to 25 dB after 8 steps) as the base dense path does, so the Ulysses path is consistent with H3’s own reduction-order sensitivity.</p>
+
+<h3>What is implemented <span class="tag done">merged on the branch</span></h3>
+<ul>
+  <li><b>Distribution.</b> Overlay materializer (<code>_overlay/materialize.py</code> in the HF repo): prefuses <code>default</code> + <code>turbo</code> LoRAs (571 pairs, fp32 accumulate, verified bit-exact against base + Σ B·A), attaches <code>sglang_vdn_linear_branch.safetensors</code>, writes <code>hybrid_attention</code> into <code>transformer/config.json</code>, reuses FastH3’s VAE/RoPE conversion.</li>
+  <li><b>Arch/config.</b> <code>VDNHybridAttentionArchConfig</code> (msgspec.Struct) on <code>MiniMaxH3DiTArchConfig.hybrid_attention</code>; name-mapping rules for the branch keys; <code>VDNH3Pipeline</code>, <code>VDNH3PipelineConfig</code> (forces <code>hybrid_window_attn_h3</code> when no backend is set, rejects <code>--model-variant</code>, quality high, ring, compile, BCG), <code>VDNH3SamplingParams</code> (9 grid points = 8 NFE, t2va only).</li>
+  <li><b>Backend</b> <code>runtime/layers/attention/backends/hybrid_window_attn_h3.py</code>: chunk-5 / radius-1 window with anchors as a union of dense FA varlen calls (dense-query rows vs all keys; per-chunk gathered K/V in passes bounded by <code>vdn_max_gather_rows</code>), gate epilogue, request-static metadata; optional tile kernel path (<code>hybrid_window_h3_kernels.py</code>, 226 ms vs 169 ms per block on SM100, so not default).</li>
+  <li><b>Linear branch</b> <code>runtime/models/dits/minimax_h3_vdn.py</code>: features, TF32 statistics, Cholesky delta rule, forward/reverse scans (cuBLAS baddbmm), alpha-bridged gather, gated RMSNorm readout, text-state seed; head-range slicing for Ulysses; fused Triton kernels in <code>sglang/kernels/ops/diffusion/attention/vdn_linear_branch_triton.py</code> (temporal conv + SiLU + L2, SiLU + L2 on strided q, statistics prologue, epilogue, boundary gather).</li>
+  <li><b>DiT integration</b> <code>runtime/models/dits/minimax_h3.py</code>: <code>_minimax_h3_hybrid_attention_core_impl</code> (line ~737) keeps raw q/k for the branch, out-of-place fused QK-norm+RoPE (new JIT variant <code>QKNormRopeOutOfPlaceKernel</code>, bitwise equal to the in-place kernel), standard Ulysses (one packed all-to-all of raw q/k/v, norm+RoPE after it with a full-sequence RoPE cache, beta/gates by head, async frame-mean all-reduce), <code>to_out_linear</code> on video rows.</li>
+  <li><b>Warmup fix (H3-wide).</b> The synthetic warmup honors <code>--warmup-num-frames</code> / <code>--warmup-resolutions</code>; without them the first served forward at a new clip length paid 2 to 3 s of allocator growth in every block (base H3 too).</li>
+  <li>Tests (<code>test_minimax_h3_vdn.py</code>, <code>test_hybrid_window_h3_attention.py</code>, 107 H3 tests pass), bench presets <code>vdn-h3</code> / <code>vdn-h3-fp8</code>, CI case <code>vdn_h3_t2va_4gpu_h100</code>, cookbook §7 + “VDN-H3 on B200” table, backend docs, catalog entry.</li>
+</ul>
+
+<h2>2. Setting up the new box</h2>
+<pre><code># storage: pick the big durable volume (on the devbox it was /scratch; the plan's /persistent did not exist)
+export HF_HOME=/scratch/.cache/huggingface
+export SGLANG_DIFFUSION_CACHE_ROOT=/scratch/sgl_diffusion_cache   # needs >= 90 GB free (62 GB prefused DiT + 10 GB VAE)
+hf download OpenVDN/vdn-minimax-h3 --local-dir /scratch/models/OpenVDN/vdn-minimax-h3 --exclude "h3-base/*/*.safetensors"
+hf download MiniMaxAI/MiniMax-H3 --local-dir /scratch/models/MiniMaxAI/MiniMax-H3 --exclude "FL2VA/*" --exclude "Ref2VA/*" --exclude "transformer_ref/*"
+# h3-base shards are byte-identical to the MiniMaxAI root ones (18/18 LFS sha256 checked): symlink them
+for c in transformer vae audio_vae; do for f in /scratch/models/MiniMaxAI/MiniMax-H3/$c/*.safetensors; do
+  ln -sfn "$f" /scratch/models/OpenVDN/vdn-minimax-h3/h3-base/$c/; done; done
+
+git clone git@github.com:kevin-mii/sglang.git -b VDN-h3 && pip install -e sglang/python   # or apply /scratch/backup/patches-latest
+# first launch materializes (~3 min with cached weights); --model-path may be the HF id or the local dir (matched by basename)
+sglang generate --backend=sglang --model-path OpenVDN/vdn-minimax-h3 --num-gpus 8 \
+  --attention-backend hybrid_window_attn_h3 --quantization fp8 --performance-mode speed \
+  --warmup-steps 2 --warmup-num-frames 345 --warmup-resolutions 1344x768 --enable-torch-compile false \
+  --prompt "..." --seed 1000 --config paper.json --quality lossless --save-output --perf-dump-path perf.json
+# paper.json: {"task":"t2va","conditions":[],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":14.375},"num_inference_steps":9}</code></pre>
+<ul>
+  <li><code>perf.json</code> carries <code>denoise_steps_ms</code> per forward; with the warmup flags every forward should be steady state.</li>
+  <li>Auto memory policy keeps 120 GB headroom: on 1 GPU it offloads the DiT; <code>--layerwise-offload-components text_encoder</code> keeps the DiT resident (fits in FP8 only). On 8 GPUs <code>--performance-mode speed</code> is enough.</li>
+  <li>Profiling: <code>--profile --num-profiled-timesteps 2</code> writes <code>logs/*global-rank0.trace.json.gz</code> next to the run; bucket kernel time by name to see the split (the 4-GPU profile: GEMM 26%, FA 24%, elementwise 15%, gathers 11%, NCCL 9%, conv 4%).</li>
+  <li>Reference stack (for same-box rows): <code>uv venv --python 3.12</code>, torch 2.13 cu129, <code>uv pip install --prerelease=allow -e .</code>, <code>uv pip install --reinstall-package torchvision "torchvision==0.28.0+cu129" --index-url https://download.pytorch.org/whl/cu129</code>, then <code>bash scripts/setup_diffusers.sh</code>. Symlink <code>ckpts</code> → the OpenVDN download. Run <code>torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py --config configs/inference/8nfe_tuned_fp8_ulysses_b200.yaml checkpoint=ckpts/stage-dmd-step-250 render.prompt_file=prompts/example_2.pt render.out=... render.record=true</code>; <code>parallel.softmax_ranks=0</code> gives the standard-Ulysses row. Its timing line is “Ulysses timing: … denoise …”.</li>
+</ul>
+
+<h2>3. Validation tools</h2>
+<ul>
+  <li><b>Unit tests:</b> <code>cd python/sglang/multimodal_gen && pytest test/unit/test_minimax_h3_vdn.py test/unit/test_hybrid_window_h3_attention.py test/unit/test_minimax_h3_admission.py</code>. Two pre-existing kernel tests fail on torch 2.13 / B200 with the untouched source too: <code>test_rope.py::test_qknorm_rope_preserves_split_bf16_rounding</code>, <code>test_model_fast_paths.py::test_ernie_qknorm_rope_is_bit_exact</code>. The bench-skill test <code>test_quality_bcg_matrix_reuses_one_gpu_set_and_cleans_once</code> needs GPU 0 visible.</li>
+  <li><b>Block parity:</b> <code>python/sglang/multimodal_gen/tools/vdn_h3_parity/</code> (README inside). SGLang dumps inputs + outputs for one block; the OpenVDN venv replays the same block; <code>compare.py</code> prints cos / relative L2. Run it after any change to the core; the reference numbers are 4.7e-3 (dense) and 6.8e-3 (hybrid) on block 0 small shape.</li>
+  <li><b>Head-slice contract:</b> <code>test_branch_head_slice_equals_full_run</code> is the test any new sharding must keep green: the branch on a head range of the full sequence equals the full run’s slice.</li>
+  <li><b>Kernel switch:</b> <code>minimax_h3_vdn.set_fused_kernels_enabled(False)</code> runs the eager chain for A/B comparisons.</li>
+</ul>
+
+<h2>4. Project A: branch-parallel Ulysses <span class="tag todo">needs 8 GPUs</span></h2>
+<p>OpenVDN’s shipped 8-GPU layout puts the two branches on disjoint rank groups: 5 softmax ranks and 3 linear (VDA) ranks on B200 (6+2 on H200). Standard Ulysses gives every rank H/8 = 7 heads of both branches; branch-parallel gives softmax ranks 11 to 12 heads of the window softmax and linear ranks 18 to 19 heads of the recurrence, so each kernel runs at a friendlier size and the two branches overlap across ranks. Their measured gain: 1.629 → 1.425 s/NFE (6+2 vs 5+3 sweep) on 8× B200; 2.68 → 2.61 on 4 GPUs.</p>
+
+<div class="fig">
+<svg viewBox="0 0 680 230" role="img" aria-label="Branch-parallel layout: 8 sequence-sharded row owners send processed q/k/v to 5 softmax ranks and raw q/k/v to 3 linear ranks through one uneven all-to-all; a reverse uneven all-to-all returns all 56 heads of both branches to each row owner">
+  <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink)">
+    <rect x="10" y="20" width="660" height="34" rx="3" fill="var(--bg)" stroke="var(--line)"/>
+    <text x="20" y="41">8 row owners: residual stream sharded by packed row · QKV projected once for all 56 heads · gates (β, gate_sm, gate_lin.down) on the row shard</text>
+    <path d="M120 54 L120 92" stroke="var(--sm)" stroke-width="2" fill="none"/>
+    <path d="M540 54 L540 92" stroke="var(--lin)" stroke-width="2" fill="none"/>
+    <text x="128" y="78" fill="var(--sm)">uneven A2A · q,k (normed+roped), v, gate_sm</text>
+    <text x="330" y="78" fill="var(--lin)">uneven A2A · raw q,k, v, β, gate_lin hidden(128)</text>
+    <rect x="10" y="92" width="400" height="60" rx="3" fill="var(--sm-bg)" stroke="var(--sm)"/>
+    <text x="20" y="112" fill="var(--sm)" font-weight="600">5 softmax ranks · 11–12 heads each · full sequence</text>
+    <text x="20" y="130">window FA varlen (decomposed) → gate → o_sm [T, h_i, 128]</text>
+    <rect x="420" y="92" width="250" height="60" rx="3" fill="var(--lin-bg)" stroke="var(--lin)"/>
+    <text x="430" y="112" fill="var(--lin)" font-weight="600">3 linear ranks · 18–19 heads each</text>
+    <text x="430" y="130">gate_lin.up on own heads → branch → o_lin</text>
+    <path d="M210 152 L210 190" stroke="var(--sm)" stroke-width="2" fill="none"/>
+    <path d="M545 152 L545 190" stroke="var(--lin)" stroke-width="2" fill="none"/>
+    <rect x="10" y="190" width="660" height="34" rx="3" fill="var(--bg)" stroke="var(--line)"/>
+    <text x="20" y="211">reverse uneven A2A: each row owner receives 56 softmax heads + 56 linear heads of its rows → out_proj(o_sm) + to_out_linear(o_lin) locally</text>
+  </g>
+</svg>
+<p class="cap">The forward and reverse exchanges are the only collectives besides the frame-mean all-reduce. Both branches still see the complete sequence; nothing is approximated.</p>
+</div>
+
+<div class="two">
+  <div class="branch sm"><h3>Softmax rank payload</h3><ul>
+    <li>q, k already QK-normed and RoPE’d on the row shard with the row-local cache (as base H3 does), v, and gate_sm [rows, heads] → 3·128+1 per head.</li>
+    <li>Compute: <code>HybridWindowAttentionH3Impl.forward_varlen</code> on [T, h_i, 128] with the request metadata; gate epilogue.</li>
+  </ul></div>
+  <div class="branch lin"><h3>Linear rank payload</h3><ul>
+    <li>Raw q, k, v (pre-norm, pre-RoPE), β [rows, heads], and only the 128-wide <code>output_gate.down(x)</code> hidden; the rank applies <code>output_gate.up</code> for its own heads (VDN sends the hidden, not the 7168-wide gate).</li>
+    <li>Compute: <code>MiniMaxH3VDNLinearBranch(..., heads=slice(a, b))</code> exactly as the standard path does; text rows travel with the payload (they are ordinary rows).</li>
+  </ul></div>
+</div>
+
+<h3>Where it goes in SGLang</h3>
+<ul>
+  <li>Entry point: <code>_minimax_h3_hybrid_attention_core_impl</code> in <code>runtime/models/dits/minimax_h3.py</code>. Add a sibling <code>_minimax_h3_branch_parallel_core_impl</code> selected when <code>attention_backend_config["vdn_softmax_ranks"]</code> is set; keep the standard core untouched so the 4-GPU numbers stay reproducible.</li>
+  <li>Groups: the SP group is <code>get_sp_group()</code> (<code>runtime/distributed/parallel_state.py</code>); its <code>device_group</code> is the NCCL group for <code>torch.distributed.all_to_all_single(..., input_split_sizes, output_split_sizes)</code>. Create two sub-groups once with <code>torch.distributed.new_group(ranks)</code> (softmax ranks, linear ranks) for the overlapped variant; the simple variant uses a single uneven all-to-all over the SP group with per-destination split sizes (zero for the other branch’s fields).</li>
+  <li>Packing: <code>sglang.kernels.ops.diffusion.pack_qkv_destination_major</code> (<code>layout/ulysses_qkv_triton.py</code>) is the existing destination-major pack for 3 tensors; extend it (or write a sibling) to pack the per-branch field lists into one send buffer with per-rank byte splits. OpenVDN’s <code>_pack_branch_target_kernel</code> in <code>src/inference/ulysses_runtime.py</code> is the reference (also <code>dispatch_fields_to_branches_overlapped</code>, <code>branches_to_sequence</code>, <code>balanced_splits</code>).</li>
+  <li>Head splits: <code>balanced_splits(56, softmax_ranks)</code> and <code>balanced_splits(56, world − softmax_ranks)</code>; a rank’s branch kind and head range are fixed for the request. The branch already accepts <code>heads=slice</code>; <code>VDNFrameAlpha</code>, <code>VDNShortConv</code> and the text state slice per-head parameters internally.</li>
+  <li>Frame mean: keep the async all-reduce over the SP group (partial sums of the row shard), wait before the branch.</li>
+  <li>Output: the reverse uneven all-to-all returns [rows, 56, 128] for each branch to the row owner; then <code>out_proj</code> and <code>to_out_linear</code> exactly as today (two GEMMs, FP8-friendly because each branch keeps its own activation scale).</li>
+  <li>Admission: <code>VDNH3PipelineConfig.validate_server_args</code> should require <code>1 ≤ vdn_softmax_ranks &lt; ulysses_degree</code>, TP = 1, ring = 1, and reject BCG/compile as today. Log the layout once next to the “VDN-H3 hybrid attention:” line in <code>_maybe_prepare_hybrid_h3_metadata</code>.</li>
+</ul>
+
+<h3>Sizing before you build (from the 4-GPU profile, per DiT block per rank)</h3>
+<div class="tbl"><table>
+<thead><tr><th>Cost on one of 4 ranks (7 heads of both branches)</th><th class="n">ms</th></tr></thead>
+<tbody>
+<tr><td>Window FlashAttention (3 varlen calls)</td><td class="n">11.4</td></tr>
+<tr><td>GEMMs for the row shard (qkv, out, far-out, fc1, fc2) + fp8 quant</td><td class="n">10.6</td></tr>
+<tr><td>Linear branch (conv 1.0, scan 1.4 + copies, trsm/Cholesky 0.9, Triton stages 1.3, epilogue, gathers of its own)</td><td class="n">≈ 9</td></tr>
+<tr><td>K/V window gathers + output copies</td><td class="n">≈ 4.5 (before the index_select change)</td></tr>
+<tr><td>NCCL (2 all-to-alls + frame-mean all-reduce)</td><td class="n">4.2</td></tr>
+<tr><td>Wall per block at 2.43 s/NFE</td><td class="n">48.6</td></tr>
+</tbody></table></div>
+<p>On 4 GPUs a 3+1 split makes the linear rank the straggler (≈ 36 ms of branch for all 56 heads + its GEMMs vs ≈ 30 ms on a softmax rank), which is why it was not built there. On 8 GPUs with 5+3 (scaling the 7-head figures above, so treat these as estimates): a linear rank holds ≈ 19 heads of the branch (≈ 24 ms) and a softmax rank ≈ 11 heads of the window attention (≈ 18 ms), against ≈ 13 ms of both per rank under standard Ulysses8; the split only wins if the freed overlap and the friendlier kernel sizes beat the heavier uneven exchange (≈ 1.7× the standard payload, since processed and raw q/k both travel). That is exactly OpenVDN’s finding: 5+3 beat 6+2 on B200 because the exchange, not compute, binds. First run standard Ulysses8 with the current code to get the baseline profile, then decide the split from it (OpenVDN saw 5+3 beat 6+2 on B200 because the exchange, not compute, binds).</p>
+<p>Acceptance: (1) <code>test_branch_head_slice_equals_full_run</code> still passes; (2) a 2-rank mini test with 1+1 split against the standard core on the small ragged layout (bitwise-close, since the math is identical per head); (3) end-to-end 8× B200 FP8 at the paper workload: PSNR vs the standard-Ulysses8 output in the 23 to 25 dB band, and s/NFE below both standard Ulysses8 and OpenVDN’s 1.40.</p>
+
+<h2>5. Project B: fp8 GEMM path <span class="tag todo">SGLang-wide, biggest single lever</span></h2>
+<p>GEMMs are 26% of the step. Measured at the H3 QKV shape (104k × 5376 × 21504, B200, idle GPU):</p>
+<div class="tbl"><table>
+<thead><tr><th>GEMM</th><th class="n">ms</th><th class="n">PFLOPS</th></tr></thead>
+<tbody>
+<tr><td>bf16 cuBLAS</td><td class="n">15.7</td><td class="n">1.53</td></tr>
+<tr><td>sgl-kernel cutlass, per-tensor A (repeated) / per-channel B — what <code>--quantization fp8</code> runs</td><td class="n">12.3</td><td class="n">1.96</td></tr>
+<tr><td>sgl-kernel cutlass, per-row A / per-channel B</td><td class="n">14.7</td><td class="n">1.64</td></tr>
+<tr><td><code>torch._scaled_mm</code>, per-tensor A and B (cuBLASLt) — OpenVDN’s SM100 choice</td><td class="n">9.2</td><td class="n">2.62</td></tr>
+<tr><td><code>torch._scaled_mm</code>, rowwise A / per-channel B</td><td class="n">17.6</td><td class="n">1.36</td></tr>
+</tbody></table></div>
+<ul>
+  <li>Entry: <code>sglang/srt/layers/quantization/fp8_utils.py::apply_fp8_linear</code> (channelwise cutlass branch, <code>use_per_token_if_dynamic=False</code>, dynamic per-tensor activation scale via <code>scaled_fp8_quant</code>) and <code>Fp8LinearMethod.process_weights_after_loading</code> (per-channel weight scales at load).</li>
+  <li>Proposal: on SM100 with dynamic activation scales, quantize weights per-tensor at load and dispatch to <code>torch._scaled_mm</code> with scalar scales; guard by an <code>Fp8Config</code> option so the default channelwise path is unchanged. Validate on VDN-H3 and base H3: block parity in the fp8 harness (<code>sgl_block_attn.py --fp8</code>, per-tensor vs channelwise), then end-to-end PSNR vs the channelwise render. OpenVDN documents that fp8 changes the sample; expect the same.</li>
+  <li>Same file: fuse SwiGLU with the activation quant for <code>fc2</code> (OpenVDN’s <code>swiglu_quantize_activation</code>): a Triton kernel producing fp8 + scale from the fc1 output, and an <code>input_prequantized</code> path that accepts it (today only per-tensor prequantized input is accepted). ≈ 1 ms per block on 1 GPU.</li>
+  <li>Expected: 6 to 8% on the 4-GPU step; it is also what closes the single-GPU gap (7.49 vs 6.47 s/NFE): in bf16 SGLang already matches OpenVDN’s tuned bf16 (7.86 vs 7.91).</li>
+</ul>
+
+<h2>6. Smaller items, with what is known</h2>
+<div class="tbl"><table>
+<thead><tr><th>Item</th><th>Status / finding</th><th class="n">Worth</th></tr></thead>
+<tbody>
+<tr><td>Gather-free window softmax</td><td>The decomposed path gathers ≈ 2.6 GB of K/V per rank per block (11% of GPU time as generic index; now <code>index_select</code>). The in-tree tile-64 Triton kernel avoids the gather but is 226 vs 169 ms per block. A real win needs a block-sparse FA4 (CuTe) with per-tile index lists; OpenVDN’s flex/FLASH path with <code>FA_CLC=1</code> is the reference (they still found the decomposition faster on SM100).</td><td class="n">≈ 5%</td></tr>
+<tr><td>Softmax gate fused into the FA epilogue</td><td>Separate <code>mul_</code> pass today (0.5 ms/block). Only pays as a kernel epilogue.</td><td class="n">1%</td></tr>
+<tr><td>Persistent Triton scan</td><td><b>Tried, reverted.</b> One program per head/direction (3xTF32, row-parallel) is 9× slower than the 2F cuBLAS baddbmm launches; a 100-step dependent chain cannot fill the GPU from one program. Leave the scan on cuBLAS.</td><td class="n">–</td></tr>
+<tr><td>Fold the 5×5 spatial conv into the Triton temporal kernel</td><td>cuDNN NHWC depthwise is 1.0 ms/block per rank; a 25-tap Triton stencil might halve it. OpenVDN kept cuDNN.</td><td class="n">1%</td></tr>
+<tr><td>Breakable CUDA graph capture</td><td>Everything except the varlen attention and collectives is static per request; rejected by admission today (as for VSA-H3). Launch gaps are ≈ 6 ms of the 48 ms block on 4 GPUs.</td><td class="n">up to 10%</td></tr>
+<tr><td>TP</td><td>Branch params load head-sharded through <code>ColumnParallelLinear</code> / custom loaders; untested beyond TP=1. Rejecting TP&gt;1 in admission until tested is the safe default.</td><td class="n">–</td></tr>
+<tr><td>50-step checkpoint (<code>stage-b-step-2000</code>)</td><td>Out of scope so far; would be a second materialized <code>transformer_50step/</code> behind <code>--model-variant</code>.</td><td class="n">–</td></tr>
+</tbody></table></div>
+
+<h2>7. Pitfalls that cost time</h2>
+<ul>
+  <li><b>pkill matches your own shell.</b> Use <code>pgrep -f "[p]attern"</code> and kill by PID, or the bash running the command dies with exit 144.</li>
+  <li><b>Never benchmark while another job holds the GPUs</b>; microbenchmarks moved 2× under a background run.</li>
+  <li><b>Formatter-rewrapped anchors.</b> Patching with literal string matches after <code>pre-commit</code> (ruff, isort, clang-format) fails silently if the file was rewrapped; use marker-bounded region replacement.</li>
+  <li><b>H3 warmup</b> is a 5 s clip unless <code>--warmup-num-frames</code> / <code>--warmup-resolutions</code> are passed (the generic builder also rewrites <code>req.num_frames</code> from the VAE geometry; the H3 lowering reads the flag).</li>
+  <li><b>Memory on 1 GPU.</b> BF16 DiT resident does not fit the paper clip (cuDNN internal error inside the depthwise conv is the symptom of workspace exhaustion).</li>
+  <li><b>Pushing.</b> Git uses the forwarded SSH agent; when the socket dies, find a live one (<code>for s in /tmp/ssh-*/agent.*; do SSH_AUTH_SOCK=$s ssh-add -l; done</code>) and set <code>git config core.sshCommand "ssh -o IdentityAgent=&lt;socket&gt;"</code>. A bundle and patch series of the branch are at <code>/scratch/backup/</code> on the devbox.</li>
+  <li><b>HF token</b> is needed only to re-upload the overlay (<code>HfApi().upload_folder(folder_path=".", repo_id="kevin-mi/VDN-H3-overlay")</code> from the overlay dir; delete any <code>__pycache__</code> first), then re-pin the sha in <code>model_overlay.py</code>.</li>
+  <li><b>Pre-existing test failures</b> on this torch 2.13 / B200 stack are listed in §3; do not chase them.</li>
+</ul>
+</div>
