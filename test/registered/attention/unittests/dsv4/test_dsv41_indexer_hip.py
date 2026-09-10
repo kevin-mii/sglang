@@ -659,6 +659,52 @@ class _LowRatioBackendCase(CustomTestCase):
             )
         return page_indices, raw_indices, backend.candidate_masks
 
+    def _dense_masks(self, st, masks, seq_lens, extend_lens):
+        """The HIP publication (one Optional[CandidateBlocks] per request) as the torch
+        oracle's dense bool [t_len, lc] masks: None keeps every reachable block."""
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            candidate_block_ids_to_mask,
+        )
+
+        out, row = [], 0
+        for cb, s, e in zip(masks, seq_lens, extend_lens):
+            lc = s // st.ratio
+            lens = ((st.pos[row : row + e] + 1) // st.ratio)[:, None]
+            row += e
+            j = torch.arange(lc, device=st.dev)
+            block = self.CANDIDATE_BLOCKS[1]
+            if cb is None:
+                out.append((j[None, :] // block) <= ((lens - 1) // block))
+                continue
+            num_blocks = (lc + block - 1) // block
+            keep = candidate_block_ids_to_mask(cb.ids, num_blocks)
+            out.append(keep.repeat_interleave(block, dim=1)[:, :lc])
+        return out
+
+    def _assert_candidates_equal(self, a_masks, b_masks, msg):
+        """Two HIP publications keep the same blocks per row (ids are unordered). None
+        stands for every reachable block, which a scored publication spells out as the
+        blocks 0..n-1 of each row."""
+
+        def keeps_every_block(cb):
+            n = (cb.compact_lens // cb.block_size)[:, None]
+            pad = 1 << 30  # -1 padding sorts after every block id
+            ids = cb.ids.masked_fill(cb.ids < 0, pad).sort(dim=1).values
+            j = torch.arange(ids.shape[1], device=ids.device)[None, :]
+            return bool(torch.equal(ids, torch.where(j < n, j, pad).to(ids.dtype)))
+
+        self.assertEqual(len(a_masks), len(b_masks), msg)
+        for x, y in zip(a_masks, b_masks):
+            if x is None or y is None:
+                other = y if x is None else x
+                self.assertTrue(other is None or keeps_every_block(other), msg)
+                continue
+            self.assertTrue(torch.equal(x.compact_lens, y.compact_lens), msg)
+            self.assertTrue(
+                torch.equal(x.ids.sort(dim=1).values, y.ids.sort(dim=1).values),
+                f"{msg}: candidate blocks differ",
+            )
+
     def _assert_selection(self, a, b, msg, *, exact_rows=None, masks=True):
         """Two (page_indices, raw_indices, masks) results agree: `exact_rows` (default
         all) exactly; the other rows by their -1 pattern and tie-robust selected
@@ -690,11 +736,7 @@ class _LowRatioBackendCase(CustomTestCase):
         if a_masks is None or b_masks is None:
             self.assertIs(a_masks, b_masks, msg)
             return
-        self.assertEqual(len(a_masks), len(b_masks), msg)
-        for x, y in zip(a_masks, b_masks):
-            self.assertEqual(x.shape, y.shape, msg)
-            self.assertEqual(x.dtype, y.dtype, msg)
-            self.assertTrue(torch.equal(x, y), f"{msg}: candidate masks differ")
+        self._assert_candidates_equal(a_masks, b_masks, msg)
 
     def _assert_agrees(self, a, b, msg):
         """Every row scored: the same -1 pattern and 95% of the selected positions."""
@@ -738,20 +780,21 @@ class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
         """The prefill kernel path must select the oracle's set per token, publish the
         oracle's candidate masks as a source, and honour them as a consumer."""
         for ratio in (1, 2):
-            st = self._setup(ratio, seq_lens=[300, 45, 700], extend_lens=[300, 45, 200])
+            seq_lens, extend_lens = [300, 45, 700], [300, 45, 200]
+            st = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
             k = self._run(st, "extend", candidate_source=True)
             t = self._run(st, "torch", candidate_source=True)
             self._assert_agrees(k, t, f"{ratio=} source")
-            k_masks, t_masks = k[2], t[2]
-            self.assertEqual(len(k_masks), len(t_masks))
-            for a, b in zip(k_masks, t_masks):
+            k_dense, t_masks = self._dense_masks(st, k[2], seq_lens, extend_lens), t[2]
+            self.assertEqual(len(k_dense), len(t_masks))
+            for a, b in zip(k_dense, t_masks):
                 self.assertEqual(a.shape, b.shape)
                 self.assertGreaterEqual((a == b).float().mean().item(), 0.95)
-            c = self._run(st, "extend", uses_candidates=True, masks=k_masks)
-            d = self._run(st, "torch", uses_candidates=True, masks=k_masks)
+            c = self._run(st, "extend", uses_candidates=True, masks=k[2])
+            d = self._run(st, "torch", uses_candidates=True, masks=k_dense)
             self._assert_agrees(
-                self._drop_filler(st, c, k_masks),
-                self._drop_filler(st, d, k_masks),
+                self._drop_filler(st, c, k_dense),
+                self._drop_filler(st, d, k_dense),
                 f"{ratio=} consumer",
             )
 
@@ -761,7 +804,8 @@ class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
         import sglang.srt.layers.attention.dsv4.low_ratio_backend_hip as hip
 
         for ratio in (1, 2):
-            st = self._setup(ratio, seq_lens=[300, 45, 700], extend_lens=[300, 45, 200])
+            seq_lens, extend_lens = [300, 45, 700], [300, 45, 200]
+            st = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
             w_pi, w_ri, w_masks = self._run(st, "extend", candidate_source=True)
             with mock.patch.object(hip, "logits_rows_per_chunk", return_value=1):
                 s_pi, s_ri, s_masks = self._run(st, "extend", candidate_source=True)
@@ -769,12 +813,11 @@ class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
             w_ri, w_pi = sorted_by_raw(w_ri, w_pi)
             s_ri, s_pi = sorted_by_raw(s_ri, s_pi)
             self.assertTrue(torch.equal(w_ri, s_ri) and torch.equal(w_pi, s_pi))
-            self.assertEqual(len(w_masks), len(s_masks))
-            for a, b in zip(w_masks, s_masks):
-                self.assertTrue(torch.equal(a, b))
+            self._assert_candidates_equal(w_masks, s_masks, f"{ratio=}")
             d = self._run(st, "extend", uses_candidates=True, masks=w_masks)
-            c_pi, c_ri, _ = self._drop_filler(st, c, w_masks)
-            d_pi, d_ri, _ = self._drop_filler(st, d, w_masks)
+            w_dense = self._dense_masks(st, w_masks, seq_lens, extend_lens)
+            c_pi, c_ri, _ = self._drop_filler(st, c, w_dense)
+            d_pi, d_ri, _ = self._drop_filler(st, d, w_dense)
             self.assertTrue(torch.equal(c_ri, d_ri) and torch.equal(c_pi, d_pi))
 
     def test_decode_path_agrees_with_torch_path(self):

@@ -26,11 +26,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
-from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
-    mask_topk_scores,
 )
 
 if TYPE_CHECKING:
@@ -232,6 +230,26 @@ class CandidateBlocks(NamedTuple):
     compact_page_table: torch.Tensor
     compact_page_size: int
     block_size: int
+
+
+def slice_candidate_blocks(candidates: CandidateBlocks, rows: slice) -> CandidateBlocks:
+    """The rows `rows` of a per-request publication."""
+    return candidates._replace(
+        ids=candidates.ids[rows],
+        compact_lens=candidates.compact_lens[rows],
+        compact_page_table=candidates.compact_page_table[rows],
+    )
+
+
+def cat_candidate_blocks(pieces: List[CandidateBlocks]) -> CandidateBlocks:
+    """Row chunks of one request's publication, in row order."""
+    if len(pieces) == 1:
+        return pieces[0]
+    return pieces[0]._replace(
+        ids=torch.cat([p.ids for p in pieces]),
+        compact_lens=torch.cat([p.compact_lens for p in pieces]),
+        compact_page_table=torch.cat([p.compact_page_table for p in pieces]),
+    )
 
 
 def select_candidate_blocks_hip(
@@ -464,20 +482,15 @@ def _fill_identity_request(
     lens: torch.Tensor,
     page_rows: torch.Tensor,
     raw_rows: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
+) -> None:
     """Rows [t, topk] of the -1 filled buffers: column j < lc holds compressed
-    position j (its slot / its raw index) when j < lens_row, else -1. Returns the
-    candidate mask a source indexer publishes: `select_candidate_blocks` keeps
-    exactly the blocks holding a position below the row's visible count."""
+    position j (its slot / its raw index) when j < lens_row, else -1. An identity
+    request publishes no candidates: every reachable block is one."""
     j = torch.arange(lc, device=lens.device)
     reach = j[None, :] < lens[:, None]
     page_rows[:, :lc] = torch.where(reach, slots_j[None, :], -1).to(torch.int32)
     if raw_rows is not None:
         raw_rows[:, :lc] = torch.where(reach, j[None, :], -1).to(torch.int32)
-    if not indexer.is_candidate_source:
-        return None
-    block = indexer.candidate_block_size
-    return (j[None, :] // block) <= ((lens[:, None] - 1) // block)
 
 
 def _decode_batch_max_seq_len(forward_batch) -> Optional[int]:
@@ -700,11 +713,9 @@ def low_ratio_index_topk_hip_extend(
             tok += t_len
             if lc == 0:
                 if published is not None:
-                    published.append(
-                        torch.zeros((t_len, 0), dtype=torch.bool, device=pos.device)
-                    )
+                    published.append(None)
                 continue
-            mask = _fill_identity_request(
+            _fill_identity_request(
                 indexer,
                 lc=lc,
                 slots_j=k_slots[starts[b] : starts[b] + lc],
@@ -713,7 +724,7 @@ def low_ratio_index_topk_hip_extend(
                 raw_rows=None if raw_indices is None else raw_indices[rows],
             )
             if published is not None:
-                published.append(mask)
+                published.append(None)
 
     if all(identity):
         fill_identity_requests(0, len(extend_lens_cpu), 0)
@@ -790,20 +801,20 @@ def low_ratio_index_topk_hip_extend(
         for lo in range(tok_lo, tok_hi, rows_per_chunk):
             rows = slice(lo, min(lo + rows_per_chunk, tok_hi))
             piece = [] if published is not None else None
-            select_rows(
-                rows,
-                req_lo,
-                req_hi,
-                group_identity,
-                None
-                if consume is None
-                else [consume[req_lo][lo - tok_lo : rows.stop - tok_lo]],
-                piece,
-            )
+            consume_rows = None
+            if consume is not None:
+                consume_rows = [
+                    None
+                    if consume[req_lo] is None
+                    else slice_candidate_blocks(
+                        consume[req_lo], slice(lo - tok_lo, rows.stop - tok_lo)
+                    )
+                ]
+            select_rows(rows, req_lo, req_hi, group_identity, consume_rows, piece)
             if piece:
                 pieces.append(piece[0])
         if published is not None:
-            published.append(torch.cat(pieces))
+            published.append(cat_candidate_blocks(pieces))
     if published is not None:
         backend.candidate_masks = published
 
@@ -820,81 +831,80 @@ def _select_topk_extend_hip(
     page_size: int,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor],
-    consume: Optional[List[torch.Tensor]],
-    publish: Optional[List[torch.Tensor]],
+    consume: Optional[List[Optional[CandidateBlocks]]],
+    publish: Optional[List[Optional[CandidateBlocks]]],
 ) -> None:
     """Row t of `logits` scores its request's compressed positions 0..lc-1 in columns 0..lc-1,
-    reachable up to compress_lens[t]. Level one runs per request on the rows in place (the source
-    publishes one bool [t_len, lc] mask per request, a consumer sinks its non-candidates), then one
-    paged top-k launch selects every row at its own length, ordered by position, -1 padded.
-    Both levels walk the rows in chunks of _TORCH_INDEXER_SCORE_BUDGET_BYTES; identity requests
-    (`identity[b]`) are written without scores (`_fill_identity_request`)."""
+    reachable up to compress_lens[t]. A source layer publishes one `CandidateBlocks` per request
+    (None for an identity or empty request: every reachable block is a candidate); a consumer
+    selects each request's rows inside its published blocks on the compact candidate row
+    (`topk_within_candidate_blocks_hip`), identity rows through the plain launch; every other
+    layer runs one paged top-k launch over the group. Rows are ordered by position, -1 padded.
+    Level one walks the rows in chunks of _TORCH_INDEXER_SCORE_BUDGET_BYTES."""
     assert page_indices.shape[1] == indexer.index_topk, (
         f"the paged top-k selects page_indices.shape[1] = {page_indices.shape[1]} "
         f"slots, the indexer wants {indexer.index_topk}"
     )
-    if publish is not None or consume is not None:
-        j = torch.arange(logits.shape[1], device=logits.device)
+    if publish is not None:
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, extend_lens_cpu)):
             rows = slice(tok_start, tok_start + t_len)
             tok_start += t_len
-            if lc == 0 or t_len == 0:
-                if publish is not None:
-                    # Consumers index the masks by request, so keep the slot.
-                    publish.append(logits.new_zeros((t_len, lc), dtype=torch.bool))
+            if lc == 0 or t_len == 0 or identity[b]:
+                # Consumers index the publication by request, so keep the slot.
+                publish.append(None)
                 continue
-            if identity[b]:
-                if publish is not None:
-                    lens = compress_lens[rows, None]
-                    block = indexer.candidate_block_size
-                    publish.append((j[None, :lc] // block) <= ((lens - 1) // block))
-                continue
-            scores = logits[rows, :lc]
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
-            if publish is None:
-                mask = consume[b]
-                assert mask.shape == (t_len, lc), (mask.shape, t_len, lc)
-                for start in range(0, t_len, step):
-                    scores[start : start + step].masked_fill_(
-                        ~mask[start : start + step], -torch.inf
-                    )
-                continue
-            lens = compress_lens[rows, None]
-            masks = []
-            for start in range(0, t_len, step):
-                chunk = scores[start : start + step]
-                lens_c = lens[start : start + step]
-                # The block selection tells unreachable positions apart by -inf.
-                chunk.masked_fill_(j[None, :lc] >= lens_c, -torch.inf)
-                masks.append(
-                    select_candidate_blocks(
-                        chunk,
-                        lens_c,
+            pieces = []
+            for lo in range(0, t_len, step):
+                chunk = slice(rows.start + lo, rows.start + min(lo + step, t_len))
+                pieces.append(
+                    select_candidate_blocks_hip(
+                        logits[chunk, :lc],
+                        compress_lens[chunk],
                         topk_blocks=indexer.candidate_topk_blocks,
                         block_size=indexer.candidate_block_size,
                     )
                 )
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
-    filter_candidates = consume is not None
-    selected = torch.empty_like(page_indices) if filter_candidates else raw_indices
+            publish.append(cat_candidate_blocks(pieces))
+    if consume is not None:
+        tok_start = 0
+        for b, t_len in enumerate(extend_lens_cpu):
+            rows = slice(tok_start, tok_start + t_len)
+            tok_start += t_len
+            if t_len == 0:
+                continue
+            rows_page = page_indices[rows]
+            rows_raw = raw_indices[rows] if raw_indices is not None else None
+            if consume[b] is None:
+                topk_transform_paged(
+                    logits[rows],
+                    compress_lens[rows].contiguous(),
+                    page_table[rows],
+                    rows_page,
+                    page_size,
+                    rows_raw,
+                )
+            else:
+                topk_within_candidate_blocks_hip(
+                    logits[rows],
+                    compress_lens[rows],
+                    consume[b],
+                    page_table=page_table[rows],
+                    page_size=page_size,
+                    page_indices=rows_page,
+                    raw_indices=rows_raw,
+                )
+            sort_selection_rows(rows_page, rows_raw)
+        return
     topk_transform_paged(
         logits,
         compress_lens.contiguous(),
         page_table,
         page_indices,
         page_size,
-        selected,
+        raw_indices,
     )
-    if filter_candidates:
-        # Fewer candidates than k leaves -inf columns in the selection.
-        selected = mask_topk_scores(logits, selected)
-        columns = selected.clamp_min(0).to(torch.int64)
-        slots = page_table.gather(1, columns // page_size) * page_size
-        slots = slots + columns % page_size
-        page_indices.copy_(torch.where(selected >= 0, slots, -1))
-        if raw_indices is not None:
-            raw_indices.copy_(selected)
     sort_selection_rows(page_indices, raw_indices)
 
 
