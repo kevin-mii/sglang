@@ -313,7 +313,7 @@ class EngramHasher(nn.Module):
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
-        if input_ids.is_cuda and torch.version.cuda is not None:
+        if input_ids.is_cuda:
             hash_ids, tokens = engram_hash_ids(
                 input_ids,
                 forward_batch.positions,
@@ -866,11 +866,9 @@ def engram_gate(
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy.
 
-    The fused kernel serves every token count on CUDA; the torch path below is the
-    non-CUDA fallback and materializes fp32 copies of x, key and value."""
+    The torch path below is the CPU fallback."""
     if (
         x.is_cuda
-        and torch.version.cuda is not None
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype

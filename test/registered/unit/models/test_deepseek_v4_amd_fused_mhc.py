@@ -287,6 +287,10 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # (norm_fused=False) -- the Triton fused post+pre contract.
         normed = object()
         layer.input_layernorm.return_value = normed
+        layer._input_norm.side_effect = lambda hs, allow_aiter_quant=True: (
+            layer.input_layernorm(hs),
+            None,
+        )
         layer.self_attn.maybe_use_decode_attn_tp.side_effect = _StopForward
 
         # Force the non-aiter (torch layernorm) branch deterministically so the
