@@ -12,6 +12,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.srt.utils import is_hip
+
+# libdevice.exp / div_rn do not lower on HIP; tl.exp and `/` are exact against torch on gfx950
+_LIBDEVICE_EXACT = not is_hip()
+
 
 @triton.jit
 def _pair_pool_decode_kernel(
@@ -32,6 +37,7 @@ def _pair_pool_decode_kernel(
     STATE_SCORE_STRIDE: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    LIBDEVICE: tl.constexpr,
 ):
     row = tl.program_id(0)
 
@@ -91,13 +97,21 @@ def _pair_pool_decode_kernel(
     # Match torch's pair-axis softmax operation order. libdevice.exp is required;
     # tl.exp uses an approximate exponential and can change the pooled latent.
     m = tl.maximum(p_score, score)
-    e0 = libdevice.exp(p_score - m)
-    e1 = libdevice.exp(score - m)
+    if LIBDEVICE:
+        e0 = libdevice.exp(p_score - m)
+        e1 = libdevice.exp(score - m)
+    else:
+        e0 = tl.exp(p_score - m)
+        e1 = tl.exp(score - m)
     denom = e0 + e1
     # The + 0.0 prevents FMA contraction: torch rounds both products before summing.
     # Use libdevice.div_rn to match torch division; Triton's / uses an approximate reciprocal.
-    t0 = p_kv * libdevice.div_rn(e0, denom)
-    t1 = kv * libdevice.div_rn(e1, denom)
+    if LIBDEVICE:
+        t0 = p_kv * libdevice.div_rn(e0, denom)
+        t1 = kv * libdevice.div_rn(e1, denom)
+    else:
+        t0 = p_kv * (e0 / denom)
+        t1 = kv * (e1 / denom)
     t0 = t0 + 0.0
     t1 = t1 + 0.0
     pooled = t0 + t1
@@ -153,6 +167,7 @@ def pair_pool_decode(
         STATE_SCORE_STRIDE=state_score.stride(0),
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
+        LIBDEVICE=_LIBDEVICE_EXACT,
         num_warps=4,
     )
     return pooled, group_pos, slots

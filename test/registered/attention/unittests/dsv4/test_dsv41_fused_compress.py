@@ -1,4 +1,6 @@
-"""Check decode numerics and packed writes through the real cache pool."""
+"""Check decode numerics and packed writes through the real cache pool.
+On ROCm the index-K pool is split (payload / scale), so the reference is its own unfused writer.
+"""
 
 import os
 import types
@@ -8,11 +10,14 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_gfx95_supported
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 HIDDEN = 2048
 HEAD_DIM = 512
@@ -103,7 +108,15 @@ def _build(n: int, ratio: int, seed: int):
     # Use the real pool: get_extra_key_buffer exposes a uint8 store as an fp8 view.
     kv_cache = pool.get_extra_key_buffer(layer_id)
     compressed_page = pool.get_extra_key_page_size(layer_id)
-    index_cache = pool.get_index_k_with_scale_buffer(layer_id)
+    # ROCm keeps payload and scale split; CUDA fuses them into one 68-byte row
+    split = pool.low_ratio_index_k_is_split(layer_id)
+    if split:
+        index_cache = (
+            pool.get_index_k_fp4_payload_buffer(layer_id).view(torch.uint8),
+            pool.get_index_k_fp4_scale_buffer(layer_id),
+        )
+    else:
+        index_cache = (pool.get_index_k_with_scale_buffer(layer_id),)
     # Ratio 1 pools nothing, so it has no pair state -- the pool asserts on the
     # accessor rather than returning an empty one.
     state = pool.get_attention_compress_states(layer_id) if ratio == 2 else None
@@ -165,6 +178,7 @@ def _build(n: int, ratio: int, seed: int):
         out_loc=out_loc,
         kv_cache=kv_cache,
         index_cache=index_cache,
+        index_k_split=split,
         compressor=compressor,
         k_norm=k_norm,
         captured=captured,
@@ -235,7 +249,7 @@ def _reference(t, ratio: int):
         t.kv_cache.shape, dtype=torch.uint8, device=t.kv_cache.device
     )
     if not live.any():
-        return kv_cache, torch.zeros_like(t.index_cache)
+        return kv_cache, tuple(torch.zeros_like(buf) for buf in t.index_cache)
     fused_store_cache(
         input=fake_quant_compressed_kv(
             rope_tail(latent[live], t.freqs[group_pos[live]], ROPE_DIM)
@@ -245,14 +259,31 @@ def _reference(t, ratio: int):
         page_size=t.compressed_page,
         type="flashmla",
     )
-    index_cache = torch.zeros_like(t.index_cache)
-    rope_fake_quant_pack_indexer(
-        t.k_norm(projected[live]),
-        t.freqs[group_pos[live]],
-        ROPE_DIM,
-        cache=index_cache,
-        loc=t.out_loc[live],
-    )
+    index_cache = tuple(torch.zeros_like(buf) for buf in t.index_cache)
+    if t.index_k_split:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            store_fp4_index_k_cache_split,
+        )
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
+
+        # the unfused ROCm chain: `index_keys` then the split-layout writer
+        payload, scale = index_cache
+        store_fp4_index_k_cache_split(
+            _rope_fq4(t.k_norm(projected[live]), t.freqs[group_pos[live]], ROPE_DIM),
+            payload.view(torch.float4_e2m1fn_x2),
+            scale,
+            t.out_loc[live],
+            page_size=payload.shape[3],
+            rne=True,
+        )
+    else:
+        rope_fake_quant_pack_indexer(
+            t.k_norm(projected[live]),
+            t.freqs[group_pos[live]],
+            ROPE_DIM,
+            cache=index_cache[0],
+            loc=t.out_loc[live],
+        )
     return kv_cache, index_cache
 
 
@@ -267,10 +298,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
         )
 
     def _check_step(self, t, ratio: int):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-        )
-
         DeepseekV4AttnBackend._low_ratio_compress_fused(
             t.backend, t.layer, t.x, t.req, t.pos
         )
@@ -280,17 +307,19 @@ class TestFusedLowRatioCompress(CustomTestCase):
         got_kv = t.kv_cache.view(torch.uint8)
         if (t.out_loc > 0).any():
             self.assertTrue(got_kv.any(), "the main-KV write published nothing")
-            self.assertTrue(t.index_cache.any(), "the index-K write published nothing")
+            for got in t.index_cache:
+                self.assertTrue(got.any(), "the index-K write published nothing")
         self.assertTrue(
             torch.equal(got_kv, ref_kv),
             f"{ratio=}: {int((got_kv != ref_kv).sum())} main-KV cache "
             f"bytes differ from the unfused chain",
         )
-        self.assertTrue(
-            torch.equal(t.index_cache, ref_index),
-            f"{ratio=}: {int((t.index_cache != ref_index).sum())} index-K "
-            f"cache bytes differ from the unfused chain",
-        )
+        for got, ref in zip(t.index_cache, ref_index):
+            self.assertTrue(
+                torch.equal(got, ref),
+                f"{ratio=}: {int((got != ref).sum())} index-K "
+                f"cache bytes differ from the unfused chain",
+            )
 
     def test_ratio_2_matches_exact_reference(self):
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
@@ -335,8 +364,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
 
     def test_static_verify_dispatch_and_real_pool_writes(self):
         from sglang.kernels.ops.attention.dsv4.c2 import c2_verify_norm_rope_store
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
             _low_ratio_compression_metadata,
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -392,7 +420,8 @@ class TestFusedLowRatioCompress(CustomTestCase):
             backend._low_ratio_compress_torch.assert_not_called()
             ref_kv, ref_index = _reference(t, 2)
             self.assertTrue(torch.equal(t.kv_cache.view(torch.uint8), ref_kv))
-            self.assertTrue(torch.equal(t.index_cache, ref_index))
+            for got, ref in zip(t.index_cache, ref_index):
+                self.assertTrue(torch.equal(got, ref))
 
             # A compact graph can happen to have a divisible row count. It must
             # still use the variable-length fallback rather than the 2D grid.
@@ -405,6 +434,78 @@ class TestFusedLowRatioCompress(CustomTestCase):
             set_global_server_args_for_scheduler(
                 ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
             )
+
+    def test_padded_rows_publish_nothing(self):
+        """A padded CUDA-graph suffix carries `raw_out_loc == 0`, and at ratio 2
+        `c2_out_loc == -1` for a row completing no group. Neither may reach
+        either cache -- both kernels derive that from the arrays themselves, so
+        the caller passes no mask."""
+        n, pad = 8, 3
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                t = _build(n, ratio, seed=200 + ratio)
+                core = t.backend.forward_metadata.core_metadata
+                core.raw_out_loc[-pad:] = 0
+                core.c1_out_loc[-pad:] = 0
+                core.c2_out_loc[-pad:] = 0
+                DeepseekV4AttnBackend._low_ratio_compress_fused(
+                    t.backend, t.layer, t.x, t.req, t.pos
+                )
+                torch.cuda.synchronize()
+                # Slot 0 of page 0 is the reserved dummy every padded row would
+                # land on if the predicate were missing.
+                self.assertFalse(
+                    t.kv_cache.view(torch.uint8)[0, :576].any(),
+                    "a padded row wrote main-KV slot 0",
+                )
+                if t.index_k_split:
+                    payload, scale = t.index_cache
+                    self.assertFalse(
+                        payload[0, 0, :, 0, :].any(),
+                        "a padded row wrote index-K slot 0",
+                    )
+                    self.assertFalse(
+                        scale[0, 0, :, 0].any(), "a padded row wrote index-K slot 0"
+                    )
+                else:
+                    self.assertFalse(
+                        t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any(),
+                        "a padded row wrote index-K slot 0",
+                    )
+
+    def test_selected_from_the_device(self):
+        """The compressor's fused-write detection must agree with the capability the
+        device reports."""
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+            DeepseekV41Compressor,
+            fused_low_ratio_compress_supported,
+        )
+
+        if torch.version.hip is not None:
+            expected = is_gfx95_supported()
+        else:
+            expected = torch.cuda.get_device_capability()[0] >= 10
+        self.assertEqual(fused_low_ratio_compress_supported(), expected)
+        for ratio in (1, 2):
+            compressor = DeepseekV41Compressor(HIDDEN, HEAD_DIM, ratio, EPS)
+            self.assertEqual(compressor.use_fused_compress, expected)
+            self.assertEqual(compressor.use_fused_gate, expected and ratio == 2)
+
+    def test_unsupported_device_keeps_the_unfused_path(self):
+        """Forced off, the compressor must keep the split projection so the fused entry
+        cannot fire."""
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+            DeepseekV41Compressor,
+        )
+
+        for ratio in (1, 2):
+            compressor = DeepseekV41Compressor(
+                HIDDEN, HEAD_DIM, ratio, EPS, fused_compress=False
+            )
+            self.assertFalse(compressor.use_fused_compress)
+            self.assertFalse(compressor.use_fused_gate)
+            self.assertTrue(hasattr(compressor, "wkv"))
+            self.assertFalse(hasattr(compressor, "wkv_gate"))
 
 
 if __name__ == "__main__":

@@ -20,12 +20,13 @@ from sglang.srt.layers.attention.dsv4.torch_quant import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    """RoPE plus fake FP4 quantization, fused for CUDA BF16 inputs."""
-    if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
+    """RoPE plus fake FP4 quantization, fused for BF16 inputs on CUDA and ROCm. The compressed
+    KV latent takes per-16 E4M3 scales; everything else per-32 UE8M0."""
+    if x.is_cuda and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,
         )
@@ -90,14 +91,13 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """Whether the fused c1 / c2 / index-K decode kernels can serve this process.
-
-    They pack fp4 with `cvt.rn.satfinite.e2m1x2`, a Blackwell (sm100+) CUDA
-    instruction, so HIP and pre-Blackwell parts keep the split projection and the
-    unfused write. Decided once at load time: the choice also fixes the weight
-    layout of the ratio-2 projection (one `wkv_gate` or `wkv` plus `wgate`)."""
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    """Whether the fused c1 / c2 / index-K decode kernels can serve this process: Blackwell
+    (sm100+) CUDA or gfx95 ROCm. Decided once at load time, since the choice also fixes the
+    weight layout of the ratio-2 projection (one `wkv_gate` or `wkv` plus `wgate`)."""
+    if not torch.cuda.is_available():
         return False
+    if torch.version.hip is not None:
+        return is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -226,6 +226,16 @@ class DeepseekV41Indexer(nn.Module):
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
+        # the module is ROCm-only, so it is imported here rather than at module scope
+        self.weights_proj_hip_max_tokens = -1
+        if torch.version.hip is not None:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                rocm_indexer_head_weights_max_tokens,
+            )
+
+            self.weights_proj_hip_max_tokens = rocm_indexer_head_weights_max_tokens(
+                self.n_heads, config.hidden_size, torch.bfloat16
+            )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's;
         # wider batches use the linear path.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
@@ -257,6 +267,7 @@ class DeepseekV41Indexer(nn.Module):
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
     def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        # on the gfx950 bf16-dequant route q_lora may be the Fp8GridActivation the fused q_norm produced
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim)

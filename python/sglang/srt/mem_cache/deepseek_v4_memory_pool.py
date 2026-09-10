@@ -450,6 +450,19 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.uses_aiter_fp4_layout:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                store_fp4_index_k_cache_split,
+            )
+
+            return store_fp4_index_k_cache_split(
+                cache_k,
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                loc,
+                page_size=self.page_size,
+                rne=self.index_k_rne,
+            )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
@@ -469,6 +482,17 @@ class DeepSeekV4IndexerPool(KVCache):
         Inverse of the store_fp4_index_k_cache page layout
         [page_size * 64 payload | page_size * 4 scale bytes]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
+        if self.uses_aiter_fp4_layout:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                read_fp4_index_k_split,
+            )
+
+            return read_fp4_index_k_split(
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                slots,
+                page_size=self.page_size,
+            )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
         p = self.page_size
@@ -489,6 +513,21 @@ class DeepSeekV4IndexerPool(KVCache):
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
+        if self.uses_aiter_fp4_layout:
+            # ROCm keeps payload and packed ue8m0 scales in two buffers
+            if slots is None:
+                slots = torch.arange(self.size, device=self.device)
+            payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
+            u = payload.view(torch.uint8)  # [n, 64]
+            exps = torch.stack(
+                [(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1
+            )  # [n, 4]
+            codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
+            vals = DSV4_DEQUANT_FP4_TABLE.to(u.device)[codes.long()].flatten(
+                1
+            )  # [n, 128]
+            scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
+            return (vals * scales).to(torch.bfloat16)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)
@@ -1464,6 +1503,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_layer_id
         )
 
+    def low_ratio_index_k_is_split(self, layer_id: int) -> bool:
+        """Whether the layer's index-K pool keeps payload and scale in the split
+        FlyDSL layout (ROCm) rather than one fused `[.., 68]`-byte row."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
+
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
@@ -1559,7 +1604,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        q: Optional[torch.Tensor] = None,
     ) -> None:
+        """``q`` ([B, H, head_dim]): rope its query heads in the same launch."""
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
@@ -1569,6 +1616,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             out_loc=swa_loc,
             kvcache=self.get_swa_raw_buffer(layer_id),
             page_size=self.swa_page_size,
+            q=q,
         )
 
     def set_unified_key_buffer_radix_fused_norm_rope(

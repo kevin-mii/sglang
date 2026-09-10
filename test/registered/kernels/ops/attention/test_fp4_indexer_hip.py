@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel (the AOT top-k transform)
 import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
@@ -36,7 +37,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    sort_selection_rows,
 )
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -827,3 +830,39 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("seq_len", [640, 1024])
+def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
+    """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
+    on the same scores differ; ordered by position they are identical, -1 padding last."""
+    torch.manual_seed(seq_len)
+    k, rows = 512, seq_len
+    scores = torch.randn(rows, seq_len, device=get_device())
+    seq_lens = torch.arange(1, rows + 1, device=get_device(), dtype=torch.int32)
+    pages = -(-seq_len // PAGE_SIZE)
+    page_table = (
+        torch.randperm(pages, device=get_device())
+        .to(torch.int32)
+        .expand(rows, -1)
+        .contiguous()
+    )
+
+    def select():
+        page = torch.empty((rows, k), dtype=torch.int32, device=get_device())
+        raw = torch.empty_like(page)
+        topk_transform_paged(scores, seq_lens, page_table, page, PAGE_SIZE, raw)
+        sort_selection_rows(page, raw)
+        return page, raw
+
+    page_a, raw_a = select()
+    page_b, raw_b = select()
+    assert torch.equal(raw_a, raw_b) and torch.equal(page_a, page_b)
+    valid = raw_a >= 0
+    assert torch.equal(valid.sum(1), seq_lens.clamp_max(k))
+    # ascending positions inside the valid prefix, padding after it
+    assert bool((raw_a[:, 1:][valid[:, 1:]] > raw_a[:, :-1][valid[:, 1:]]).all())
+    assert bool((valid[:, :-1] | ~valid[:, 1:]).all())
+    pos = raw_a.clamp_min(0)
+    slots = page_table.gather(1, pos // PAGE_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
+    assert torch.equal(page_a, torch.where(valid, slots, -1))
