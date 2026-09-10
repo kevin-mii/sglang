@@ -862,7 +862,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
+    # ROCm sparse decode attention kernel. "auto" (the default) is resolved by
+    # hip_flash_mla.resolve_hip_flashmla_backend to aiter_sparse on gfx950 and
+    # tilelang elsewhere; set explicitly to force one of tilelang | triton |
+    # aiter_sparse | torch | comparison.
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
@@ -1438,9 +1442,9 @@ class Envs:
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
-    # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
-    # _apply_wo_a_bf16_matmul.
-    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # tuned batched_gemm_bf16 (gfx95). ON on ROCm, OFF elsewhere; the call sites also
+    # require SGLANG_USE_AITER on gfx95. Set False to force the einsum.
+    SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(_default_hip)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
