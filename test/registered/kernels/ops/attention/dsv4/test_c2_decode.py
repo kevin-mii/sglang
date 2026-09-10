@@ -1,0 +1,691 @@
+"""Check ratio-2 pooling within tolerance, and pair state and cache stores bitwise.
+
+Closed-form softmax and FMA contraction can cross bf16 rounding boundaries.
+The pooling gate allows two bf16 ulps plus an absolute floor near cancellation;
+an aggregate mismatch bound detects systematic drift within that tolerance.
+The store gate uses the kernel's own latent, while the end-to-end byte check
+covers rows whose latents agree. Pair state is copied without arithmetic.
+"""
+
+import sys
+
+import pytest
+import torch
+
+from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
+from sglang.kernels.ops.attention.dsv4.c2 import (
+    c2_decode_norm,
+    c2_decode_norm_rope_store,
+)
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    DeepseekV41Compressor,
+    RMSNorm,
+    rope_tail,
+)
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_compressed_kv
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The kernel is not Blackwell-specific (its widest vector is 16 bytes and PDL
+# only needs sm90), but the ratio-2 compressor is served on B200/GB300, so gate
+# it there too rather than on Hopper alone.
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="the fused c2 decode compressor requires CUDA",
+)
+
+EPS = 1e-6
+# 512 only, and not merely because it is the served width: the kernel carries the
+# main-KV write, and a 584-byte FlashMLA slot is 448 fp8 nope plus 64 bf16 RoPE,
+# so no other `head_dim` has a layout to store into. The kernel asserts it rather
+# than letting the store go wrong.
+HEAD_DIMS = (512,)
+BATCHES = (1, 2, 8, 32, 64)
+# `CompressStatePool.ring_size`, positions per request slot in the pair state.
+# Two values, because the addressing is modular and a wrong wrap only shows on
+# one of them: the served size is `next_power_of_2(draft + 1)`.
+RING_SIZES = (2, 8)
+
+ROPE_DIM = 64
+RATIO = 2
+# Slots per page of the *compressed* pool, i.e. the FULL page size over the
+# ratio. 128 // 2 as served.
+PAGE_SIZE = 64
+SLOT_BYTES = 584
+PAGE_BYTES = -(-SLOT_BYTES * PAGE_SIZE // 576) * 576
+
+# Two bf16 ulp, worst case, in relative terms -- see the module docstring for
+# why the intermediate bf16 cast in `finish` makes one ulp reachable and two the
+# ceiling. The floor is 12 binary orders below a normalized output, so it only
+# ever engages on elements the pair pooling has cancelled to near zero.
+POOL_RTOL = 2**-6
+POOL_ATOL = 2**-20
+# Fraction of elements allowed to differ from torch at all, aggregated over the
+# whole sweep. Measured 2.7e-5; a systematic drift would put this near 1.
+MISMATCH_FRAC = 1e-3
+# Fraction of *rows* whose latent may differ from torch by the ulp above. A row
+# is 512 elements, so the per-element rate compounds; measured 0.03.
+ROW_MISMATCH_FRAC = 0.2
+
+
+def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Use explicit torch RMSNorm so the oracle stays independent of fused kernels;
+    RMSNorm.forward can change implementation with batch size.
+    """
+    dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    return (weight * x).to(dtype)
+
+
+def _norm(dim: int, seed: int) -> RMSNorm:
+    """`DeepseekV41Compressor.norm` as the model holds it: bf16 weight, because
+    the parameter is created inside `set_default_torch_dtype(model dtype)`."""
+    with set_default_torch_dtype(torch.bfloat16):
+        norm = RMSNorm(dim, EPS).cuda()
+    assert norm.weight.dtype == torch.bfloat16
+    # Not `ones`: a constant weight cannot catch a wrong per-element index.
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(dim, generator=g, device="cuda"))
+    return norm
+
+
+def _inputs(
+    n,
+    dim,
+    seed,
+    *,
+    positions=None,
+    req=None,
+    raw_out_loc=None,
+    num_state_rows=None,
+    ring_size=RING_SIZES[-1],
+):
+    """Inputs exercise distinct partner rows and alternating parity without padding;
+    a separate case covers the scheduler's int64 output locations.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    num_state_rows = num_state_rows if num_state_rows is not None else n + 2
+    kv_input = torch.randn(n, 2 * dim, generator=g, device="cuda", dtype=torch.float32)
+    kv_state = torch.randn(
+        num_state_rows * ring_size,
+        2 * dim,
+        generator=g,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    if positions is None:
+        positions = torch.arange(1, n + 1, device="cuda", dtype=torch.int32)
+    if req is None:
+        req = torch.arange(1, n + 1, device="cuda", dtype=torch.int64)
+    if raw_out_loc is None:
+        # Odd and never 0, so no row is taken for padding and `>> 1` gives each
+        # row its own compressed slot.
+        raw_out_loc = torch.arange(n, device="cuda", dtype=torch.int32) * 2 + 3
+    return kv_input, kv_state, positions, req, raw_out_loc
+
+
+def _state_rows(req, positions, ring_size):
+    """`CompressStatePool.translate_from_req_position_to_state_loc`, for the
+    slot a row reads (`pos - 1`) and the one it writes (`pos`)."""
+    base = req.to(torch.int64) * ring_size
+    pos = positions.to(torch.int64)
+    return base + (pos - 1) % ring_size, base + pos % ring_size
+
+
+def _torch_reference(kv_input, kv_state, norm, positions, req, raw_out_loc, ring_size):
+    """The ratio-2 decode branch and `finish`, transcribed. Updates `kv_state`
+    in place like the kernel does; returns `(latent, completes)`."""
+    dim = kv_input.shape[1] // 2
+    kv, score = kv_input[:, :dim], kv_input[:, dim:]
+    state_kv, state_score = kv_state[:, :dim], kv_state[:, dim:]
+    odd = (positions.to(torch.int64) % 2) == 1
+    read, write = _state_rows(req, positions, ring_size)
+    # The ring separates the two: a completing row reads what `pos - 1` left, a
+    # pending one writes its own slot, so there is no read-modify-write of one
+    # row and no ordering to respect between them.
+    partner_kv, partner_score = state_kv[read], state_score[read]
+    # Only an even *live* row writes. Scattering the others as no-ops would not
+    # be equivalent: padded rows share a `req_pool_idx` with a live request, and
+    # a duplicated index makes the scatter pick a winner rather than skip.
+    parks = (~odd) & (raw_out_loc != 0)
+    w = write[parks]
+    assert w.unique().numel() == w.numel(), "a decode step parks once per request"
+    state_kv[w] = kv[parks]
+    state_score[w] = score[parks]
+    pooled = DeepseekV41Compressor.pool_pairs(
+        torch.stack([partner_kv, kv], dim=1),
+        torch.stack([partner_score, score], dim=1),
+    )
+    return _torch_rmsnorm(pooled.to(torch.bfloat16), norm.weight.data, EPS), odd
+
+
+def _compare(got, expected, rows, ctx):
+    """Assert the tolerance gate on `rows`; return `(num_differing, num_compared)`
+    for the aggregate mismatch test."""
+    got, expected = got.float()[rows], expected.float()[rows]
+    if got.numel() == 0:
+        return 0, 0
+    diff = (got - expected).abs()
+    worst = (diff / (POOL_ATOL + POOL_RTOL * expected.abs())).max().item()
+    assert worst <= 1.0, (
+        f"{ctx}: out of tolerance at {worst:.3f}x the bound "
+        f"(rtol={POOL_RTOL}, atol={POOL_ATOL}); "
+        f"max|diff| {diff.max().item():.3e} on |ref| up to "
+        f"{expected.abs().max().item():.3e}"
+    )
+    return int((diff > 0).sum()), got.numel()
+
+
+def _run(n, dim, seed, *, sentinel=None, ring_size=RING_SIZES[-1], **kw):
+    """One `c2_decode_norm` call against the reference. Returns the mismatch
+    counters and the two pair states so callers can add their own assertions."""
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
+        n, dim, seed, ring_size=ring_size, **kw
+    )
+    norm = _norm(dim, seed + 1)
+    ref_state, got_state = kv_state.clone(), kv_state.clone()
+
+    expected, odd = _torch_reference(
+        kv_input, ref_state, norm, positions, req, raw_out_loc, ring_size
+    )
+    out = None
+    if sentinel is not None:
+        out = torch.full((n, dim), sentinel, device="cuda", dtype=torch.bfloat16)
+    got = c2_decode_norm(
+        kv_input,
+        got_state,
+        norm.weight.data,
+        positions,
+        req,
+        raw_out_loc,
+        EPS,
+        ring_size=ring_size,
+        out=out,
+    )
+    # A padded row still computes and still publishes its latent -- the caller
+    # discards that row -- so the tolerance gate covers the live ones.
+    live = odd & (raw_out_loc != 0)
+    counts = _compare(got, expected, live, f"{n=} {dim=} {seed=}")
+    return got, expected, odd, got_state, ref_state, counts
+
+
+# ---------------------------------------------------------------- pool + norm
+
+
+@pytest.mark.parametrize("ring_size", RING_SIZES)
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+@pytest.mark.parametrize("n", BATCHES)
+def test_mixed_parity(n, dim, ring_size):
+    """Both parities in one batch: the odd rows complete a group against the
+    state, the even rows park themselves in it. Both ring sizes, because the
+    slot arithmetic is modular and a wrong wrap shows on only one of them."""
+    *_, got_state, ref_state, _ = _run(n, dim, seed=1000 + n + dim, ring_size=ring_size)
+    # Pure copy on the even rows, untouched on the odd ones -- no arithmetic, so
+    # nothing here is allowed to differ by even one bit.
+    assert torch.equal(got_state, ref_state), "pair state diverged"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+@pytest.mark.parametrize("n", BATCHES)
+def test_raw_out_loc_int64(n, dim):
+    """`raw_out_loc` arrives as the scheduler's int64 `out_cache_loc` in the
+    served model (the unit tests above hand int32). The kernel indexes either
+    width and must produce the same bytes: same latent, same pair state."""
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
+        n, dim, seed=7000 + n + dim
+    )
+    norm = _norm(dim, 7001 + n + dim)
+    state32, state64 = kv_state.clone(), kv_state.clone()
+    args = (norm.weight.data, positions, req)
+    kw = {"ring_size": RING_SIZES[-1]}
+    got32 = c2_decode_norm(kv_input, state32, *args, raw_out_loc, EPS, **kw)
+    got64 = c2_decode_norm(
+        kv_input, state64, *args, raw_out_loc.to(torch.int64), EPS, **kw
+    )
+    odd = (positions.to(torch.int64) % 2) == 1
+    assert torch.equal(got32[odd], got64[odd]), "latent differs by loc dtype"
+    assert torch.equal(state32, state64), "pair state differs by loc dtype"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_even_rows_are_left_alone(dim):
+    """An even row produces no group and the kernel skips its output row rather
+    than storing a value the caller discards. Whatever was in `out` survives."""
+    n = 8
+    sentinel = -7.5
+    got, _, odd, _, _, _ = _run(n, dim, seed=2000 + dim, sentinel=sentinel)
+    even = ~odd
+    assert even.any() and odd.any(), "test needs both parities present"
+    assert torch.equal(got[even], torch.full_like(got[even], sentinel)), (
+        "an even row overwrote its output"
+    )
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_pair_state_carried_across_two_steps(dim):
+    """The load-bearing property: a group spans two decode steps. Step one is
+    all-even, so every row only parks; step two is all-odd and must pool
+    against exactly what step one left behind."""
+    n = 8
+    g = torch.Generator(device="cuda").manual_seed(3000 + dim)
+    first = torch.randn(n, 2 * dim, generator=g, device="cuda", dtype=torch.float32)
+    second = torch.randn(n, 2 * dim, generator=g, device="cuda", dtype=torch.float32)
+    kv_state = torch.randn(
+        n * RING_SIZES[-1], 2 * dim, generator=g, device="cuda", dtype=torch.float32
+    )
+    # Rotated by one so the carry cannot be confused with `req == row`.
+    req = ((torch.arange(n, device="cuda") + 1) % n).to(torch.int64)
+    raw_out_loc = torch.arange(n, device="cuda", dtype=torch.int32) * 2 + 3
+    even = torch.full((n,), 4, device="cuda", dtype=torch.int32)
+    odd = even + 1
+    norm = _norm(dim, 3001 + dim)
+
+    ref_state, got_state = kv_state.clone(), kv_state.clone()
+    ring = RING_SIZES[-1]
+    _torch_reference(first, ref_state, norm, even, req, raw_out_loc, ring)
+    expected, mask = _torch_reference(
+        second, ref_state, norm, odd, req, raw_out_loc, ring
+    )
+
+    args = (norm.weight.data,)
+    kw = {"ring_size": ring}
+    c2_decode_norm(first, got_state, *args, even, req, raw_out_loc, EPS, **kw)
+    got = c2_decode_norm(second, got_state, *args, odd, req, raw_out_loc, EPS, **kw)
+
+    assert mask.all(), "step two must be all-odd"
+    _compare(got, expected, mask, f"two-step {dim=}")
+    assert torch.equal(got_state, ref_state), "pair state diverged across steps"
+    # A step-two row must actually depend on step one: pooling against the
+    # original state instead would give a different answer.
+    stale = c2_decode_norm(
+        second, kv_state.clone(), *args, odd, req, raw_out_loc, EPS, **kw
+    )
+    assert not torch.equal(got, stale), "step two ignored what step one parked"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_req_indirection(dim):
+    """`req` is an arbitrary map, not the row index: it is `req_pool_indices`,
+    which the scheduler hands out in allocation order. Reversed here, and
+    narrower than the batch so the state pool is not a permutation of it."""
+    n = 8
+    num_state_rows = 6
+    req = torch.tensor([4, 3, 2, 1, 0, 5, 5, 5], device="cuda", dtype=torch.int64)
+    # The rows that share a state row are odd, so all three only *read* it and
+    # the result stays deterministic. `test_padded_rows_publish_nothing` covers
+    # the write side.
+    positions = torch.tensor([0, 1, 2, 3, 4, 5, 7, 9], device="cuda", dtype=torch.int32)
+    *_, got_state, ref_state, _ = _run(
+        n,
+        dim,
+        seed=4000 + dim,
+        positions=positions,
+        req=req,
+        num_state_rows=num_state_rows,
+    )
+    assert torch.equal(got_state, ref_state), "pair state diverged"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_padded_rows_publish_nothing(dim):
+    """Graph-padding rows with raw_out_loc == 0 must not write cache or state,
+    even when their req_pool_idx aliases a live request.
+    """
+    n = 8
+    num_state_rows = 5
+    req = torch.tensor([0, 1, 2, 3, 4, 0, 0, 0], device="cuda", dtype=torch.int64)
+    # Both parities among the padded rows: an even one would park in the state,
+    # an odd one would consume it, and neither may happen.
+    positions = torch.tensor([2, 3, 4, 5, 6, 0, 1, 0], device="cuda", dtype=torch.int32)
+    raw_out_loc = torch.tensor(
+        [7, 9, 11, 13, 15, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    got, expected, odd, got_state, ref_state, _ = _run(
+        n,
+        dim,
+        seed=5000 + dim,
+        positions=positions,
+        req=req,
+        raw_out_loc=raw_out_loc,
+        num_state_rows=num_state_rows,
+    )
+    assert torch.equal(got_state, ref_state), "a padded row wrote the pair state"
+    live = odd & (raw_out_loc != 0)
+    assert live.any(), "test needs a live completing row"
+    _compare(got, expected, live, f"padded {dim=}")
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_saturated_and_tied_scores(dim):
+    """The closed form is `exp(-|s0 - s1|)`: a tie must give exactly 0.5/0.5,
+    and a large gap must underflow to a clean one-sided pick, not a NaN."""
+    n = 6
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(n, dim, seed=6000 + dim)
+    positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
+    # Row 0 ties with its partner; the rest sit far enough apart that
+    # `exp(-|delta|)` underflows in fp32.
+    kv_input[:, dim:] = 0.0
+    kv_state[:, dim:] = 0.0
+    kv_input[1::2, dim:] = 200.0
+    kv_state[req[2::2], dim:] = 200.0
+    norm = _norm(dim, 6001 + dim)
+    ref_state, got_state = kv_state.clone(), kv_state.clone()
+
+    ring = RING_SIZES[-1]
+    expected, odd = _torch_reference(
+        kv_input, ref_state, norm, positions, req, raw_out_loc, ring
+    )
+    got = c2_decode_norm(
+        kv_input,
+        got_state,
+        norm.weight.data,
+        positions,
+        req,
+        raw_out_loc,
+        EPS,
+        ring_size=ring,
+    )
+    assert odd.all() and torch.isfinite(got.float()).all()
+    _compare(got, expected, odd, f"saturated {dim=}")
+
+
+def test_empty_batch():
+    """An idle decode step launches nothing and must not fault."""
+    got, *_ = _run(0, 512, seed=7000)
+    assert got.shape == (0, 512)
+
+
+def test_agrees_with_torch_almost_everywhere():
+    """Pooled latents must agree bitwise except near bf16 rounding boundaries;
+    an aggregate mismatch bound rejects systematic drift within per-element tolerance.
+    """
+    differing = compared = 0
+    for dim in HEAD_DIMS:
+        for n in BATCHES:
+            for seed in range(4):
+                *_, (d, c) = _run(n, dim, seed=8000 + seed * 131 + n + dim)
+                differing += d
+                compared += c
+    assert compared > 0
+    frac = differing / compared
+    assert frac <= MISMATCH_FRAC, (
+        f"{differing}/{compared} = {frac:.3e} of elements differ from torch, "
+        f"above {MISMATCH_FRAC:.0e} -- that is a drift, not boundary rounding"
+    )
+
+
+# ------------------------------------------------- + RoPE, fp4 quant and store
+
+
+def _freqs(max_pos, seed):
+    """`layer.freqs_cis` and the fp32 real/imag-interleaved view the kernel
+    indexes itself, at `positions - 1`."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    ang = torch.randn(max_pos, ROPE_DIM // 2, generator=g, device="cuda")
+    freqs = torch.polar(torch.ones_like(ang), ang)
+    return freqs, torch.view_as_real(freqs).flatten(-2).contiguous().float()
+
+
+def _cache(max_slot):
+    """A compressed-pool buffer wide enough for `max_slot`, zeroed so an
+    untouched slot is recognizable."""
+    return torch.zeros(
+        max_slot // PAGE_SIZE + 2, PAGE_BYTES, dtype=torch.uint8, device="cuda"
+    )
+
+
+def _torch_store(latent, freqs, cache, slots):
+    """Use torch arithmetic as an independent RoPE/fake-quant oracle;
+    use the production writer for the shared 584-byte FlashMLA layout.
+    """
+    fq4 = fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM))
+    fused_store_cache(
+        input=fq4, cache=cache, indices=slots, page_size=PAGE_SIZE, type="flashmla"
+    )
+
+
+def _run_fusion(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
+    """One `c2_decode_norm_rope_store` call. Returns everything both the
+    isolated and the end-to-end store gate need."""
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
+        n, dim, seed, ring_size=ring_size, **kw
+    )
+    norm = _norm(dim, seed + 1)
+    freqs, freqs_cis = _freqs(int(positions.max().item()) + 2 if n else 2, seed + 2)
+    slots = (raw_out_loc // RATIO).to(torch.int64)
+    cache = _cache(int(slots.max().item()) if n else 0)
+
+    ref_state, got_state = kv_state.clone(), kv_state.clone()
+    expected, odd = _torch_reference(
+        kv_input, ref_state, norm, positions, req, raw_out_loc, ring_size
+    )
+    got = c2_decode_norm_rope_store(
+        kv_input,
+        got_state,
+        norm.weight.data,
+        positions,
+        req,
+        raw_out_loc,
+        EPS,
+        freqs_cis,
+        cache,
+        page_size=PAGE_SIZE,
+        ring_size=RING_SIZES[-1],
+    )
+    live = odd & (raw_out_loc != 0)
+    return dict(
+        got=got,
+        expected=expected,
+        live=live,
+        cache=cache,
+        slots=slots,
+        # Per row, the way `_low_ratio_write_group` gathers `freqs_cis[group_pos]`.
+        # The kernel indexes `positions - 1` itself; only completing rows are
+        # compared, and those are all at an odd position, so the clamp is dead.
+        freqs=freqs[(positions.to(torch.int64) - 1).clamp_min(0)],
+        got_state=got_state,
+        ref_state=ref_state,
+        norm=norm,
+    )
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+@pytest.mark.parametrize("n", BATCHES)
+def test_store_accepts_the_pool_fp8_view(n, dim):
+    """`get_extra_key_buffer` hands the compressed pool out viewed as
+    `float8_e4m3fn`, not as the uint8 it was allocated as. The kernel must take
+    that view and write the same bytes it writes through the uint8 buffer."""
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
+        n, dim, seed=8000 + n + dim
+    )
+    norm = _norm(dim, 8001 + n + dim)
+    _, freqs_cis = _freqs(int(positions.max().item()) + 2 if n else 2, 8002 + n + dim)
+    slots_max = int((raw_out_loc // RATIO).max().item()) if n else 0
+    cache_u8, cache_fp8 = _cache(slots_max), _cache(slots_max)
+    args = (norm.weight.data, positions, req, raw_out_loc, EPS, freqs_cis)
+    got_u8 = c2_decode_norm_rope_store(
+        kv_input,
+        kv_state.clone(),
+        *args,
+        cache_u8,
+        page_size=PAGE_SIZE,
+        ring_size=RING_SIZES[-1],
+    )
+    got_fp8 = c2_decode_norm_rope_store(
+        kv_input,
+        kv_state.clone(),
+        *args,
+        cache_fp8.view(torch.float8_e4m3fn),
+        page_size=PAGE_SIZE,
+        ring_size=RING_SIZES[-1],
+    )
+    odd = (positions.to(torch.int64) % 2) == 1
+    assert torch.equal(got_u8[odd], got_fp8[odd]), "latent differs by cache dtype"
+    assert torch.equal(cache_u8, cache_fp8), "cache bytes differ by cache dtype"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+@pytest.mark.parametrize("n", BATCHES)
+def test_fusion_latent_is_bitwise_the_norm_only_latent(n, dim):
+    """Both entry points are the same instantiation up to `kStore`, and the
+    pre-RoPE latent is published before that branch. Bolting the write on must
+    not perturb it by one bit -- the index-K branch reads it."""
+    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
+        n, dim, seed=9000 + n, ring_size=RING_SIZES[-1]
+    )
+    norm = _norm(dim, 9001 + n)
+    _, freqs_cis = _freqs(int(positions.max().item()) + 2 if n else 2, 9002)
+    slots = (raw_out_loc // RATIO).to(torch.int64)
+    cache = _cache(int(slots.max().item()) if n else 0)
+
+    plain_state, fused_state = kv_state.clone(), kv_state.clone()
+    plain = c2_decode_norm(
+        kv_input,
+        plain_state,
+        norm.weight.data,
+        positions,
+        req,
+        raw_out_loc,
+        EPS,
+        ring_size=RING_SIZES[-1],
+    )
+    fused = c2_decode_norm_rope_store(
+        kv_input,
+        fused_state,
+        norm.weight.data,
+        positions,
+        req,
+        raw_out_loc,
+        EPS,
+        freqs_cis,
+        cache,
+        page_size=PAGE_SIZE,
+        ring_size=RING_SIZES[-1],
+    )
+    odd = (positions.to(torch.int64) % 2) == 1
+    assert torch.equal(fused[odd], plain[odd]), "the store branch moved the latent"
+    assert torch.equal(fused_state, plain_state), "the store branch moved the state"
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+@pytest.mark.parametrize("n", BATCHES)
+def test_store_is_bitwise_the_production_writer(n, dim):
+    """The hard gate on the write half, with the pooling residual factored out:
+    the reference is driven by the kernel's *own* latent, so the only thing
+    under test is RoPE, the fp4 fake-quant and the 584-byte layout. No
+    tolerance -- every byte of every slot, and every byte outside them."""
+    r = _run_fusion(n, dim, seed=10000 + n + dim)
+    live = r["live"]
+    ref_cache = torch.zeros_like(r["cache"])
+    if live.any():
+        _torch_store(r["got"][live], r["freqs"][live], ref_cache, r["slots"][live])
+    assert torch.equal(r["cache"], ref_cache), (
+        f"{n=} {dim=}: {int((r['cache'] != ref_cache).sum())} of "
+        f"{r['cache'].numel()} cache bytes differ from the production writer"
+    )
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_store_end_to_end_against_torch(dim):
+    """Full path against pure torch, pooling included. Compared per row and
+    only where the latent agrees bitwise: fp4 is a step function, so one bf16
+    ulp of latent can move a stored value by a whole grid step, and averaging
+    that into a tolerance would hide a real error. The rows that do agree must
+    agree to the byte, and they must be nearly all of them."""
+    n, seed = 64, 11000 + dim
+    r = _run_fusion(n, dim, seed=seed)
+    live = r["live"]
+    ref_cache = torch.zeros_like(r["cache"])
+    _torch_store(r["expected"][live], r["freqs"][live], ref_cache, r["slots"][live])
+
+    same = (r["got"].view(torch.int16) == r["expected"].view(torch.int16)).all(dim=-1)
+    agree = live & same
+    assert agree.any(), "no row agreed bitwise on the latent"
+    slots = r["slots"]
+    page, slot = slots // PAGE_SIZE, slots % PAGE_SIZE
+    for i in agree.nonzero().squeeze(1).tolist():
+        p, s = page[i].item(), slot[i].item()
+        value = slice(s * 576, (s + 1) * 576)
+        scale = slice(576 * PAGE_SIZE + s * 8, 576 * PAGE_SIZE + s * 8 + 8)
+        assert torch.equal(r["cache"][p, value], ref_cache[p, value]), (
+            f"row {i}: 576-byte value differs from torch"
+        )
+        assert torch.equal(r["cache"][p, scale], ref_cache[p, scale]), (
+            f"row {i}: fp8 scale bytes differ from torch"
+        )
+    frac = 1.0 - int(agree.sum()) / int(live.sum())
+    assert frac <= ROW_MISMATCH_FRAC, (
+        f"{frac:.3f} of live rows differ from torch on the latent, above "
+        f"{ROW_MISMATCH_FRAC} -- that is a drift, not boundary rounding"
+    )
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_store_skips_even_and_padded_rows(dim):
+    """Nothing but a live completing row may reach the cache. Every row here is
+    either at an even position or padded, so the buffer must come back exactly
+    as it went in -- including compressed slot 0, which is what `raw_out_loc == 0`
+    would land on if the pad check were missing."""
+    n = 8
+    positions = torch.tensor([0, 2, 4, 6, 8, 1, 3, 5], device="cuda", dtype=torch.int32)
+    # The live rows are all even; the padded ones cover both parities.
+    raw_out_loc = torch.tensor(
+        [3, 5, 7, 9, 11, 0, 0, 0], device="cuda", dtype=torch.int32
+    )
+    r = _run_fusion(
+        n,
+        dim,
+        seed=12000 + dim,
+        positions=positions,
+        raw_out_loc=raw_out_loc,
+        req=torch.tensor([0, 1, 2, 3, 4, 0, 0, 0], device="cuda", dtype=torch.int64),
+        num_state_rows=5,
+    )
+    assert not r["live"].any(), "test needs no live completing row"
+    assert not r["cache"].any(), (
+        f"{int((r['cache'] != 0).sum())} cache bytes written with nothing to store"
+    )
+
+
+@pytest.mark.parametrize("dim", HEAD_DIMS)
+def test_store_slot_is_raw_out_loc_over_ratio(dim):
+    """The kernel derives its slot in-kernel as `raw_out_loc >> 1` rather than
+    reading `c2_out_loc`. Scattered across a page boundary and beyond, the
+    written slots must be exactly that set and nothing else."""
+    n = 6
+    want = [
+        1,
+        PAGE_SIZE - 1,
+        PAGE_SIZE,
+        PAGE_SIZE + 1,
+        2 * PAGE_SIZE - 1,
+        2 * PAGE_SIZE,
+    ]
+    # Odd, so `>> 1` also proves the shift is a floor and not a round.
+    raw_out_loc = torch.tensor(
+        [s * RATIO + 1 for s in want], device="cuda", dtype=torch.int32
+    )
+    positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
+    r = _run_fusion(
+        n, dim, seed=13000 + dim, positions=positions, raw_out_loc=raw_out_loc
+    )
+    assert r["live"].all()
+    written = set()
+    cache = r["cache"]
+    for p in range(cache.shape[0]):
+        for s in range(PAGE_SIZE):
+            value = cache[p, s * 576 : (s + 1) * 576]
+            base = 576 * PAGE_SIZE + s * 8
+            if value.any() or cache[p, base : base + 8].any():
+                written.add(p * PAGE_SIZE + s)
+    assert written == set(want), f"wrote slots {sorted(written)}, wanted {want}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
