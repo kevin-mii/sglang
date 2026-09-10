@@ -1,0 +1,333 @@
+"""The gfx950 fused fp8-grid producers -- RMSNorm + fake-quant, the shared expert's clamp + silu *
+mul, and the wo_a decode GEMM with the fp8-grid epilogue -- against the unfused launches they
+replace: the fake-quant must be bit-identical to the reference applied to the same bf16 input,
+the GEMM bitwise aiter's, and rows batch-invariant.
+"""
+
+import unittest
+
+import torch
+
+from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
+    silu_and_mul_clamp_triton,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+    _mxfp8_e4m3_quantize_torch,
+    bf16_dequant_blockscaled_linear,
+    dequant_mxfp8_to_bf16,
+    fake_quant_fp8_activation,
+)
+from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+    rmsnorm_fake_quant_fp8,
+)
+from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=110, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+EPS = 1e-6
+
+
+def _reference_norm(
+    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor = None
+):
+    """The unfused RMSNorm: fp32 math, bf16 output (and bf16-rounded residual sum)."""
+    xf = x.float()
+    if residual is not None:
+        xf = xf + residual.float()
+        residual = xf.to(x.dtype)
+    var = xf.pow(2).mean(dim=-1, keepdim=True)
+    y = (xf * torch.rsqrt(var + EPS) * weight.float()).to(x.dtype)
+    return y, residual
+
+
+def _reference_fake_quant(y: torch.Tensor) -> torch.Tensor:
+    """Per-32 ue8m0 scale, e4m3 round trip, back to bf16 (torch only)."""
+    q, scales = _mxfp8_e4m3_quantize_torch(y)
+    return dequant_mxfp8_to_bf16(q, scales)
+
+
+def _ulp(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return (a.view(torch.int16).int() - b.view(torch.int16).int()).abs()
+
+
+SHAPES = [(1, 5120), (8, 5120), (33, 1536), (4096, 1024), (5, 64), (3, 7168)]
+
+
+class TestRmsnormFakeQuantFp8(CustomTestCase):
+    def _make(self, m, k):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 2
+        w = torch.rand(k, device="cuda", dtype=torch.bfloat16) * 2
+        return x, w
+
+    def test_matches_norm_then_fake_quant(self):
+        torch.manual_seed(0)
+        for m, k in SHAPES:
+            x, w = self._make(m, k)
+            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+            self.assertIsInstance(fq, Fp8GridActivation)
+            self.assertEqual(fq.x.shape, x.shape)
+            self.assertEqual(y.dtype, torch.bfloat16)
+
+            y_ref, _ = _reference_norm(x, w)
+            ulp = _ulp(y, y_ref)
+            self.assertLessEqual(ulp.max().item(), 1, (m, k))
+            self.assertLessEqual((ulp > 0).float().mean().item(), 1e-4, (m, k))
+
+            # The quant step is exact on the kernel's own bf16 norm output.
+            self.assertTrue(torch.equal(fq.x, _reference_fake_quant(y)), (m, k))
+
+            # identical to the unfused pair except where a 1-ulp pre-quant difference crossed an e4m3 midpoint
+            fq_ref = _reference_fake_quant(y_ref)
+            ne = fq.x != fq_ref
+            self.assertLessEqual(ne.float().mean().item(), 1e-4, (m, k))
+            if ne.any():
+                rel = (
+                    fq.x.float() - fq_ref.float()
+                ).abs() / fq_ref.float().abs().clamp(min=1e-3)
+                self.assertLessEqual(rel[ne].max().item(), 0.5, (m, k))
+
+    def test_residual_add(self):
+        torch.manual_seed(1)
+        for m, k in [(4, 5120), (17, 1536), (2, 64)]:
+            x, w = self._make(m, k)
+            residual = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            y_ref, res_ref = _reference_norm(x, w, residual.clone())
+            res = residual.clone()
+            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS, residual=res)
+            self.assertTrue(torch.equal(res, res_ref), (m, k))
+            self.assertLessEqual(_ulp(y, y_ref).max().item(), 1, (m, k))
+            self.assertTrue(torch.equal(fq.x, _reference_fake_quant(y)), (m, k))
+
+    def test_rows_independent_and_repeatable(self):
+        torch.manual_seed(2)
+        for k in (5120, 1536):
+            x, w = self._make(64, k)
+            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+            fq2, y2 = rmsnorm_fake_quant_fp8(x, w, EPS)
+            self.assertTrue(torch.equal(fq.x, fq2.x) and torch.equal(y, y2))
+            for r in (0, 7, 63):
+                fq1, y1 = rmsnorm_fake_quant_fp8(x[r : r + 1], w, EPS)
+                self.assertTrue(torch.equal(fq1.x[0], fq.x[r]), (k, r))
+                self.assertTrue(torch.equal(y1[0], y[r]), (k, r))
+            fq_half, y_half = rmsnorm_fake_quant_fp8(x[:9], w, EPS)
+            self.assertTrue(torch.equal(fq_half.x, fq.x[:9]))
+            self.assertTrue(torch.equal(y_half, y[:9]))
+
+    def test_strided_rows_and_norm_optional(self):
+        # `q_lora` is a column slice of the fused `wqkv_a` output.
+        torch.manual_seed(3)
+        wide = torch.randn(6, 1536 + 512, device="cuda", dtype=torch.bfloat16)
+        w = torch.rand(1536, device="cuda", dtype=torch.bfloat16)
+        x = wide[:, :1536]
+        self.assertFalse(x.is_contiguous())
+        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+        fq_c, y_c = rmsnorm_fake_quant_fp8(x.contiguous(), w, EPS)
+        self.assertTrue(torch.equal(fq.x, fq_c.x) and torch.equal(y, y_c))
+        fq_only, none = rmsnorm_fake_quant_fp8(x, w, EPS, return_norm=False)
+        self.assertIsNone(none)
+        self.assertTrue(torch.equal(fq_only.x, fq.x))
+
+    def test_emit_fp8_is_the_same_quantization(self):
+        # the native-route fp8 codes + scales dequantize exactly to the same launch's fp8-grid bf16 activation
+        torch.manual_seed(5)
+        for m, k in [(1, 5120), (8, 1536), (33, 5120), (3, 64)]:
+            x, w = self._make(m, k)
+            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+            q8, y8 = rmsnorm_fake_quant_fp8(x, w, EPS, emit_fp8=True)
+            self.assertIsInstance(q8, Mxfp8Activation)
+            self.assertEqual(q8.q.dtype, torch.float8_e4m3fn)
+            self.assertEqual(tuple(q8.scale.shape), (m, k // 32))
+            self.assertTrue(torch.equal(y8, y), (m, k))
+            self.assertTrue(
+                torch.equal(dequant_mxfp8_to_bf16(q8.q, q8.scale), fq.x), (m, k)
+            )
+            residual = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            r1, r2 = residual.clone(), residual.clone()
+            fq_r, _ = rmsnorm_fake_quant_fp8(x, w, EPS, residual=r1)
+            q8_r, _ = rmsnorm_fake_quant_fp8(x, w, EPS, residual=r2, emit_fp8=True)
+            self.assertTrue(torch.equal(r1, r2))
+            self.assertTrue(
+                torch.equal(dequant_mxfp8_to_bf16(q8_r.q, q8_r.scale), fq_r.x)
+            )
+
+    def test_empty_rows(self):
+        x = torch.empty(0, 5120, device="cuda", dtype=torch.bfloat16)
+        w = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
+        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+        self.assertEqual(fq.x.shape, (0, 5120))
+        self.assertEqual(y.shape, (0, 5120))
+
+    def test_bf16_dequant_linear_skips_requant(self):
+        # the dense route must see the same GEMM operands from the fused output as from the unfused route
+        torch.manual_seed(4)
+        x, w = self._make(8, 5120)
+        weight = (
+            (torch.randn(256, 5120, device="cuda") * 0.02)
+            .to(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+        fused_route = bf16_dequant_blockscaled_linear(
+            fq.x, weight, input_on_fp8_grid=True
+        )
+        unfused_route = bf16_dequant_blockscaled_linear(y, weight)
+        # same operands into the same GEMM; the tolerance only guards a different BLAS algorithm between calls
+        torch.testing.assert_close(fused_route, unfused_route, atol=0, rtol=1e-2)
+
+
+def _reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+    g, u = gate_up.float().chunk(2, dim=-1)
+    g = g.clamp(max=limit)
+    u = u.clamp(min=-limit, max=limit)
+    return (torch.nn.functional.silu(g) * u).to(gate_up.dtype)
+
+
+class TestSiluAndMulClampTriton(CustomTestCase):
+    def test_matches_torch_form(self):
+        torch.manual_seed(0)
+        for m, half, dtype in [
+            (1, 576, torch.bfloat16),
+            (7, 576, torch.bfloat16),
+            (33, 1152, torch.bfloat16),
+            (4096, 576, torch.bfloat16),
+            (5, 100, torch.float16),
+            (3, 2048, torch.float32),
+        ]:
+            x = torch.randn(m, 2 * half, device="cuda", dtype=dtype) * 6
+            ref = _reference(x, 10.0)
+            out = silu_and_mul_clamp_triton(x, 10.0)
+            self.assertEqual(out.shape, ref.shape)
+            self.assertEqual(out.dtype, dtype)
+            # the clamps engage: some gate values exceed the limit, some up values sit at +-limit
+            self.assertTrue((x[:, :half] > 10.0).any())
+            tol = 1e-5 if dtype == torch.float32 else 2e-2
+            torch.testing.assert_close(out.float(), ref.float(), atol=tol, rtol=tol)
+
+    def test_fp8_grid_epilogue_matches_separate_fake_quant(self):
+        torch.manual_seed(1)
+        for m, half in [(1, 576), (9, 576), (300, 1024), (4, 32)]:
+            x = torch.randn(m, 2 * half, device="cuda", dtype=torch.bfloat16) * 6
+            plain = silu_and_mul_clamp_triton(x, 10.0)
+            fused = silu_and_mul_clamp_triton(x, 10.0, fp8_grid=True)
+            self.assertIsInstance(fused, Fp8GridActivation)
+            ref = fake_quant_fp8_activation(plain)
+            self.assertTrue(torch.equal(fused.x, ref), (m, half))
+            # Idempotent: quantizing the fused output again changes nothing.
+            self.assertTrue(torch.equal(fake_quant_fp8_activation(fused.x), fused.x))
+
+    def test_emit_fp8_is_the_same_quantization(self):
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            Mxfp8Activation,
+            dequant_mxfp8_to_bf16,
+        )
+
+        torch.manual_seed(6)
+        for m, inter in [(1, 512), (8, 1024), (40, 256)]:
+            gate_up = torch.randn(m, 2 * inter, device="cuda", dtype=torch.bfloat16) * 4
+            grid = silu_and_mul_clamp_triton(gate_up, 7.0, fp8_grid=True)
+            q8 = silu_and_mul_clamp_triton(gate_up, 7.0, emit_fp8=True)
+            self.assertIsInstance(q8, Mxfp8Activation)
+            self.assertEqual(q8.q.dtype, torch.float8_e4m3fn)
+            self.assertTrue(
+                torch.equal(dequant_mxfp8_to_bf16(q8.q, q8.scale), grid.x), (m, inter)
+            )
+
+    def test_empty_rows(self):
+        x = torch.empty(0, 1152, device="cuda", dtype=torch.bfloat16)
+        self.assertEqual(silu_and_mul_clamp_triton(x, 10.0).shape, (0, 576))
+
+
+GEMM_SHAPES = [(2, 1024, 4096), (8, 1024, 512)]
+
+
+G, R, D = GEMM_SHAPES[0]
+
+
+def _aiter_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """aiter batched_gemm_bf16 on the [G, T, D] copy, transposed back and flattened to [T, G * R]."""
+    from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+
+    xq = x.transpose(0, 1).contiguous()
+    y = batched_gemm_bf16(xq, w, dtype=torch.bfloat16)
+    return y.transpose(0, 1).contiguous().flatten(1)
+
+
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "gfx950 bf16-dequant dense route only"
+)
+class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
+    def setUp(self):
+        from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+            batched_gemm_bf16_fp8_grid,
+        )
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            fake_quant_fp8_activation,
+        )
+
+        self.gemm = batched_gemm_bf16_fp8_grid
+        self.fake_quant = fake_quant_fp8_activation
+
+    def test_bitwise_against_aiter_and_separate_fake_quant(self):
+        cases = [
+            (1, 1.0),
+            (1, 40.0),
+            (2, 0.05),
+            (7, 1.0),
+            (16, 3.0),
+            (33, 1.0),
+            (64, 0.5),
+        ]
+        for g, r, d in GEMM_SHAPES:
+            for seed, (t, scale) in enumerate(cases):
+                torch.manual_seed(seed)
+                w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
+                x = (torch.randn(t, g, d, device="cuda") * scale).bfloat16()
+                ref = _aiter_reference(x, w)
+                plain = self.gemm(x, w, fp8_grid=False)
+                self.assertEqual(plain.shape, (t, g * r))
+                self.assertTrue(torch.equal(plain, ref), (g, r, d, t, scale))
+                grid = self.gemm(x, w)
+                self.assertTrue(
+                    torch.equal(grid, self.fake_quant(ref)), (g, r, d, t, scale)
+                )
+                # Idempotent: the output is already on the grid.
+                self.assertTrue(torch.equal(self.fake_quant(grid), grid))
+
+    def test_strided_input_view(self):
+        # the model hands over a [T, G, D] view of a [T, H, head_dim] tensor; the kernel reads it through strides
+        torch.manual_seed(11)
+        w = (torch.randn(G, R, D, device="cuda") * 0.02).bfloat16()
+        # 16 heads x 512 -> 2 groups x 4096 (TP4).
+        base = torch.randn(5, 16, 512, device="cuda").bfloat16()
+        x = base.view(5, G, -1)
+        self.assertEqual(x.shape, (5, G, D))
+        self.assertTrue(
+            torch.equal(self.gemm(x, w), self.fake_quant(_aiter_reference(x, w)))
+        )
+        wide = torch.randn(3, G, 2 * D, device="cuda").bfloat16()[:, :, :D]
+        self.assertFalse(wide.is_contiguous())
+        self.assertTrue(
+            torch.equal(
+                self.gemm(wide, w),
+                self.fake_quant(_aiter_reference(wide.contiguous(), w)),
+            )
+        )
+
+    def test_repeatable_and_empty(self):
+        torch.manual_seed(2)
+        w = (torch.randn(G, R, D, device="cuda") * 0.02).bfloat16()
+        x = torch.randn(3, G, D, device="cuda").bfloat16()
+        first = self.gemm(x, w)
+        for _ in range(5):
+            self.assertTrue(torch.equal(self.gemm(x, w), first))
+        self.assertEqual(self.gemm(x[:0], w).shape, (0, G * R))
+
+
+if __name__ == "__main__":
+    unittest.main()
