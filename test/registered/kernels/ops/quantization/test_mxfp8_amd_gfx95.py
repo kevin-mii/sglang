@@ -280,6 +280,8 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
         x = torch.randn(300, k, device="cuda", dtype=torch.bfloat16)
         xq, xs = mxfp8_e4m3_quantize(x)
         tile = large_m_plan(300, n, k)
+        if tile is None:
+            self.skipTest(f"M=300 of {n}x{k} is tuned to hipBLASLt bf16, not a tile")
         out = mxfp8_shuffled_gemm(xq, xs, w_sh, ws8, tile[:4], tile[4])
         ref = fake_quant_fp8_activation(x).float() @ w_bf16.float().t()
         rel = ((out.float() - ref).abs().max() / ref.abs().max()).item()
