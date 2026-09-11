@@ -97,7 +97,9 @@ def deepseek_v4_topk_transform_512(
 
     Args:
         scores: float32 ``[B, max_seq_len]`` indexer logits, contiguous on dim 1.
-        seq_lens: int32 ``[B]``, true KV length per batch row.
+        seq_lens: int32 ``[B]``, true KV length per batch row; each at most
+            ``max_seq_len`` and at most ``num_pages * page_size`` (a row reads
+            its scores and page table up to its length).
         page_table: int32 ``[B, num_pages]``, logical->physical page table,
             contiguous on dim 1.
         page_indices: int32 ``[B, topk]``, output buffer, contiguous. Filled

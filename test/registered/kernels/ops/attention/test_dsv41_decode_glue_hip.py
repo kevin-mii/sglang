@@ -57,6 +57,10 @@ def _seed(seed: int) -> random.Random:
 
 
 def _topk_inputs(rng, bs, width, topk, page_size, lens):
+    # a row is at most as long as its logits: the kernel reads scores[0, len) and
+    # page_table[0, len // page_size], so a longer row reads memory past the tensor
+    # end, and what it selects there (a stale word as the page) differs by launch
+    assert max(lens, default=0) <= width, (lens, width)
     # distinct scores per row: the radix top-k breaks a tie at the threshold in
     # atomic-counter order, so two launches over tied scores can select different
     # sets, and this compares two launches
@@ -82,10 +86,14 @@ def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: b
     for width in (1024, 4096, 70000):
         for bs in (1, 5, 33):
             page_size = rng.choice([16, 64])
-            lens = [
-                rng.choice([0, 1, topk - 1, topk, topk + 1, width // 2, width])
-                for _ in range(bs)
+            # the topk + 1 edge (a radix row of exactly topk picks) only where the
+            # logits are that wide; at width == topk it would run past the row
+            edges = [
+                n
+                for n in (0, 1, topk - 1, topk, topk + 1, width // 2, width)
+                if n <= width
             ]
+            lens = [rng.choice(edges) for _ in range(bs)]
             scores, seq_lens, page_table = _topk_inputs(
                 rng, bs, width, topk, page_size, lens
             )
