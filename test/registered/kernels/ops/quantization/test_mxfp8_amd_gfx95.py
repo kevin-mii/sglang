@@ -164,15 +164,6 @@ ROUTE_SHAPES = [(1856, 5120), (8192, 1280), (1152, 5120), (5120, 2048)]
 MS = (1, 2, 5, 16, 17, 32, 33, 64, 200, 1024, 1025, 2100)
 
 
-def _quant_weight_block32_route(w):
-    n, k = w.shape
-    blocks = w.float().view(n // 32, 32, k // 32, 32)
-    amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-30)
-    e = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
-    q = (blocks / torch.exp2(e)).clamp(-448, 448).to(torch.float8_e4m3fn).view(n, k)
-    return q, torch.exp2(e).view(n // 32, k // 32)
-
-
 def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a.view(torch.int16).int() - b.view(torch.int16).int()).abs()
 
@@ -182,7 +173,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
     def _weights(self, n, k, seed=0):
         torch.manual_seed(seed)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        wq, ws = _quant_weight_block32_route(w)
+        wq, ws = _quant_weight_block32(w)
         w_sh, ws8, w_bf16_small = prepare_mxfp8_native_weight(wq, ws, [32, 32])
         w_bf16 = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
         return wq, ws, w_sh, ws8, w_bf16_small, w_bf16

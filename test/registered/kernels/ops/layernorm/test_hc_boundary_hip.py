@@ -310,12 +310,6 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
         self.assertEqual(coefficients.comb.shape, (0, HC, HC))
 
 
-HC, H = 4, 5120
-
-
-ITERS, RMS_EPS, HC_EPS = 20, 1e-20, 1e-6
-
-
 def _prefill_available():
     if not is_hip() or not torch.cuda.is_available():
         return False

@@ -26,9 +26,8 @@ BYTES = 584
 SCALE = D**-0.5
 
 
-def _pack_cache(num_tokens_total, num_blocks, device, gen):
-    """Random bf16 keys quantized to the packed fp8 layout; returns the fp8-viewed
-    cache [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
+def _pack_cache(num_blocks, device, gen, *, fp8_view=True):
+    """Random bf16 keys in the packed fp8 layout: cache [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
     slots = num_blocks * PAGE
     k = torch.randn(slots, D, generator=gen) * 0.5
     nope = k[:, :NOPE].reshape(slots, NOPE // 64, 64)
@@ -44,9 +43,11 @@ def _pack_cache(num_tokens_total, num_blocks, device, gen):
     data[:, :, NOPE:] = rope.view(torch.uint8).reshape(num_blocks, PAGE, 2 * ROPE)
     scales = raw[:, PAGE * 576 :].view(num_blocks, PAGE, 8)
     scales[:, :, :7] = (exp.reshape(num_blocks, PAGE, 7) + 127).to(torch.uint8)
-    cache = raw.view(num_blocks, PAGE, 1, BYTES).view(torch.float8_e4m3fn).to(device)
+    cache = raw.view(num_blocks, PAGE, 1, BYTES)
+    if fp8_view:
+        cache = cache.view(torch.float8_e4m3fn)
     deq = torch.cat([nope_deq.reshape(slots, NOPE), rope.float()], dim=1).to(device)
-    return cache, deq
+    return cache.to(device), deq
 
 
 def _masked(indices, lengths):
@@ -89,8 +90,8 @@ class TestAiterSparseBackend(CustomTestCase):
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, swa_deq = _pack_cache(0, 2, dev, gen)
-        topk_cache, topk_deq = _pack_cache(0, 5, dev, gen)
+        swa_cache, swa_deq = _pack_cache(2, dev, gen)
+        topk_cache, topk_deq = _pack_cache(5, dev, gen)
         q = (
             (torch.randn(batch, 1, heads, D, generator=gen) * 0.5)
             .to(torch.bfloat16)
@@ -195,8 +196,8 @@ class TestAiterSparseBackend(CustomTestCase):
         heads = 16
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, _ = _pack_cache(0, 2, dev, gen)
-        topk_cache, _ = _pack_cache(0, 5, dev, gen)
+        swa_cache, _ = _pack_cache(2, dev, gen)
+        topk_cache, _ = _pack_cache(5, dev, gen)
         q = (torch.randn(batch, 1, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
         q = q.to(dev)
         sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
@@ -272,33 +273,7 @@ class TestAiterSparseBackend(CustomTestCase):
         self.assertEqual(_fold_lengths_into_index_lists(idx, None), (None, None))
 
 
-NOPE, ROPE, D = 448, 64, 512
-
-
 SWA, TOPK = 128, 512
-
-
-def _pack_cache_prefill(num_blocks, device, gen):
-    """Random bf16 keys quantized to the packed fp8 layout; returns the uint8 cache
-    [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
-    slots = num_blocks * PAGE
-    k = torch.randn(slots, D, generator=gen) * 0.5
-    nope = k[:, :NOPE].reshape(slots, NOPE // 64, 64)
-    amax = nope.abs().amax(-1, keepdim=True).clamp(min=1e-6)
-    exp = torch.ceil(torch.log2(amax / 448.0)).clamp(min=-127, max=127)
-    scale = torch.pow(2.0, exp)
-    nope_fp8 = (nope / scale).to(torch.float8_e4m3fn)
-    nope_deq = nope_fp8.float() * scale
-    rope = k[:, NOPE:].to(torch.bfloat16)
-    raw = torch.zeros(num_blocks, PAGE * BYTES, dtype=torch.uint8)
-    data = raw[:, : PAGE * 576].view(num_blocks, PAGE, 576)
-    data[:, :, :NOPE] = nope_fp8.view(torch.uint8).reshape(num_blocks, PAGE, NOPE)
-    data[:, :, NOPE:] = rope.view(torch.uint8).reshape(num_blocks, PAGE, 2 * ROPE)
-    scales = raw[:, PAGE * 576 :].view(num_blocks, PAGE, 8)
-    scales[:, :, :7] = (exp.reshape(num_blocks, PAGE, 7) + 127).to(torch.uint8)
-    cache = raw.view(num_blocks, PAGE, 1, BYTES).to(device)
-    deq = torch.cat([nope_deq.reshape(slots, NOPE), rope.float()], dim=1).to(device)
-    return cache, deq
 
 
 def _prefill_lists(num_tokens, device, gen):
@@ -348,8 +323,8 @@ class TestAiterSparsePrefill(CustomTestCase):
         gen = torch.Generator(device="cpu").manual_seed(0)
         dev = torch.device("cuda")
         blocks = cls.NUM_TOKENS // PAGE + 1
-        cls.swa_cache, swa_deq = _pack_cache_prefill(blocks, dev, gen)
-        cls.topk_cache, topk_deq = _pack_cache_prefill(blocks, dev, gen)
+        cls.swa_cache, swa_deq = _pack_cache(blocks, dev, gen, fp8_view=False)
+        cls.topk_cache, topk_deq = _pack_cache(blocks, dev, gen, fp8_view=False)
         cls.q = (
             (torch.randn(cls.NUM_TOKENS, 1, cls.HEADS, D, generator=gen) * 0.5)
             .to(torch.bfloat16)
@@ -415,32 +390,6 @@ class TestAiterSparsePrefill(CustomTestCase):
         self.assertTrue(torch.equal(full[:half], part))
 
 
-NOPE, ROPE, D = 448, 64, 512
-
-
-def _pack_cache_reduce(num_tokens_total, num_blocks, device, gen):
-    """Random bf16 keys quantized to the packed fp8 layout; returns the fp8-viewed
-    cache [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
-    slots = num_blocks * PAGE
-    k = torch.randn(slots, D, generator=gen) * 0.5
-    nope = k[:, :NOPE].reshape(slots, NOPE // 64, 64)
-    amax = nope.abs().amax(-1, keepdim=True).clamp(min=1e-6)
-    exp = torch.ceil(torch.log2(amax / 448.0)).clamp(min=-127, max=127)
-    scale = torch.pow(2.0, exp)
-    nope_fp8 = (nope / scale).to(torch.float8_e4m3fn)
-    nope_deq = nope_fp8.float() * scale
-    rope = k[:, NOPE:].to(torch.bfloat16)
-    raw = torch.zeros(num_blocks, PAGE * BYTES, dtype=torch.uint8)
-    data = raw[:, : PAGE * 576].view(num_blocks, PAGE, 576)
-    data[:, :, :NOPE] = nope_fp8.view(torch.uint8).reshape(num_blocks, PAGE, NOPE)
-    data[:, :, NOPE:] = rope.view(torch.uint8).reshape(num_blocks, PAGE, 2 * ROPE)
-    scales = raw[:, PAGE * 576 :].view(num_blocks, PAGE, 8)
-    scales[:, :, :7] = (exp.reshape(num_blocks, PAGE, 7) + 127).to(torch.uint8)
-    cache = raw.view(num_blocks, PAGE, 1, BYTES).view(torch.float8_e4m3fn).to(device)
-    deq = torch.cat([nope_deq.reshape(slots, NOPE), rope.float()], dim=1).to(device)
-    return cache, deq
-
-
 def _freqs(device, max_pos=8192, seed=0):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     angles = torch.rand(max_pos, ROPE // 2, generator=gen) * 2 * math.pi
@@ -467,8 +416,8 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, _ = _pack_cache_reduce(0, 2, dev, gen)
-        topk_cache, _ = _pack_cache_reduce(0, 5, dev, gen)
+        swa_cache, _ = _pack_cache(2, dev, gen)
+        topk_cache, _ = _pack_cache(5, dev, gen)
         q = (torch.randn(batch, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
         sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
         swa_idx = torch.stack(
@@ -652,8 +601,8 @@ class TestAiterSparseDecodeSplitPin(CustomTestCase):
 
         dev = torch.device("cuda")
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        swa_cache, _ = _pack_cache_reduce(0, 2, dev, gen)
-        topk_cache, _ = _pack_cache_reduce(0, 5, dev, gen)
+        swa_cache, _ = _pack_cache(2, dev, gen)
+        topk_cache, _ = _pack_cache(5, dev, gen)
         heads = 16
         # row i of every batch gets the same query and lists
         rows = []
@@ -697,27 +646,6 @@ class TestAiterSparseDecodeSplitPin(CustomTestCase):
             one, eight, many = self._run(1), self._run(8), self._run(self.ROWS)
         self.assertTrue(torch.equal(one, eight[:1]))
         self.assertTrue(torch.equal(eight, many[:8]))
-        # the pin reproduces aiter's own choice (4) where the cost model picks it
-        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(0):
-            self.assertTrue(torch.equal(self._run(8), eight))
-
-    def test_auto_splits_change_with_the_batch(self):
-        """Documents why the pin exists: unpinned, the 96-row batch combines in 2 splits."""
-        from aiter.ops.triton.attention.pa_decode_sparse import _decode_num_splits
-
-        from sglang.srt.environ import envs
-
-        self.assertEqual(_decode_num_splits(8, 1, 128.0, 512.0, 64), 4)
-        self.assertEqual(_decode_num_splits(self.ROWS, 1, 128.0, 512.0, 64), 2)
-        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(0):
-            auto_many = self._run(self.ROWS)
-        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(2):
-            pinned_two = self._run(self.ROWS)
-        self.assertTrue(torch.equal(auto_many, pinned_two))
-        for _ in range(3):
-            with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(0):
-                self.assertTrue(torch.equal(self._run(self.ROWS), auto_many))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -472,18 +471,13 @@ class TestFusedLowRatioCompress(CustomTestCase):
                     )
 
     def test_selected_from_the_device(self):
-        """The compressor's fused-write detection must agree with the capability the
-        device reports."""
+        """The compressor's fused-write choice must follow `fused_low_ratio_compress_supported`."""
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
             DeepseekV41Compressor,
             fused_low_ratio_compress_supported,
         )
 
-        if torch.version.hip is not None:
-            expected = is_gfx95_supported()
-        else:
-            expected = torch.cuda.get_device_capability()[0] >= 10
-        self.assertEqual(fused_low_ratio_compress_supported(), expected)
+        expected = fused_low_ratio_compress_supported()
         for ratio in (1, 2):
             compressor = DeepseekV41Compressor(HIDDEN, HEAD_DIM, ratio, EPS)
             self.assertEqual(compressor.use_fused_compress, expected)

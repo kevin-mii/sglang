@@ -371,29 +371,6 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
-if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2()
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-        test_group_desc_propagated_via_real_new_group("tp")
-        test_group_desc_propagated_via_real_new_group("pp")
-        test_group_desc_none_normalized_to_anonymous()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
-
-
 def _broadcast_coordinator(*, pynccl_comm):
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
@@ -439,3 +416,27 @@ def test_hip_broadcast_eager_keeps_torch_distributed():
     dist_broadcast.assert_called_once_with(
         values, src=5, group=coordinator.device_group
     )
+
+
+
+if __name__ == "__main__":
+    # Run tests without requiring GPUs
+    import sys
+
+    try:
+        test_parallel_group_construction_tp8_attn_cp2()
+        test_parallel_group_construction_tp8_moe_ep4_cp2()
+        test_group_desc_propagated_via_real_new_group("tp")
+        test_group_desc_propagated_via_real_new_group("pp")
+        test_group_desc_none_normalized_to_anonymous()
+
+        sys.exit(0)
+    except AssertionError as e:
+        print(f"\n Test failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n Unexpected error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

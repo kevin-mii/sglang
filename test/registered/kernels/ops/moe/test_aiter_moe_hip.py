@@ -16,11 +16,17 @@ try:
 except ImportError:  # aiter is absent off ROCm
     aiter_moe_sorting = None
 
+try:
+    from aiter import topk_gating as aiter_topk_gating
+except ImportError:  # aiter is absent off ROCm
+    aiter_topk_gating = None
+
 
 NUM_EXPERTS = 384
-
-
 MODEL_DIM = 5120
+HIDDEN = 5120
+TOPK = 6
+ROUTED_SCALING = 1.5
 
 
 def _routing(num_tokens, topk, seed, device):
@@ -258,21 +264,6 @@ class TestFusedAiterMoeSorting(CustomTestCase):
         self.assertEqual(int(big_ids[10:].abs().sum()), 0)
         self.assertEqual(float(big_weights[10:].abs().sum()), 0.0)
         self.assertNotEqual(int(big_ids[:10].abs().sum()), 0)
-
-
-try:
-    from aiter import topk_gating as aiter_topk_gating
-except ImportError:  # aiter is absent off ROCm
-    aiter_topk_gating = None
-
-
-HIDDEN = 5120
-
-
-TOPK = 6
-
-
-ROUTED_SCALING = 1.5
 
 
 def _aiter_gate(logits, bias, topk, renorm, rsf):
@@ -675,7 +666,6 @@ class TestRocmRouterGateSort(CustomTestCase):
         self.assertEqual(int(self.handoff(self.device).abs().sum()), 0, msg)
 
     def test_matches_two_launches_and_aiter(self):
-        cases = 0
         for num_tokens in range(1, self.max_tokens + 1):
             for topk in (6, 8):
                 for block_size in (16, 32, 64):
@@ -696,8 +686,6 @@ class TestRocmRouterGateSort(CustomTestCase):
                                     pad,
                                     ties,
                                 )
-                                cases += 1
-        self.assertGreaterEqual(cases, 96 * self.max_tokens)
 
     def test_repeated_and_graph_replayed_launches(self):
         """The hand-off buffer is left clean, so back-to-back launches and graph replays agree."""

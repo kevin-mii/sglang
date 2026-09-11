@@ -266,9 +266,15 @@ class TestPrefillRunnerUsesCapturedMetadataContract(CustomTestCase):
         return runner
 
     def test_capture_stashes_and_replay_refreshes_per_bucket(self):
-        attn_backend = mock.Mock()
+        calls = []
         stashed = object()
-        attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture.return_value = stashed
+        attn_backend = SimpleNamespace(
+            init_forward_metadata_for_breakable_cuda_graph_capture=lambda batch: stashed,
+            init_forward_metadata=lambda batch: calls.append(("init", batch)),
+            prepare_forward_metadata_for_breakable_cuda_graph_replay=lambda *a, **k: calls.append(
+                ("replay", a, k)
+            ),
+        )
         runner = self._runner(attn_backend)
         capture_batch = SimpleNamespace(name="capture")
         live_batch = SimpleNamespace(name="live")
@@ -278,9 +284,8 @@ class TestPrefillRunnerUsesCapturedMetadataContract(CustomTestCase):
         runner._prepare_forward_metadata_for_replay(live_batch, static_batch, 96)
 
         self.assertIs(runner.attn_metadata_buffers[96], stashed)
-        attn_backend.init_forward_metadata.assert_not_called()
-        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay.assert_called_once_with(
-            stashed, live_batch, static_forward_batch=static_batch
+        self.assertEqual(
+            calls, [("replay", (stashed, live_batch), {"static_forward_batch": static_batch})]
         )
 
 

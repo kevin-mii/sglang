@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import sys
 
 import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
@@ -272,16 +273,19 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
 def test_sparse_buffers(topk: int, ratios):
     rng = _seed(9)
     for rows in (1, 5, 70):
-        lens = lambda: torch.tensor(  # noqa: E731
-            [
-                rng.choice([1, 2, topk - 1, topk, topk + 1, 1 << 16])
-                for _ in range(rows)
-            ],
-            dtype=torch.int32,
-            device=DEVICE,
-        )
-        c4_clamp1, c4_raw = lens(), lens()
-        low = {r: lens() for r in ratios}
+
+        def random_lengths():
+            return torch.tensor(
+                [
+                    rng.choice([1, 2, topk - 1, topk, topk + 1, 1 << 16])
+                    for _ in range(rows)
+                ],
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+
+        c4_clamp1, c4_raw = random_lengths(), random_lengths()
+        low = {r: random_lengths() for r in ratios}
         out = sparse_buffers(
             c4_topk_lengths_clamp1=c4_clamp1,
             c4_topk_lengths_raw=c4_raw,
@@ -494,3 +498,7 @@ def test_widen_pair_i64_matches_casts():
         torch.tensor([9, 0], device=DEVICE, dtype=torch.int32),
     )
     assert oa.tolist() == [3, -1] and ob.tolist() == [9, 0]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -887,10 +887,6 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
             )
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.parametrize("seq_len", [640, 1024])
 def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
@@ -925,3 +921,8 @@ def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     pos = raw_a.clamp_min(0)
     slots = page_table.gather(1, pos // PAGE_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
     assert torch.equal(page_a, torch.where(valid, slots, -1))
+
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
