@@ -133,7 +133,7 @@ def _batched_gemm_bf16_fp8_grid_kernel(
 
 
 @triton.jit
-def _batched_gemm_bf16_splitk_partial_kernel(
+def _batched_gemm_bf16_split_k_partial_kernel(
     a_ptr,
     b_ptr,
     part_ptr,
@@ -196,7 +196,7 @@ def _batched_gemm_bf16_splitk_partial_kernel(
 
 
 @triton.jit
-def _batched_gemm_splitk_reduce_kernel(
+def _batched_gemm_split_k_reduce_kernel(
     part_ptr,
     c_ptr,
     M,
@@ -254,7 +254,7 @@ def _batched_gemm_split_k(
     partials = torch.empty(
         (G, _SPLIT_K, tiles_m * _BLOCK_M, R), dtype=torch.float32, device=x.device
     )
-    _batched_gemm_bf16_splitk_partial_kernel[(G, tiles_m * tiles_n, _SPLIT_K)](
+    _batched_gemm_bf16_split_k_partial_kernel[(G, tiles_m * tiles_n, _SPLIT_K)](
         x,
         w,
         partials,
@@ -277,7 +277,7 @@ def _batched_gemm_split_k(
         waves_per_eu=_WAVES_PER_EU,
         matrix_instr_nonkdim=_MFMA_NONKDIM,
     )
-    _batched_gemm_splitk_reduce_kernel[(G, tiles_m * tiles_n)](
+    _batched_gemm_split_k_reduce_kernel[(G, tiles_m * tiles_n)](
         partials,
         out,
         T,

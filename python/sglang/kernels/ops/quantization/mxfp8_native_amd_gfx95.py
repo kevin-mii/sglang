@@ -126,7 +126,7 @@ def select_config(m: int, n: int, k: int) -> GemvConfig:
 
 
 @cache_once
-def _jit_module(cfg: GemvConfig, x_bf16: bool):
+def _jit_mxfp8_gemv_module(cfg: GemvConfig, x_bf16: bool):
     args = make_cpp_args(cfg.waves, cfg.steps, cfg.rows, cfg.tokens, cfg.ksplit, x_bf16)
     return load_jit(
         "dpsk_v4_mxfp8_gemv_gfx95",
@@ -194,7 +194,7 @@ def mxfp8_gemv(
         out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     cfg = config or select_config(m, n, k)
     assert cfg.valid_for(m, n, k), (cfg, m, n, k)
-    _jit_module(cfg, x_bf16).run(weight_shuffled, weight_scale_ue8m0, x, x_scale, out)
+    _jit_mxfp8_gemv_module(cfg, x_bf16).run(weight_shuffled, weight_scale_ue8m0, x, x_scale, out)
     return out
 
 
@@ -212,7 +212,7 @@ def large_m_bucket(m: int) -> int:
 
 @functools.lru_cache(maxsize=2)
 def _large_m_table(fp8_in: bool) -> Dict[str, str]:
-    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,splitk'}`` from the table's
+    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}`` from the table's
     ``large_m`` / ``large_m_fp8in`` section."""
     try:
         with open(CONFIG_FILE) as f:
@@ -226,7 +226,7 @@ def _large_m_table(fp8_in: bool) -> Dict[str, str]:
 def large_m_plan(
     m: int, n: int, k: int, fp8_in: bool = False
 ) -> Optional[Tuple[int, int, int, int, int]]:
-    """The dot_scaled tile (BM, BN, BK, warps, splitk) for ``m`` rows, or None when hipBLASLt
+    """The dot_scaled tile (BM, BN, BK, warps, split_k) for ``m`` rows, or None when hipBLASLt
     bf16 is the measured winner or the shape has no row (the caller then needs a bf16 copy).
     ``fp8_in``: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
     entry = _large_m_table(fp8_in).get(f"{gfx_name()}:{n}:{k}:{large_m_bucket(m)}")
@@ -273,11 +273,11 @@ def prepare_mxfp8_native_weight(
     assert tuple(block_size) == (32, 32), block_size
     assert native_route_supports(n, k), (n, k)
     shuffled = shuffle_mxfp8_weight(weight.contiguous())
-    scale_e8m0 = ue8m0_weight_scale(weight_scale)
+    scale_ue8m0 = ue8m0_weight_scale(weight_scale)
     weight_bf16 = None
     if weight_needs_bf16_copy(n, k):
         weight_bf16 = dequant_block_fp8_weight_to_bf16(weight, weight_scale, block_size)
-    return shuffled, scale_e8m0, weight_bf16
+    return shuffled, scale_ue8m0, weight_bf16
 
 
 # Triton tl.dot_scaled GEMM over the shuffled weight
@@ -361,46 +361,46 @@ def mxfp8_shuffled_gemm(
     xq: torch.Tensor,
     xs: torch.Tensor,
     weight_shuffled: torch.Tensor,
-    weight_scale_e8m0: torch.Tensor,
+    weight_scale_ue8m0: torch.Tensor,
     tile: Tuple[int, int, int, int],
-    splitk: int,
+    split_k: int,
 ) -> torch.Tensor:
     """``[M, N] bf16 = xq[M, K] fp8 . W^T`` over the shuffled fp8 weight with the table's
-    ``tile`` (BM, BN, BK, warps). With ``splitk > 1`` the K partitions' fp32 partials are
+    ``tile`` (BM, BN, BK, warps). With ``split_k > 1`` the K partitions' fp32 partials are
     summed in partition order (deterministic)."""
     m, k = xq.shape
     n = weight_shuffled.shape[0] * 16
     bm, bn, bk, warps = tile
     if k % bk != 0:
         bk = 128
-    assert (k // bk) % splitk == 0, (k, bk, splitk)
-    grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), splitk)
-    if splitk == 1:
+    assert (k // bk) % split_k == 0, (k, bk, split_k)
+    grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), split_k)
+    if split_k == 1:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=xq.device)
     else:
-        out = torch.empty(splitk, m, n, dtype=torch.float32, device=xq.device)
+        out = torch.empty(split_k, m, n, dtype=torch.float32, device=xq.device)
     _mxfp8_shuffled_gemm_kernel[grid](
         xq.view(torch.uint8),
         xs,
         weight_shuffled,
-        weight_scale_e8m0,
+        weight_scale_ue8m0,
         out,
         m,
         n,
         k,
         xq.stride(0),
         xs.stride(0),
-        weight_scale_e8m0.stride(0),
+        weight_scale_ue8m0.stride(0),
         n,
-        k // splitk,
+        k // split_k,
         BLOCK_M=bm,
         BLOCK_N=bn,
         BLOCK_K=bk,
-        OUT_F32=splitk > 1,
+        OUT_F32=split_k > 1,
         num_warps=warps,
         num_stages=2,
     )
-    if splitk > 1:
+    if split_k > 1:
         out = out.sum(0).to(torch.bfloat16)  # fixed partition order
     return out
 
@@ -419,7 +419,7 @@ def native_route_plan(
 def mxfp8_native_blockscaled_linear(
     input: torch.Tensor,
     weight_shuffled: torch.Tensor,
-    weight_scale_e8m0: torch.Tensor,
+    weight_scale_ue8m0: torch.Tensor,
     weight_bf16: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
@@ -445,9 +445,9 @@ def mxfp8_native_blockscaled_linear(
             input_2d = input_2d.to(torch.bfloat16).contiguous()
         if plan == "gemv":
             if xq is not None:
-                out = mxfp8_gemv(xq, weight_shuffled, weight_scale_e8m0, xs)
+                out = mxfp8_gemv(xq, weight_shuffled, weight_scale_ue8m0, xs)
             else:
-                out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_e8m0)
+                out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_ue8m0)
         elif plan == HIPBLASLT_BF16:
             if xq is not None:
                 x = (
@@ -466,7 +466,7 @@ def mxfp8_native_blockscaled_linear(
             tile = large_m_plan(m, n, k, fp8_in)
             assert tile is not None, (m, n, k, fp8_in)
             out = mxfp8_shuffled_gemm(
-                xq, xs, weight_shuffled, weight_scale_e8m0, tile[:4], tile[4]
+                xq, xs, weight_shuffled, weight_scale_ue8m0, tile[:4], tile[4]
             )
     if bias is not None:
         out = out + bias

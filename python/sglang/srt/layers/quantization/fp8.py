@@ -882,7 +882,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.mxfp8_native_ready = False
             if native_route_supports(n, k):
                 # the same bytes in scaled-MFMA lane order; a bf16 copy stays only where hipBLASLt serves M > 32
-                shuffled, scale_e8m0, weight_bf16 = prepare_mxfp8_native_weight(
+                shuffled, scale_ue8m0, weight_bf16 = prepare_mxfp8_native_weight(
                     layer.weight.data,
                     layer.weight_scale_inv.data,
                     self.weight_block_size,
@@ -890,7 +890,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 copy_or_rebind_param(
                     layer, "weight", shuffled.view(torch.float8_e4m3fn)
                 )
-                copy_or_rebind_param(layer, "weight_scale_mx_e8m0", scale_e8m0)
+                copy_or_rebind_param(layer, "weight_scale_mx_e8m0", scale_ue8m0)
                 if weight_bf16 is not None:
                     copy_or_rebind_param(layer, "weight_bf16", weight_bf16)
                 else:
@@ -1270,7 +1270,7 @@ class Fp8LinearMethod(LinearMethodBase):
             return self.w8a8_mxfp8_linear(
                 input=x,
                 weight_shuffled=layer.weight.view(torch.uint8),
-                weight_scale_e8m0=layer.weight_scale_mx_e8m0,
+                weight_scale_ue8m0=layer.weight_scale_mx_e8m0,
                 weight_bf16=layer.weight_bf16,
                 input_scale=input_scale,
                 bias=bias,
