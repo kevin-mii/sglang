@@ -527,12 +527,8 @@ class DeepSeekV4IndexerPool(KVCache):
             )  # [n, 64, 2]
             dequant = DSV4_DEQUANT_FP4_TABLE.to(payload_u8.device)[
                 fp4_codes.long()
-            ].flatten(
-                1
-            )  # [n, 128]
-            scales = torch.exp2(scale_exps.float() - 127).repeat_interleave(
-                32, dim=-1
-            )
+            ].flatten(1)  # [n, 128]
+            scales = torch.exp2(scale_exps.float() - 127).repeat_interleave(32, dim=-1)
             return (dequant * scales).to(torch.bfloat16)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:

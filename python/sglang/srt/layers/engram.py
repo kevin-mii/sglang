@@ -34,8 +34,8 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
+from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,

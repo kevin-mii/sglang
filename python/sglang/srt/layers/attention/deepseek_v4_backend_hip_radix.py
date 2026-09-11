@@ -41,7 +41,6 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     create_paged_compressor_data,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
-from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
@@ -62,6 +61,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (

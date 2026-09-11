@@ -825,7 +825,9 @@ def low_ratio_index_topk_hip_extend(
             prefill_workspace=prefill_workspace if rows.start == 0 else None,
         )
 
-    def select_rows(rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish):
+    def select_rows(
+        rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish
+    ):
         _select_topk_extend_hip(
             indexer=indexer,
             logits=score_rows(rows),
