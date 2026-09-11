@@ -2898,8 +2898,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     or (get_platform().is_sm90 and x.shape[0] == 1)
                 )
             )
-            and x.dtype == torch.bfloat16
-        ):
+        ) and x.dtype == torch.bfloat16:
             # The split-K partial fixes the reduction order;
             # fusing the reduction and sinkhorn preserves batch invariance.
             main_stream = torch.cuda.current_stream()
