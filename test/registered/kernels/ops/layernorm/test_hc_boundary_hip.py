@@ -147,10 +147,20 @@ class TestHcBoundaryFused(CustomTestCase):
             )
             self.assertEqual(res_out.shape, residual.shape)
             self.assertEqual(y.shape, (m, H))
-            # the new residual is a differently contracted fp32 chain rounded to bf16: at most one bf16 ulp
+            # the new residual is a differently contracted fp32 chain rounded to bf16: at
+            # most one bf16 ulp of each element, with an absolute floor for the elements
+            # the sum cancelled to near zero (fp32 error of O(1) terms, far under a bf16
+            # ulp at unit scale)
             ref_res = _ref_post(x, residual, post_in, comb_in)
-            tol = 2.0**-7 * ref_res.float().abs().max().item()
-            self.assertLess((res_out.float() - ref_res.float()).abs().max().item(), tol)
+            self.assertEqual(res_out.dtype, ref_res.dtype)
+            ulp = (
+                res_out.view(torch.int16).int() - ref_res.view(torch.int16).int()
+            ).abs()
+            near_zero = (res_out.float() - ref_res.float()).abs() <= 2.0**-18
+            self.assertTrue(
+                bool(((ulp <= 1) | near_zero).all()),
+                f"m={m}: {int(((ulp > 1) & ~near_zero).sum())} elements beyond one bf16 ulp",
+            )
             # The collapse of the stored residual, as hc_combine computes it.
             y_ref = hc_combine(res_out.flatten(1), pre_prev, HC, torch.bfloat16)
             self.assertTrue(torch.equal(y, y_ref))
