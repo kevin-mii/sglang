@@ -392,11 +392,10 @@ def rmsnorm_with_sinkhorn(
     eps: float,
     coefficients: HcCoefficients,
     *,
-    return_norm: bool = True,
     quant_eps: float = 1e-10,
     emit_fp8: bool = False,
     fake_quant: bool = True,
-) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation, None], Optional[torch.Tensor]]:
+) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation, None], torch.Tensor]:
     """``rmsnorm_fake_quant_fp8(x, weight, eps)`` (the plain bf16 RMSNorm when ``fake_quant`` is
     False) with the pending reduce + sinkhorn of ``coefficients`` in the same launch. ``x`` is
     the ``[M, K]`` collapsed sublayer input the boundary produced from the rows the coefficients
@@ -405,7 +404,6 @@ def rmsnorm_with_sinkhorn(
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
     assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
-    assert return_norm or fake_quant, "nothing to produce"
     x = _row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
@@ -425,7 +423,7 @@ def rmsnorm_with_sinkhorn(
         if fake_quant and emit_fp8
         else None
     )
-    out_norm = torch.empty((M, K), dtype=x.dtype, device=dev) if return_norm else None
+    out_norm = torch.empty((M, K), dtype=x.dtype, device=dev)
     if fake_quant:
         quant = (
             Mxfp8Activation(out_fq, out_scale)
@@ -443,12 +441,12 @@ def rmsnorm_with_sinkhorn(
         x,
         weight,
         out_fq if out_fq is not None else x,
-        out_norm if out_norm is not None else x,
+        out_norm,
         out_scale if out_scale is not None else x,
         K,
         x.stride(0),
         out_fq.stride(0) if out_fq is not None else 0,
-        out_norm.stride(0) if out_norm is not None else 0,
+        out_norm.stride(0),
         out_scale.stride(0) if out_scale is not None else 0,
         eps,
         quant_eps,
@@ -464,7 +462,7 @@ def rmsnorm_with_sinkhorn(
         m,
         1.0 / coefficients.k,
         coefficients.rms_eps,
-        WRITE_NORM=out_norm is not None,
+        WRITE_NORM=True,
         EMIT_FP8=emit_fp8,
         FAKE_QUANT=fake_quant,
         CHUNK=CHUNK,

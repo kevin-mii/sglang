@@ -20,7 +20,6 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 ROCM_ROUTER_MAX_TOKENS = 64
 
 _BLOCK_M = 16
-_MAX_M_TILES = ROCM_ROUTER_MAX_TOKENS // _BLOCK_M
 _BLOCK_N = 16
 _BLOCK_K = 512
 _MAX_SPLIT_K = 32

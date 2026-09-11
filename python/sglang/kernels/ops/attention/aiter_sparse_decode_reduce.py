@@ -98,7 +98,6 @@ def aiter_sparse_split_reduce(
     attn_sink: Optional[torch.Tensor],
     out_dtype: torch.dtype = torch.bfloat16,
     inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    rope_dim: int = 64,
 ) -> torch.Tensor:
     """Combine ``pa_decode_sparse(..., skip_reduce=True)``'s partials into the
     ``[T, H, D]`` output. ``inv_rope`` is ``(freqs_real [max_pos, rope_dim] fp32,
@@ -117,15 +116,13 @@ def aiter_sparse_split_reduce(
     has_sink = attn_sink is not None
     if inv_rope is not None:
         freqs_real, positions = inv_rope
-        assert (
-            freqs_real.dtype == torch.float32
-            and freqs_real.shape[1] == rope_dim
-            and freqs_real.stride(1) == 1
-        )
+        rope_dim = freqs_real.shape[1]
+        assert freqs_real.dtype == torch.float32 and freqs_real.stride(1) == 1
         assert positions.shape == (T,), positions.shape
         assert rope_dim % 2 == 0 and rope_dim <= D
     else:
         freqs_real = positions = out  # unread placeholders
+        rope_dim = 0
     _aiter_sparse_decode_reduce_kernel[(T, H)](
         part_m,
         part_l,

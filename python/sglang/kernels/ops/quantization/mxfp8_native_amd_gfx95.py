@@ -69,17 +69,6 @@ class GemvConfig:
         )
 
 
-# candidate set of the offline sweep that produced mxfp8_gemv_gfx95_configs.json
-ALL_CONFIGS = tuple(
-    GemvConfig(w, s, r, t, ks)
-    for w in (4, 8, 16)
-    for s in (1, 2, 4)
-    for r in (16, 32)
-    for t in (16, 32)
-    for ks in (True, False)
-)
-
-
 def default_config(m: int, n: int, k: int) -> GemvConfig:
     """Heuristic for shapes without a tuned row."""
     tokens = 16 if m <= 16 else 32
@@ -166,7 +155,6 @@ def mxfp8_gemv(
     weight_shuffled: torch.Tensor,
     weight_scale_ue8m0: torch.Tensor,
     x_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     config: Optional[GemvConfig] = None,
 ) -> torch.Tensor:
     """``out[M, N] bf16 = x[M, K] . W^T`` on the gfx950 scaled matrix core.
@@ -189,8 +177,7 @@ def mxfp8_gemv(
         x_scale = x_scale.contiguous()
         # the kernel takes the fp8 bytes
         x = x.view(torch.uint8)
-    if out is None:
-        out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
+    out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     cfg = config or select_config(m, n, k)
     assert cfg.valid_for(m, n, k), (cfg, m, n, k)
     _jit_mxfp8_gemv_module(cfg, x_bf16).run(
@@ -474,29 +461,3 @@ def mxfp8_native_blockscaled_linear(
     if output_dtype is not None and out.dtype != output_dtype:
         out = out.to(output_dtype)
     return out.view(*input.shape[:-1], n)
-
-
-__all__ = [
-    "ALL_CONFIGS",
-    "CONFIG_FILE",
-    "GemvConfig",
-    "MXFP8_GEMV_MAX_TOKENS",
-    "M_BUCKETS",
-    "default_config",
-    "gfx_name",
-    "mxfp8_gemv",
-    "select_config",
-    "shuffle_mxfp8_weight",
-    "ue8m0_weight_scale",
-    "HIPBLASLT_BF16",
-    "LARGE_M_BUCKETS",
-    "large_m_bucket",
-    "large_m_plan",
-    "native_consumer_wants_fp8",
-    "weight_needs_bf16_copy",
-    "mxfp8_native_blockscaled_linear",
-    "mxfp8_shuffled_gemm",
-    "native_route_plan",
-    "native_route_supports",
-    "prepare_mxfp8_native_weight",
-]

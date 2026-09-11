@@ -489,17 +489,14 @@ def bf16_dequant_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: Optional[torch.Tensor] = None,
-    input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    output_dtype: Optional[torch.dtype] = None,
     input_on_fp8_grid: bool = False,
 ) -> torch.Tensor:
     """`weight` is the dequantized bf16 weight (`dequant_block_fp8_weight_to_bf16`);
-    `weight_scale` / `input_scale` are unused and kept for the linear signature.
+    `weight_scale` is unused and kept for the linear signature.
     `input_on_fp8_grid` says a fused upstream kernel (`rmsnorm_fake_quant_fp8`)
     already put `input` on the fp8 grid, so the fake-quant here is skipped."""
     assert weight.dtype == torch.bfloat16, weight.dtype
-    assert input_scale is None, "pre-quantized inputs do not reach this route"
     input_2d = input.view(-1, input.shape[-1])
     if input_on_fp8_grid:
         x = input_2d.to(torch.bfloat16)
@@ -513,6 +510,4 @@ def bf16_dequant_blockscaled_linear(
         out = _skinny_gemm_bf16(x, weight)
     else:
         out = F.linear(x, weight, bias)
-    if output_dtype is not None and out.dtype != output_dtype:
-        out = out.to(output_dtype)
     return out.view(*input.shape[:-1], weight.shape[0])
