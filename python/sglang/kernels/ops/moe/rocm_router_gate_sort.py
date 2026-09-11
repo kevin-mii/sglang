@@ -6,7 +6,8 @@ One program per row runs the gate and zeroes its ``moe_buf`` row; program 0 then
 ``M * TOPK`` entries by pairwise comparison. At ``M == 1`` they are its own lanes; otherwise rows
 reach program 0 through a fence-free hand-off: ``int64`` slots with a valid bit, published and
 polled with device-scope atomic adds (coherent across XCDs without an L2 writeback), cleared
-once read.
+once read. A row that has not published within ``MAX_SPINS`` polls traps the wave (``s_trap``,
+which ROCr reports as a queue error and aborts the process) instead of sorting zeros for it.
 """
 
 from __future__ import annotations
@@ -269,8 +270,12 @@ def _router_gate_sort_kernel(
                 tl.min(tl.where(in_range, (got & 1).to(tl.int32), 1), axis=1), axis=0
             )
             spins += 1
-        # a row that never published means a broken hand-off: trap rather than hang or route garbage
-        tl.device_assert(ready != 0, "rocm_router_gate_sort: hand-off timed out")
+        if ready == 0:
+            # a row that never published is a broken hand-off: trap rather than sort zeros for it
+            # (tl.device_assert is compiled out without TRITON_DEBUG, so it cannot be the guard)
+            tl.inline_asm_elementwise(
+                "s_trap 2", "=v,v", [ready], dtype=tl.int32, is_pure=False, pack=1
+            )
         # clear the slots for the next launch (this program is the only reader)
         tl.atomic_add(slot, -got, mask=in_range, sem="relaxed", scope="gpu")
         N: tl.constexpr = M_PAD * TOPK_PAD
