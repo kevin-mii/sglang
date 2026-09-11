@@ -403,7 +403,7 @@ def _run_fusion(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
         freqs_cis,
         cache,
         page_size=PAGE_SIZE,
-        ring_size=RING_SIZES[-1],
+        ring_size=ring_size,
     )
     live = odd & (raw_out_loc != 0)
     return dict(
