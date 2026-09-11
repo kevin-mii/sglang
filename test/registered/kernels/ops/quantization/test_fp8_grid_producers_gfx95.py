@@ -274,6 +274,7 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         self.fake_quant = fake_quant_fp8_activation
 
     def test_bitwise_against_aiter_and_separate_fake_quant(self):
+        """The single-launch regime (T above the split-K cap, or forced) is bitwise aiter's."""
         cases = [
             (1, 1.0),
             (1, 40.0),
@@ -289,15 +290,63 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
                 w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
                 x = (torch.randn(t, g, d, device="cuda") * scale).bfloat16()
                 ref = _aiter_reference(x, w)
-                plain = self.gemm(x, w, fp8_grid=False)
+                plain = self.gemm(x, w, fp8_grid=False, split_k=False)
                 self.assertEqual(plain.shape, (t, g * r))
                 self.assertTrue(torch.equal(plain, ref), (g, r, d, t, scale))
-                grid = self.gemm(x, w)
+                grid = self.gemm(x, w, split_k=False)
                 self.assertTrue(
                     torch.equal(grid, self.fake_quant(ref)), (g, r, d, t, scale)
                 )
                 # Idempotent: the output is already on the grid.
                 self.assertTrue(torch.equal(self.fake_quant(grid), grid))
+            # above the split-K cap the default regime is the single launch (aiter's own
+            # kernel changes tile there, so it is only compared against itself)
+            torch.manual_seed(99)
+            w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
+            x = torch.randn(65, g, d, device="cuda").bfloat16()
+            self.assertTrue(
+                torch.equal(self.gemm(x, w), self.gemm(x, w, split_k=False))
+            )
+
+    def test_split_k_regime(self):
+        """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product (the
+        reassociated sum), on the grid, batch-invariant and repeatable."""
+        from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+            _split_k_applies,
+        )
+
+        for g, r, d in GEMM_SHAPES:
+            if not _split_k_applies(1, d):
+                continue
+            torch.manual_seed(5)
+            w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
+            x = (torch.randn(64, g, d, device="cuda") * 1.5).bfloat16()
+            exact = torch.einsum("tgd,grd->tgr", x.double(), w.double()).flatten(1)
+            full_plain = self.gemm(x, w, fp8_grid=False)
+            self.assertTrue(
+                torch.equal(full_plain, self.gemm(x, w, fp8_grid=False, split_k=True))
+            )
+            # one bf16 rounding (half an ulp of the result) of an fp32 sum whose association
+            # differs from aiter's: the fp32 error is bounded by the sum of absolute products
+            absprod = torch.einsum(
+                "tgd,grd->tgr", x.abs().float(), w.abs().float()
+            ).flatten(1)
+            err = (full_plain.double() - exact).abs()
+            bound = exact.abs() * 2.0**-8 + absprod.double() * 2.0**-20 + 1e-6
+            self.assertTrue(bool((err <= bound).all()), (g, r, d, err.max().item()))
+            single = self.gemm(x, w, fp8_grid=False, split_k=False)
+            err_single = (single.double() - exact).abs()
+            self.assertTrue(bool((err_single <= bound).all()), (g, r, d))
+            full_grid = self.gemm(x, w)
+            self.assertTrue(torch.equal(full_grid, self.fake_quant(full_plain)))
+            for t in (1, 2, 6, 17):
+                sub = self.gemm(x[:t], w)
+                self.assertTrue(torch.equal(sub, full_grid[:t]), (g, r, d, t))
+                self.assertTrue(
+                    torch.equal(self.gemm(x[:t], w, fp8_grid=False), full_plain[:t])
+                )
+            for _ in range(5):
+                self.assertTrue(torch.equal(self.gemm(x, w), full_grid))
 
     def test_strided_input_view(self):
         # the model hands over a [T, G, D] view of a [T, H, head_dim] tensor; the kernel reads it through strides

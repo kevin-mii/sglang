@@ -1,12 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batched bf16 GEMM ``Y[g] = X[g] @ W[g]^T`` with the consumer's fp8-grid rounding in the
-epilogue: the DeepSeek-V4 ``wo_a`` absorb GEMM at decode on gfx950. The main loop is aiter's
-``_batched_gemm_bf16_kernel`` at a fixed 16 x 32 x 512 tile, so the bf16 result is bitwise
-aiter's, and with ``fp8_grid=True`` the output is bitwise
-``fake_quant_fp8_activation(batched_gemm_bf16(...))``. Requires ``R % 32 == 0``.
+epilogue: the DeepSeek-V4 ``wo_a`` absorb GEMM at decode on gfx950. Requires ``R % 32 == 0``.
+
+Two regimes, both batch-invariant and repeatable:
+
+* ``T > _SPLIT_K_MAX_M``: aiter's ``_batched_gemm_bf16_kernel`` main loop at a fixed
+  16 x 32 x 512 tile, so the bf16 result is bitwise aiter's and with ``fp8_grid=True`` bitwise
+  ``fake_quant_fp8_activation(batched_gemm_bf16(...))``.
+* ``T <= _SPLIT_K_MAX_M`` (decode, target verify): the same tile split eight ways along K, fp32
+  partials, then a reduce launch with the epilogue. At these row counts the single-launch
+  kernel only fills 64 CUs and streams the 16 MB weight in 12 us; the split fills the machine
+  and takes 7.5 us including the reduce (cold weights). The fp32 sum order is fixed
+  (per-split MFMA chain, then splits in order), so rows are still batch-invariant; the bits
+  differ from aiter's single chain by the reassociation.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 import triton
@@ -18,6 +29,8 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_round
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 16, 32, 512
 _NUM_WARPS, _NUM_STAGES, _WAVES_PER_EU, _MFMA_NONKDIM = 2, 2, 2, 16
 _CACHE_MODIFIER = ".cg"
+# split-K regime (see the module docstring): 8 splits of 256-wide K steps, up to this many rows
+_SPLIT_K, _SPLIT_K_BLOCK_K, _SPLIT_K_MAX_M = 8, 256, 64
 
 
 @triton.jit
@@ -124,15 +137,178 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _batched_gemm_bf16_splitk_partial_kernel(
+    a_ptr,
+    b_ptr,
+    part_ptr,
+    M,
+    N,
+    K,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    cache_modifier: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+):
+    """Grid (G, row tiles x N tiles, SPLIT_K): the fp32 partial of one K slice, stored as
+    ``part[g, split, row_tile, m, n]``. ``K % (SPLIT_K * BLOCK_SIZE_K) == 0``."""
+    batch_id = tl.cast(tl.program_id(axis=0), tl.int64)
+    pid = tl.program_id(axis=1)
+    pid_k = tl.program_id(axis=2)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    k_per_split = K // SPLIT_K
+    offs_k = pid_k * k_per_split + tl.arange(0, BLOCK_SIZE_K)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = offs_m < M
+    a_ptrs = a_ptr + (
+        batch_id * tl.cast(stride_ab, tl.int64)
+        + tl.cast(offs_m, tl.int64)[:, None] * stride_am
+        + offs_k[None, :] * stride_ak
+    )
+    b_ptrs = b_ptr + (
+        batch_id * tl.cast(stride_bb, tl.int64)
+        + offs_k[:, None] * stride_bk
+        + tl.cast(offs_n, tl.int64)[None, :] * stride_bn
+    )
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(k_per_split // BLOCK_SIZE_K):
+        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+        b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+        acc = tl.dot(a, b, acc=acc)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    tile = ((batch_id * SPLIT_K + pid_k) * num_pid_m + pid_m) * BLOCK_SIZE_M
+    tl.store(
+        part_ptr
+        + (tile + tl.arange(0, BLOCK_SIZE_M))[:, None] * N
+        + tl.cast(offs_n, tl.int64)[None, :],
+        acc,
+    )
+
+
+@triton.jit
+def _batched_gemm_splitk_reduce_kernel(
+    part_ptr,
+    c_ptr,
+    M,
+    N,
+    stride_cb,
+    stride_cm,
+    eps,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    FP8_GRID: tl.constexpr,
+):
+    """Grid (G, row tiles x N tiles): sums the partials of one output tile in split order,
+    rounds to bf16 and, with FP8_GRID, onto the consumer's fp8 grid."""
+    batch_id = tl.cast(tl.program_id(axis=0), tl.int64)
+    pid = tl.program_id(axis=1)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        tile = ((batch_id * SPLIT_K + s) * num_pid_m + pid_m) * BLOCK_SIZE_M
+        acc += tl.load(
+            part_ptr
+            + (tile + tl.arange(0, BLOCK_SIZE_M))[:, None] * N
+            + offs_n[None, :]
+        )
+    c = acc.to(c_ptr.type.element_ty)
+    if FP8_GRID:
+        xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
+        c = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_SIZE_M, BLOCK_SIZE_N))
+        c = c.to(c_ptr.type.element_ty)
+    c_ptrs = (
+        c_ptr
+        + stride_cb * batch_id
+        + stride_cm * tl.cast(offs_m, tl.int64)[:, None]
+        + offs_n[None, :]
+    )
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def _split_k_applies(T: int, D: int) -> bool:
+    return 0 < T <= _SPLIT_K_MAX_M and D % (_SPLIT_K * _SPLIT_K_BLOCK_K) == 0
+
+
+def _batched_gemm_split_k(
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fp8_grid: bool, eps: float
+) -> None:
+    T, G, D = x.shape
+    R = w.shape[1]
+    tiles_m, tiles_n = triton.cdiv(T, _BLOCK_M), triton.cdiv(R, _BLOCK_N)
+    partials = torch.empty(
+        (G, _SPLIT_K, tiles_m * _BLOCK_M, R), dtype=torch.float32, device=x.device
+    )
+    _batched_gemm_bf16_splitk_partial_kernel[(G, tiles_m * tiles_n, _SPLIT_K)](
+        x,
+        w,
+        partials,
+        T,
+        R,
+        D,
+        x.stride(1),
+        x.stride(0),
+        x.stride(2),
+        w.stride(0),
+        w.stride(2),
+        w.stride(1),
+        BLOCK_SIZE_M=_BLOCK_M,
+        BLOCK_SIZE_N=_BLOCK_N,
+        BLOCK_SIZE_K=_SPLIT_K_BLOCK_K,
+        SPLIT_K=_SPLIT_K,
+        cache_modifier=_CACHE_MODIFIER,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
+        waves_per_eu=_WAVES_PER_EU,
+        matrix_instr_nonkdim=_MFMA_NONKDIM,
+    )
+    _batched_gemm_splitk_reduce_kernel[(G, tiles_m * tiles_n)](
+        partials,
+        out,
+        T,
+        R,
+        R,
+        G * R,
+        eps,
+        BLOCK_SIZE_M=_BLOCK_M,
+        BLOCK_SIZE_N=_BLOCK_N,
+        SPLIT_K=_SPLIT_K,
+        FP8_GRID=fp8_grid,
+        num_warps=_NUM_WARPS,
+    )
+
+
 def batched_gemm_bf16_fp8_grid(
     x: torch.Tensor,
     w: torch.Tensor,
     fp8_grid: bool = True,
     eps: float = 1e-10,
+    split_k: Optional[bool] = None,
 ) -> torch.Tensor:
     """``x`` [T, G, D] bf16 (any strides, contiguous last dim), ``w`` [G, R, D]
     bf16 contiguous -> [T, G * R] bf16, ``out[t, g*R:(g+1)*R] = x[t, g] @ w[g]^T``,
-    on the fp8 grid when ``fp8_grid``. ``R % 32 == 0`` is required for the grid."""
+    on the fp8 grid when ``fp8_grid``. ``R % 32 == 0`` is required for the grid.
+    ``split_k`` forces a regime (tests); None selects by T (module docstring)."""
     assert x.dim() == 3 and w.dim() == 3, (x.shape, w.shape)
     T, G, D = x.shape
     assert w.shape[0] == G and w.shape[2] == D, (x.shape, w.shape)
@@ -142,6 +318,12 @@ def batched_gemm_bf16_fp8_grid(
     assert not fp8_grid or R % 32 == 0, R
     out = torch.empty((T, G * R), dtype=torch.bfloat16, device=x.device)
     if T == 0:
+        return out
+    if split_k is None:
+        split_k = _split_k_applies(T, D)
+    if split_k:
+        assert _split_k_applies(T, D), (T, D)
+        _batched_gemm_split_k(x, w, out, fp8_grid, eps)
         return out
     grid = (G, triton.cdiv(T, _BLOCK_M) * triton.cdiv(R, _BLOCK_N))
     _batched_gemm_bf16_fp8_grid_kernel[grid](

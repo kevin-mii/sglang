@@ -2238,7 +2238,16 @@ class MQALayer(MqaAttentionBase):
                     o = _apply_wo_a_bf16_matmul(
                         o,
                         wo_a,
-                        is_decode=forward_batch.forward_mode.is_decode(),
+                        # ROCm: target verify has a few rows per request, and the
+                        # decode kernels (16-row tiles) serve it as well; CUDA keeps
+                        # its own verify route behind is_target_verify
+                        is_decode=(
+                            forward_batch.forward_mode.is_decode()
+                            or (
+                                _is_hip
+                                and forward_batch.forward_mode.is_target_verify()
+                            )
+                        ),
                         is_target_verify=forward_batch.forward_mode.is_target_verify(),
                         fuse_mxfp8_quant=(
                             not get_forward().sp_active
