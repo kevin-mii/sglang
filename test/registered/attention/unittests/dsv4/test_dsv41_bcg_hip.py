@@ -210,7 +210,9 @@ class TestHipBreakableGraphMetadataContract(CustomTestCase):
 
 
 @unittest.skipUnless(
-    is_hip() and torch.cuda.is_available(), "the fp8-grid wrapper is a gfx950 path"
+    is_hip() and torch.cuda.is_available(),
+    "the fp8-grid wrapper is the ROCm model's; the gfx950 predicates are mocked, so"
+    " any ROCm GPU runs this",
 )
 class TestBreakInputsKeepTheirWrapper(CustomTestCase):
     """The row slice and the BCG weak-ref pass must hand `Fp8GridActivation` on, or the

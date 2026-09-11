@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -122,6 +122,9 @@ class TestDsv41Fp4TieRoundingHip(CustomTestCase):
             fq = rope_tail_fake_quant_fp4(row.view(1, 128), freqs, 64)
             self._check("rope_tail_fake_quant_fp4", scale, fq[0], RNE)
 
+    @unittest.skipUnless(
+        is_gfx95_supported(), "the AITER ratio-4 quantizers use gfx950's fp4 cvt"
+    )
     def test_aiter_ratio4_kernels_round_half_to_even(self):
         """The AITER ratio-4 quantizers must round ties to even, unlike the CUDA ratio-4
         kernels' odd ties toward zero."""

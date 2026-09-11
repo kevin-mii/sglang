@@ -145,7 +145,9 @@ class _StubIndexer:
 # -- the kernels: FlyDSL paged logits and the AOT paged top-k transform ---------
 
 
-@unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
+)
 class TestFp4PagedLogitsKernels(CustomTestCase):
     def _setup(self, ratio):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -734,7 +736,9 @@ class _LowRatioBackendCase(CustomTestCase):
         self._assert_selection(a, b, msg, exact_rows=none, masks=False)
 
 
-@unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
+)
 class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
     """The decode and ragged-prefill entry points against the torch oracle."""
 
@@ -858,7 +862,9 @@ class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
                     self.assertEqual(p, t_pos[r])
 
 
-@unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
+)
 class TestTwoLevelDecodeHip(_LowRatioBackendCase):
     """Level one of the two-level top-k: the source keeps TOPK_BLOCKS x BLOCK_SIZE positions, later ratio-1 sources select inside them."""
 
@@ -1291,7 +1297,9 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
                     )
 
 
-@unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
+)
 class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
     """A request whose visible compressed context fits index_topk is written without scoring; the skipped path must equal the scored path exactly."""
 

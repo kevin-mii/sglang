@@ -10,13 +10,15 @@ from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import RMSNorm, rope_tail
 from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_compressed_kv
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="requires a GPU",
+    not torch.cuda.is_available() or (is_hip() and not is_gfx95_supported()),
+    reason="requires a GPU; on ROCm the byte-for-byte e4m3fn cache oracle needs gfx950"
+    " (gfx942's hardware fp8 pack encodes E4M3FNUZ)",
 )
 
 EPS = 1e-6
