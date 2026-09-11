@@ -1,5 +1,7 @@
 """Compare decode and multimodal extend hashes with a per-token reference."""
 
+import sys
+
 import pytest
 import torch
 
@@ -231,3 +233,7 @@ def test_extend_with_scheduler_history_and_image_spans():
         starts=starts,
         **_common(image=True),
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
