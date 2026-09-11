@@ -515,6 +515,7 @@ class _LowRatioBackendCase(CustomTestCase):
             )
             meta = SimpleNamespace(
                 core_metadata=core,
+                late_layer_tail=None,
                 low_ratio_indexer_metadata=lambda r: indexer_metadata,
                 fp4_low_ratio_decode_workspaces={},
                 fp4_low_ratio_prefill_workspaces=(
