@@ -958,7 +958,9 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
                 page_table = torch.stack(
                     [torch.randperm(n_pages, device="cuda") for _ in lens]
                 ).to(torch.int32)
-                self._assert_consumer_matches_reference(raw, seq, cands, page_table, "consumer")
+                self._assert_consumer_matches_reference(
+                    raw, seq, cands, page_table, "consumer"
+                )
 
     def test_graph_replay_hand_off(self):
         """Source then consumer captured once must replay on new lengths and logits with
@@ -1148,7 +1150,9 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
         case = self._setup(1, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
         consumer = self._layer_inputs(case)
 
-        filtered_source_pages, filtered_source_raw, cands = self._run(case, "decode", candidate_source=True)
+        filtered_source_pages, filtered_source_raw, cands = self._run(
+            case, "decode", candidate_source=True
+        )
         self.assertIsInstance(cands, CandidateBlocks)
         filtered_consumer_pages, filtered_consumer_raw, _ = self._run(
             case, "decode", inputs=consumer, uses_candidates=True, masks=cands
@@ -1173,7 +1177,9 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
         ):
             self.assertTrue(torch.equal(sorted_rows(a), sorted_rows(b)), name)
         for b, n in enumerate(seq_lens):
-            self.assertEqual(int((skipped_consumer_raw[b] >= 0).sum()), min(TOPK, n), f"row {b}")
+            self.assertEqual(
+                int((skipped_consumer_raw[b] >= 0).sum()), min(TOPK, n), f"row {b}"
+            )
 
         # A consumer that did not skip while the source did fails loudly.
         with self.assertRaises(AssertionError):
@@ -1435,7 +1441,9 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
         branch (0..len-1 in order, then -1) and match the scored path exactly."""
         for ratio in (1, 2):
             seq_lens = [1, 37, 300, 512 * ratio, 512 * ratio + ratio - 1]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
+            case = self._setup(
+                ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens)
+            )
             full = self._run(case, "decode", skip=False)
             fast = self._run(case, "decode", skip=True)
             self._assert_selection(fast, full, f"{ratio=}")
@@ -1454,7 +1462,9 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
 
         for ratio in (1, 2):
             seq_lens = [1, 300, 512 * ratio + ratio]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
+            case = self._setup(
+                ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens)
+            )
             backend = SimpleNamespace(low_ratio_identity_skip=True, index_topk=TOPK)
             self.assertFalse(
                 low_ratio_decode_rows_are_identity(backend, case.forward_batch, ratio)

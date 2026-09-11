@@ -269,10 +269,12 @@ class TestPrefillRunnerUsesCapturedMetadataContract(CustomTestCase):
         calls = []
         stashed = object()
         attn_backend = SimpleNamespace(
-            init_forward_metadata_for_breakable_cuda_graph_capture=lambda batch: stashed,
+            init_forward_metadata_for_breakable_cuda_graph_capture=lambda batch: (
+                stashed
+            ),
             init_forward_metadata=lambda batch: calls.append(("init", batch)),
-            prepare_forward_metadata_for_breakable_cuda_graph_replay=lambda *a, **k: calls.append(
-                ("replay", a, k)
+            prepare_forward_metadata_for_breakable_cuda_graph_replay=lambda *a, **k: (
+                calls.append(("replay", a, k))
             ),
         )
         runner = self._runner(attn_backend)
@@ -285,7 +287,8 @@ class TestPrefillRunnerUsesCapturedMetadataContract(CustomTestCase):
 
         self.assertIs(runner.attn_metadata_buffers[96], stashed)
         self.assertEqual(
-            calls, [("replay", (stashed, live_batch), {"static_forward_batch": static_batch})]
+            calls,
+            [("replay", (stashed, live_batch), {"static_forward_batch": static_batch})],
         )
 
 

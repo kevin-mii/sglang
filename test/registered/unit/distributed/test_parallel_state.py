@@ -418,7 +418,6 @@ def test_hip_broadcast_eager_keeps_torch_distributed():
     )
 
 
-
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

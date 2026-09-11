@@ -923,6 +923,5 @@ def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     assert torch.equal(page_a, torch.where(valid, slots, -1))
 
 
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

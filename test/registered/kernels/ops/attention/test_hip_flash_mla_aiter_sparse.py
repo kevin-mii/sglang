@@ -83,7 +83,9 @@ def _reference(q, sink, sets):
     is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
 )
 class TestAiterSparseBackend(CustomTestCase):
-    def _assert_matches_reference_and_tilelang(self, batch, heads, swa_lengths, topk_lengths, seed=0):
+    def _assert_matches_reference_and_tilelang(
+        self, batch, heads, swa_lengths, topk_lengths, seed=0
+    ):
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
         )
@@ -181,11 +183,15 @@ class TestAiterSparseBackend(CustomTestCase):
 
     def test_short_context_lengths(self):
         # a context shorter than the window and the top-k width: the length masks live slots left in the list
-        self._assert_matches_reference_and_tilelang(3, 16, [101, 128, 5], [100, 512, 1], seed=1)
+        self._assert_matches_reference_and_tilelang(
+            3, 16, [101, 128, 5], [100, 512, 1], seed=1
+        )
 
     def test_padded_heads(self):
         # The model pads the per-rank heads to 64 (zero q, zero sink).
-        self._assert_matches_reference_and_tilelang(2, 64, [128, 64], [512, 300], seed=2)
+        self._assert_matches_reference_and_tilelang(
+            2, 64, [128, 64], [512, 300], seed=2
+        )
 
     def _real_vs_padded_heads(self, batch, seed):
         """The 16-head call must return bitwise what the padded 64-head call returned on the real heads."""
@@ -488,7 +494,9 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
                 self.assertEqual(got.dtype, torch.bfloat16)
                 self.assertTrue(torch.equal(got, ref))
                 self.assertTrue(
-                    torch.equal(aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"]), got)
+                    torch.equal(
+                        aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"]), got
+                    )
                 )
 
     def test_no_sink(self):
@@ -499,7 +507,14 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         )
 
         inputs = self._inputs(4, 16, 7, 77, 301)
-        args = (inputs["q"], inputs["swa_cache"], inputs["swa_idx"], self._indptr(4, 128), None, SCALE)
+        args = (
+            inputs["q"],
+            inputs["swa_cache"],
+            inputs["swa_idx"],
+            self._indptr(4, 128),
+            None,
+            SCALE,
+        )
         ref = pa_decode_sparse(*args, kv_splits=4)
         acc, m, lsum = pa_decode_sparse(*args, kv_splits=4, skip_reduce=True)
         self.assertTrue(torch.equal(aiter_sparse_split_reduce(acc, m, lsum, None), ref))
@@ -646,6 +661,7 @@ class TestAiterSparseDecodeSplitPin(CustomTestCase):
             one, eight, many = self._run(1), self._run(8), self._run(self.ROWS)
         self.assertTrue(torch.equal(one, eight[:1]))
         self.assertTrue(torch.equal(eight, many[:8]))
+
 
 if __name__ == "__main__":
     unittest.main()
