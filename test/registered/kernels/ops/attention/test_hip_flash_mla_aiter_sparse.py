@@ -26,6 +26,11 @@ BYTES = 584
 SCALE = D**-0.5
 
 
+# Relative tolerance for the short-list case: about 3x the measured aiter error
+# (~3e-3) and 40x under what attending one stray key on a 5-key list costs (~0.4).
+TOL_SHORT = 1e-2
+
+
 def _pack_cache(num_blocks, device, gen, *, fp8_view=True):
     """Random bf16 keys in the packed fp8 layout: cache [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
     slots = num_blocks * PAGE
@@ -84,7 +89,7 @@ def _reference(q, sink, sets):
 )
 class TestAiterSparseBackend(CustomTestCase):
     def _assert_matches_reference_and_tilelang(
-        self, batch, heads, swa_lengths, topk_lengths, seed=0
+        self, batch, heads, swa_lengths, topk_lengths, seed=0, tol=3e-2
     ):
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
@@ -162,10 +167,10 @@ class TestAiterSparseBackend(CustomTestCase):
         err = (got.float() - ref).abs().max().item() / scale
         err_tl = (tilelang.float() - ref).abs().max().item() / scale
         self.assertLess(
-            err, 3e-2, f"aiter vs reference {err:.4f} (tilelang {err_tl:.4f})"
+            err, tol, f"aiter vs reference {err:.4f} (tilelang {err_tl:.4f})"
         )
         self.assertLess(
-            (got.float() - tilelang.float()).abs().max().item() / scale, 3e-2
+            (got.float() - tilelang.float()).abs().max().item() / scale, tol
         )
         for _ in range(5):
             again = flash_mla_with_kvcache_entrypoint(
@@ -185,6 +190,15 @@ class TestAiterSparseBackend(CustomTestCase):
         # a context shorter than the window and the top-k width: the length masks live slots left in the list
         self._assert_matches_reference_and_tilelang(
             3, 16, [101, 128, 5], [100, 512, 1], seed=1
+        )
+
+    def test_short_lists_skip_the_padding_key(self):
+        """The -1 inside the length (index 3 of the top-k list) must not be attended: on
+        lists this short every key carries a visible share of the softmax mass, so a stray
+        key -- wrapped to the last slot or otherwise -- fails at this tolerance where the
+        640-key cases above would absorb it."""
+        self._assert_matches_reference_and_tilelang(
+            2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT
         )
 
     def test_padded_heads(self):
