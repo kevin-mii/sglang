@@ -568,13 +568,11 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
+# cherry-pick ROCm/aiter#5283 (7b481fb) and #5279 (24a62b1): gfx950 DSV4 a8w8 blockscale bpreshuffle configs; drop at the next aiter bump
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
-# docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch: the FlyDSL MoE stage-1
-# K-loop left LDS-DMA loads in flight across the K-step barrier (partial `s_waitcnt vmcnt(N)`
-# with the tile-derived N too large for t64x256/t128x* tiles, and the LLVM scheduler free to
-# hoist scale loads above the last DMA), so the a8w4 stage-1 output was not bitwise repeatable
-# run to run. Drop once the fix lands in AITER_COMMIT.
+# aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage-1 left LDS-DMA loads in flight across the
+# K-step barrier (partial vmcnt(N) + scheduler hoists), so a8w4 stage-1 was not bitwise repeatable.
+# Stands in for an upstream fix not yet filed (patch text and ISA evidence in docker/patches/rocm/); drop at the bump that carries it.
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -1181,19 +1179,18 @@ ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
-# The ROCm 7.0 dp-attention workaround; off on the ROCm 7.2 stacks this file builds.
+# ROCm 7.0 dp-attention workaround (dp_attention.py _USE_ROCM700A_WA); off for the served ROCm 7.2+ stacks
 ENV SGLANG_USE_ROCM700A=0
-# Keep the fp4 MoE experts on the aiter path and route bf16 GEMMs through hipBLASLt.
+# aiter's bf16-vs-fp8 MoE token bound (default 256); 0 keeps every batch on the quantized expert kernels
 ENV AITER_BF16_FP8_MOE_BOUND=0
-# aiter FlyDSL a8w4 MoE kernel picks tuned on 4x MI350X for DeepSeek-V4.1 (TP4 + EP4): aiter's own
-# knob, kept out of the Python package and shipped with the image until it lands in aiter; keys are
-# gfx950-only, other targets fall back to aiter's heuristic. Bitwise-repeatable only together with the
-# stage-1 LDS-DMA drain patch applied to the aiter checkout above.
+# bf16 GEMMs through hipBLASLt
+ENV TORCH_BLAS_PREFER_HIPBLASLT=1
+# aiter's tuned-FMoE table for DeepSeek-V4.1 EP4 a8w4 on gfx950 (other targets keep aiter's heuristic);
+# bitwise-repeatable only with the stage-1 LDS-DMA drain patch above. Drop once the rows land in aiter.
 COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
 ENV AITER_CONFIG_FMOE=/sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
 # bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
 ENV AITER_FLYDSL_FORCE_REDUCE=1
-ENV TORCH_BLAS_PREFER_HIPBLASLT=1
 
 ENV NCCL_MIN_NCHANNELS=112
 # Unquantized quick-reduce: INT8/INT4 all-reduce is lossier than the CUDA path.
