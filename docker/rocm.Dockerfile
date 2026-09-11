@@ -1185,10 +1185,10 @@ ENV SGLANG_USE_ROCM700A=0
 ENV AITER_BF16_FP8_MOE_BOUND=0
 # bf16 GEMMs through hipBLASLt
 ENV TORCH_BLAS_PREFER_HIPBLASLT=1
-# aiter's tuned-FMoE table for DeepSeek-V4.1 EP4 a8w4 on gfx950 (other targets keep aiter's heuristic);
-# bitwise-repeatable only with the stage-1 LDS-DMA drain patch above. Drop once the rows land in aiter.
-COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
-ENV AITER_CONFIG_FMOE=/sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
+# aiter's tuned-FMoE rows for DeepSeek-V4.1 EP4 a8w4 on gfx950, bitwise-repeatable only with the
+# stage-1 LDS-DMA drain patch above; drop once the rows land in aiter. Placed under model_configs/
+# so aiter merges them into its table: AITER_CONFIG_FMOE=<file> would replace every other model's rows.
+COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
 # bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
 ENV AITER_FLYDSL_FORCE_REDUCE=1
 
