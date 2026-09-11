@@ -82,6 +82,75 @@ def engram_commit_history(
 
 
 @triton.jit
+def _engram_commit_decode_kernel(
+    history_ptr,
+    tokens_ptr,
+    slots_ptr,
+    out_loc_ptr,
+    pad_row,
+    HISTORY_STRIDE: tl.constexpr,
+    HISTORY_WIDTH: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    HAS_OUT_LOC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(slots_ptr + row).to(tl.int64)
+    if HAS_OUT_LOC:
+        # a padded row (out_cache_loc 0) must not overwrite a live request's history
+        loc = tl.load(out_loc_ptr + row)
+        slot = tl.where(loc == 0, pad_row, slot)
+    col = tl.arange(0, BLOCK)
+    valid = col < HISTORY_WIDTH
+    # history is oldest first: column j takes shift HISTORY_WIDTH - 1 - j
+    values = tl.load(
+        tokens_ptr + row * TOKEN_STRIDE + (HISTORY_WIDTH - 1 - col), mask=valid, other=0
+    )
+    tl.store(
+        history_ptr + slot * HISTORY_STRIDE + col,
+        values.to(history_ptr.dtype.element_ty),
+        mask=valid,
+    )
+
+
+def engram_commit_decode_history(
+    history: torch.Tensor,
+    tokens: torch.Tensor,
+    req_slots: torch.Tensor,
+    out_loc: Optional[torch.Tensor],
+    pad_row: int,
+) -> None:
+    """The decode commit of ``EngramHasher.forward`` in one launch::
+
+        rows = where(out_loc == 0, pad_row, req_slots) if out_loc is not None else req_slots
+        history[rows] = tokens[:, :n - 1].flip(-1).to(history.dtype)
+
+    ``tokens`` is the hash kernel's ``[bs, n]`` shift table (shift 0 = the token itself);
+    padded rows all land on the spare ``pad_row``, whose contents are never read."""
+    bs = req_slots.numel()
+    width = history.shape[1]
+    if bs == 0 or width == 0:
+        return
+    assert history.stride(1) == 1 and tokens.stride(1) == 1
+    assert tokens.shape[0] == bs and tokens.shape[1] >= width, (tokens.shape, width)
+    assert req_slots.stride(0) == 1
+    assert out_loc is None or (out_loc.shape[0] == bs and out_loc.stride(0) == 1)
+    _engram_commit_decode_kernel[(bs,)](
+        history,
+        tokens,
+        req_slots,
+        out_loc if out_loc is not None else req_slots,
+        pad_row,
+        HISTORY_STRIDE=history.stride(0),
+        HISTORY_WIDTH=width,
+        TOKEN_STRIDE=tokens.stride(0),
+        HAS_OUT_LOC=out_loc is not None,
+        BLOCK=triton.next_power_of_2(width),
+        num_warps=1,
+    )
+
+
+@triton.jit
 def _engram_hash_kernel(
     ids_ptr,
     pos_ptr,

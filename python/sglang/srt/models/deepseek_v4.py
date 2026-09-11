@@ -3827,12 +3827,25 @@ class DeepseekV4Model(nn.Module):
                 pending_post = None
             if engram is not None:
                 before_engram = hidden_states
+                keep_image_rows = (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                )
+                # HIP: the image-token select rides in the fused gate launch
+                image_rows = (
+                    (input_ids.contiguous(), self.config.image_token_id)
+                    if keep_image_rows
+                    and _is_hip
+                    and hidden_states.is_cuda
+                    and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+                    else None
+                )
                 if i == 14 and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_stream(self.engram_prefetch_stream)
                     prefetched_engram_kv.record_stream(main_stream)
                     hidden_states = engram.apply_gate(
-                        hidden_states, prefetched_engram_kv
+                        hidden_states, prefetched_engram_kv, image_rows=image_rows
                     )
                     prefetched_engram_kv = None
                 else:
@@ -3841,11 +3854,9 @@ class DeepseekV4Model(nn.Module):
                         hash_ids[:, engram.layer_hash_index],
                         forward_batch,
                         cp_all_tokens=cp_extend,
+                        image_rows=image_rows,
                     )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if keep_image_rows and image_rows is None:
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,

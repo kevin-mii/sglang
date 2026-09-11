@@ -363,3 +363,84 @@ def sparse_buffers(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _page_table_from_req_to_token_kernel(
+    r2t_ptr,
+    req_ptr,
+    out_ptr,
+    num_cols,
+    r2t_stride,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    req = tl.load(req_ptr + row).to(tl.int64)
+    col = blk * BLOCK + tl.arange(0, BLOCK)
+    mask = col < num_cols
+    v = tl.load(
+        r2t_ptr + req * r2t_stride + col.to(tl.int64) * PAGE, mask=mask, other=0
+    )
+    # torch's floor division; the C-style quotient rounds toward zero
+    q = v // PAGE
+    q = tl.where((v < 0) & (v % PAGE != 0), q - 1, q)
+    tl.store(out_ptr + row.to(tl.int64) * num_cols + col, q.to(tl.int32), mask=mask)
+
+
+def page_table_from_req_to_token(
+    req_to_token: torch.Tensor,
+    req_rows: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+) -> torch.Tensor:
+    """``(req_to_token[req_rows, :max_seq_len:page_size] // page_size).to(torch.int32)`` in one
+    launch (the gather, the floor division and the cast)."""
+    assert req_to_token.dim() == 2 and req_to_token.stride(1) == 1
+    assert req_rows.dim() == 1 and req_rows.stride(0) == 1
+    n = req_rows.shape[0]
+    num_cols = max(
+        0, (min(max_seq_len, req_to_token.shape[1]) + page_size - 1) // page_size
+    )
+    out = torch.empty((n, num_cols), dtype=torch.int32, device=req_to_token.device)
+    if n == 0 or num_cols == 0:
+        return out
+    block = min(1024, triton.next_power_of_2(num_cols))
+    _page_table_from_req_to_token_kernel[(n, triton.cdiv(num_cols, block))](
+        req_to_token,
+        req_rows,
+        out,
+        num_cols,
+        req_to_token.stride(0),
+        PAGE=page_size,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < n
+    tl.store(oa_ptr + i, tl.load(a_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
+    tl.store(ob_ptr + i, tl.load(b_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
+
+
+def widen_pair_i64(
+    a: torch.Tensor, b: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(a.to(torch.int64), b.to(torch.int64))`` for two same-length integer vectors in one
+    launch (the decode request slots and positions the low-ratio indexer takes widened)."""
+    assert a.dim() == b.dim() == 1 and a.shape == b.shape, (a.shape, b.shape)
+    assert a.stride(0) == 1 and b.stride(0) == 1
+    n = a.shape[0]
+    oa = torch.empty(n, dtype=torch.int64, device=a.device)
+    ob = torch.empty(n, dtype=torch.int64, device=a.device)
+    if n:
+        block = min(1024, triton.next_power_of_2(n))
+        _widen_pair_kernel[(triton.cdiv(n, block),)](
+            a, b, oa, ob, n, BLOCK=block, num_warps=4
+        )
+    return oa, ob

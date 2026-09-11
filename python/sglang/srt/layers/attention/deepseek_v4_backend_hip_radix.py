@@ -21,7 +21,9 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
     mask_indices_by_length,
+    page_table_from_req_to_token,
     sparse_buffers,
+    widen_pair_i64,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -1320,8 +1322,22 @@ class DeepseekV4HipRadixBackend(
             and metadata.core_metadata.low_ratios
             and one_token_rows
         ):
-            metadata.low_ratio_req_indices = token_req_indices(forward_batch)
-            metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.positions.is_cuda
+                and forward_batch.req_pool_indices.shape
+                == forward_batch.positions.shape
+                and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+            ):
+                # both widenings in one launch
+                metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
+                    widen_pair_i64(
+                        forward_batch.req_pool_indices, forward_batch.positions
+                    )
+                )
+            else:
+                metadata.low_ratio_req_indices = token_req_indices(forward_batch)
+                metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
 
         # same capture-safe workspace contract as the c4 ones below
         if (
@@ -2421,10 +2437,16 @@ class DeepseekV4HipRadixBackend(
             )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
 
-        page_table = req_to_token[
-            req_pool_indices_repeated, : max_seq_len : self.page_size
-        ]
-        page_table = (page_table // self.page_size).to(torch.int32)
+        if req_to_token.is_cuda and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get():
+            # the gather, the floor division and the cast in one launch
+            page_table = page_table_from_req_to_token(
+                req_to_token, req_pool_indices_repeated, max_seq_len, self.page_size
+            )
+        else:
+            page_table = req_to_token[
+                req_pool_indices_repeated, : max_seq_len : self.page_size
+            ]
+            page_table = (page_table // self.page_size).to(torch.int32)
 
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,

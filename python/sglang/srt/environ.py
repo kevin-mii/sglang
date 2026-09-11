@@ -897,6 +897,10 @@ class Envs:
     # routed scale) in the same launch (moe_topk_reduce_add). Set to 0 for aiter's
     # reduction plus the separate shared-expert add.
     SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
+    # DSV4.1 decode glue on HIP in single launches: Engram history commit, core
+    # page table, widened indexer indices, the image-token select inside the Engram
+    # gate. Set to 0 for the torch chains (bitwise the same).
+    SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
 
     # ===================================================================
     # Apple Silicon and MLX

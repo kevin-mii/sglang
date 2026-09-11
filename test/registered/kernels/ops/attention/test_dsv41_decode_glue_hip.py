@@ -428,3 +428,52 @@ def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
                 x, table, 64, compressed_kv=compressed_kv, positions=pos
             )
             assert torch.equal(out, ref)
+
+
+def test_page_table_from_req_to_token_matches_torch():
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+        page_table_from_req_to_token,
+    )
+
+    _seed(23)
+    req_to_token = torch.randint(
+        0, 2**20, (300, 8192), device=DEVICE, dtype=torch.int32
+    )
+    req_to_token[
+        7, :64
+    ] = -3  # torch floor-divides; the slot values are never negative in serving
+    for bs, max_seq_len, page in (
+        (1, 1000, 64),
+        (8, 4097, 64),
+        (64, 8192, 64),
+        (5, 63, 64),
+        (3, 128, 128),
+        (2, 8191, 32),
+    ):
+        req = torch.randint(0, 300, (bs,), device=DEVICE, dtype=torch.int32)
+        req[0] = 7
+        ref = (req_to_token[req, :max_seq_len:page] // page).to(torch.int32)
+        got = page_table_from_req_to_token(req_to_token, req, max_seq_len, page)
+        assert got.shape == ref.shape and got.dtype == torch.int32
+        assert torch.equal(got, ref)
+    empty = page_table_from_req_to_token(
+        req_to_token, torch.empty(0, device=DEVICE, dtype=torch.int32), 1000, 64
+    )
+    assert empty.shape == (0, 16)
+
+
+def test_widen_pair_i64_matches_casts():
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import widen_pair_i64
+
+    _seed(29)
+    for bs in (0, 1, 8, 64, 257, 5000):
+        a = torch.randint(0, 300, (bs,), device=DEVICE, dtype=torch.int32)
+        b = torch.randint(0, 2**31 - 1, (bs,), device=DEVICE, dtype=torch.int32)
+        oa, ob = widen_pair_i64(a, b)
+        assert oa.dtype == ob.dtype == torch.int64
+        assert torch.equal(oa, a.to(torch.int64)) and torch.equal(ob, b.to(torch.int64))
+    oa, ob = widen_pair_i64(
+        torch.tensor([3, -1], device=DEVICE, dtype=torch.int64),
+        torch.tensor([9, 0], device=DEVICE, dtype=torch.int32),
+    )
+    assert oa.tolist() == [3, -1] and ob.tolist() == [9, 0]

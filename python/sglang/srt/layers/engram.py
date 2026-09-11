@@ -14,7 +14,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -27,6 +27,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
     MODE_VERIFY,
+    engram_commit_decode_history,
     engram_commit_history,
     engram_hash_ids,
 )
@@ -343,7 +344,21 @@ class EngramHasher(nn.Module):
                 row,
                 starts,
             )
-        if commit_rows is not None:
+        if (
+            commit_rows is not None
+            and commit_last is None
+            and input_ids.is_cuda
+            and _fused_decode_glue()
+        ):
+            # decode: the where / flip / cast / index_put chain below in one launch
+            engram_commit_decode_history(
+                self.history,
+                tokens,
+                req_slots,
+                forward_batch.out_cache_loc,
+                self.pad_row,
+            )
+        elif commit_rows is not None:
             # Padded rows must not overwrite a live request's history.
             last_tokens = tokens if commit_last is None else tokens[commit_last]
             out_loc = forward_batch.out_cache_loc
@@ -856,6 +871,13 @@ class EngramEmbedding(nn.Module):
         return local.view(*indices.shape, self.dim)
 
 
+def _fused_decode_glue() -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_hip
+
+    return is_hip() and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+
+
 def engram_gate(
     x: torch.Tensor,
     kv: torch.Tensor,
@@ -863,9 +885,12 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    image_rows: Optional[Tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy.
+    ``image_rows = (input_ids, image_token_id)`` keeps ``x`` on the image-token rows
+    (the model's ``torch.where`` after the gate, folded into the fused kernel).
 
     The torch path below is the CPU fallback."""
     if (
@@ -878,7 +903,9 @@ def engram_gate(
         and k_weight.dtype in (torch.bfloat16, torch.float32)
         and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, image_rows=image_rows
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -891,7 +918,11 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if image_rows is not None:
+        input_ids, image_token_id = image_rows
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
 
 
 class Engram(nn.Module):
@@ -929,8 +960,10 @@ class Engram(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         *,
         cp_all_tokens: bool = False,
+        image_rows: Optional[Tuple[torch.Tensor, int]] = None,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer; ``image_rows``
+        as in ``apply_gate``."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
@@ -939,7 +972,7 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
-        return self.apply_gate(x, kv)
+        return self.apply_gate(x, kv, image_rows=image_rows)
 
     def project(
         self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
@@ -947,7 +980,20 @@ class Engram(nn.Module):
         kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
         return kv
 
-    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+    def apply_gate(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        image_rows: Optional[Tuple[torch.Tensor, int]] = None,
+    ) -> torch.Tensor:
+        """``image_rows = (input_ids [T], image_token_id)`` keeps ``x`` on the image-token
+        rows, replacing the model's ``torch.where`` after the gate."""
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            image_rows=image_rows,
         )
