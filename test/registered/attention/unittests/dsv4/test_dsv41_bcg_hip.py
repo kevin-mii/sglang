@@ -338,6 +338,14 @@ def _tensor_fields(obj):
             yield f.name, value
 
 
+# Allocated with torch.empty_like by init_flashmla_related: the index-source layer
+# writes every row before a consumer reads one, so a fresh build holds whatever the
+# allocator hands back. Two builds agree on shape, not on contents.
+_UNINITIALIZED_SCRATCH_FIELDS = frozenset(
+    {"c1_sparse_raw_indices", "c2_sparse_raw_indices", "c4_sparse_raw_indices"}
+)
+
+
 @unittest.skipUnless(
     is_hip() and torch.cuda.is_available(), "the HIP radix backend is ROCm only"
 )
@@ -463,9 +471,13 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                 if name == "swa_out_cache_loc":
                     continue
                 with self.subTest(field=name):
-                    self.assertTrue(
-                        torch.equal(getattr(captured.core_attn_metadata, name), value)
-                    )
+                    rebound = getattr(captured.core_attn_metadata, name)
+                    if name in _UNINITIALIZED_SCRATCH_FIELDS:
+                        self.assertEqual(rebound.shape, value.shape)
+                        self.assertEqual(rebound.dtype, value.dtype)
+                        self.assertEqual(rebound.device, value.device)
+                    else:
+                        self.assertTrue(torch.equal(rebound, value))
             for ratio in (1, 2):
                 for name in ("page_table", "c4_seq_lens"):
                     with self.subTest(ratio=ratio, field=name):
