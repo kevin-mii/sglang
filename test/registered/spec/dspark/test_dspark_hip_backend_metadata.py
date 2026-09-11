@@ -1,8 +1,4 @@
-"""DSpark plumbing of the HIP DeepSeek-V4 backend, metadata only: the draft block
-attends over the last SWA_WINDOW committed tokens plus the whole block, with the
-block slots from out_cache_loc, and target-verify runs the ratio-1/2 indexer through
-the paged decode body with decode-form rows and hoisted inputs.
-"""
+"""DSpark metadata on the HIP DeepSeek-V4 backend: the draft block window and the target-verify indexer rows."""
 
 import unittest
 from types import SimpleNamespace

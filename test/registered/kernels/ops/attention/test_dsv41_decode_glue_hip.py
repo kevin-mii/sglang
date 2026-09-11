@@ -1,8 +1,4 @@
-"""Single-launch replacements for the DeepSeek-V4.1 decode glue on HIP must be
-bitwise the torch chains they replace: the sorted top-k epilogue (AOT) and the
-sorted candidate mapping, the length fold of the aiter_sparse index lists, the
-low-ratio metadata and sparse buffers, the expanded indexer page table, and the
-2-D grid of the compressed-attention metadata kernel."""
+"""Single-launch replacements for the DeepSeek-V4.1 decode glue on HIP must be bitwise the torch chains they replace."""
 
 from __future__ import annotations
 

@@ -77,7 +77,7 @@ class TestCompressedKVQuant(CustomTestCase):
         )
         self.assertTrue(torch.equal(cache, expected))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA or ROCm")
+    @unittest.skipUnless(torch.cuda.is_available(), "requires a GPU")
     def test_triton_matches_torch_for_both_quantization_rules(self):
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,

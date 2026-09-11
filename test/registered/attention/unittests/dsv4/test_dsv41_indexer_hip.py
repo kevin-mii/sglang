@@ -1,19 +1,4 @@
-"""The V4.1 low-ratio indexer on ROCm (gfx950): the FlyDSL fp4 paged logits
-kernels (decode, target-verify rows and ragged prefill) plus the AOT paged top-k
-transform against a torch golden of the reference scoring on the production
-layout (64-slot indexer-K pages in the split payload / scale layout behind the
-FULL 256-token page table); the backend entry points `low_ratio_index_topk_hip_*`
-against the torch oracle `_low_ratio_index_topk_torch` on the same batch, pool and
-metadata, including the candidate-mask flow from the source layer to a consumer
-and the request-group split of the prefill logits; level one of the two-level
-top-k (the length-bounded HIP helpers against the reference
-`select_candidate_blocks` under kernel garbage past the reach, graph replay of the
-source -> consumer hand-off, the decode body beyond the 16384-position candidate
-span and the span skip below it); identity requests, whose visible compressed
-context fits index_topk and are written without scoring; and the split-K Triton
-GEMV route of the indexer head weights against the served aiter chain and an fp64
-reference.
-"""
+"""The V4.1 low-ratio indexer on ROCm: FlyDSL fp4 paged logits + AOT top-k against a torch golden, the HIP backend entry points and the two-level top-k against the torch oracle."""
 
 import unittest
 from types import SimpleNamespace
@@ -870,10 +855,7 @@ class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
 
 @unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
 class TestTwoLevelDecodeHip(_LowRatioBackendCase):
-    """Level one of the two-level top-k on the decode path: the candidate-source layer
-    keeps TOPK_BLOCKS x BLOCK_SIZE positions and the later ratio-1 sources select
-    inside them, so the selection only diverges from the plain paged top-k once a
-    request has more than SPAN compressed positions."""
+    """Level one of the two-level top-k: the source keeps TOPK_BLOCKS x BLOCK_SIZE positions, later ratio-1 sources select inside them."""
 
     def _garbage_tail(self, logits, lens):
         """Kernel garbage past each row's reach (large positives on even rows, NaN on
@@ -1300,11 +1282,7 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
 
 @unittest.skipUnless(is_hip(), "FlyDSL fp4 indexer kernels are ROCm only")
 class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
-    """Identity requests: a request whose visible compressed context fits index_topk
-    selects every position on every row, so the backend writes that selection
-    without scoring. The skipped path must produce exactly the indices (page and
-    raw) and candidate masks of the scored path, for whole-batch skips, mixed
-    batches of short and long requests, and decode rows."""
+    """A request whose visible compressed context fits index_topk is written without scoring; the skipped path must equal the scored path exactly."""
 
     def _identity_row_mask(self, st, seq_lens, extend_lens):
         """Rows of the requests the skip writes without scores."""
@@ -1551,13 +1529,7 @@ def _ulp_distance(a, b):
     is_hip() and is_gfx95_supported(), "split-K MFMA GEMV pair is gfx95 only"
 )
 class TestIndexerHeadWeightsHip(CustomTestCase):
-    """The ROCm decode route of the head weights (split-K Triton GEMV plus a
-    fixed-order reduce that applies `head_weight_scale`) must be
-    `bf16(bf16(fp32 split-K sum) * scale)` bit for bit, give every row the same
-    weights whether alone or inside a 16-row batch, replay from a graph, and stand
-    within one bf16 ulp of the exactly rounded product on every element. Against
-    the served chain (aiter's tuned GEMM, then the aten bf16 multiply) the two
-    differ only where the fp32 sums round to different bf16 values."""
+    """The ROCm head-weights route must be `bf16(bf16(fp32 split-K sum) * scale)` bit for bit, batch-invariant and within one bf16 ulp of the exact product."""
 
     def setUp(self):
         torch.manual_seed(20260909)

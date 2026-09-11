@@ -1,9 +1,4 @@
-"""The one-launch MoE sorting must match ``aiter.fused_moe.moe_sorting`` bit for bit on every
-tensor the GEMM stages read (padded rows compared against aiter on already-masked inputs), the
-ROCm decode router (split-K GEMV + fused sqrtsoftplus gate) must reproduce aiter's
-``topk_gating`` ids and weights bit for bit, ties included, with batch-invariant logits, and
-the one-launch gate + sorting must reproduce both at once.
-"""
+"""The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's `moe_sorting` and `topk_gating` bit for bit."""
 
 import unittest
 
@@ -18,7 +13,7 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 try:
     from aiter.fused_moe import moe_sorting as aiter_moe_sorting
-except ImportError:  # pragma: no cover - CUDA runners
+except ImportError:  # aiter is absent off ROCm
     aiter_moe_sorting = None
 
 
@@ -267,7 +262,7 @@ class TestFusedAiterMoeSorting(CustomTestCase):
 
 try:
     from aiter import topk_gating as aiter_topk_gating
-except ImportError:  # pragma: no cover - CUDA runners
+except ImportError:  # aiter is absent off ROCm
     aiter_topk_gating = None
 
 

@@ -1,6 +1,4 @@
-"""Check decode numerics and packed writes through the real cache pool.
-On ROCm the index-K pool is split (payload / scale), so the reference is its own unfused writer.
-"""
+"""Check decode numerics and packed writes through the real cache pool; on ROCm the split index-K pool gets its own unfused reference writer."""
 
 import os
 import types

@@ -1,10 +1,4 @@
-"""Check fused index-key writes and index-query packing against the Triton path.
-
-Key inputs with exact fp32 sums of squares require bytewise equality across
-the whole cache; random inputs allow a bounded mismatch rate for RMSNorm
-reduction-order differences at rounding boundaries. Query packing has no
-order-dependent reduction and must be bytewise equal for arbitrary inputs.
-"""
+"""Check the fused index-key writes and index-query packing bytewise against the Triton path."""
 
 import sys
 
@@ -29,7 +23,7 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="the fused index-K write requires CUDA",
+    reason="requires a GPU",
 )
 
 # `index_head_dim` and `qk_rope_head_dim` as served. The one-warp tiling is

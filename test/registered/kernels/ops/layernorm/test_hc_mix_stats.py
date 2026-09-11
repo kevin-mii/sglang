@@ -11,7 +11,7 @@ register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="hc_mix_stats requires CUDA",
+    reason="hc_mix_stats requires a GPU",
 )
 
 EPS = 1e-6

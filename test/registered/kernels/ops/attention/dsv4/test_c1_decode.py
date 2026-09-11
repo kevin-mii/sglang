@@ -1,10 +1,4 @@
-"""Check ratio-1 latents against float64 RMSNorm and cache writes byte-for-byte.
-
-The latent gate allows slack only near bf16 rounding boundaries, selected from
-the float64 reference independently of kernel output. Torch parity is required
-outside that band, with an aggregate mismatch bound to detect systematic drift.
-The store gate uses the kernel's own latent to isolate packing from norm rounding.
-"""
+"""Check ratio-1 latents against the float64 RMSNorm within the bf16 boundary band and the cache writes byte-for-byte."""
 
 import sys
 
@@ -22,14 +16,12 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="the fused c1 decode compressor requires CUDA",
+    reason="requires a GPU",
 )
 
 EPS = 1e-6
-# 512 only, and not merely because it is the served width: the kernel carries
-# the main-KV write, and a 584-byte FlashMLA slot is 448 fp8 nope plus 64 bf16
-# RoPE, so no other `head_dim` has a layout to store into. The kernel asserts
-# it rather than letting the store go wrong.
+# The 584-byte FlashMLA layout fixes head_dim at 512:
+# 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIMS = (512,)
 BATCHES = (1, 8, 128)
 

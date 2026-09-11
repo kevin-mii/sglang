@@ -1,6 +1,6 @@
 """The fused K RMSNorm + RoPE + fp8 store into the FlashMLA paged cache must match a torch
 reference of the same quantization; values are drawn so every block has elements in the top
-e4m3 binade [256, 448), which the ROCm software fp8 encoder once saturated to 448.
+e4m3 binade [256, 448).
 """
 
 import math

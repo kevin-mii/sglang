@@ -1,25 +1,9 @@
 """Pin the e2m1 tie rounding of every HIP FP4 indexer quantizer.
 
-Two conventions exist for a value that sits exactly between two e2m1 grid
-points (|x| / scale in {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}):
-
-- round half to even, the reference rounding (`torch.round` in
-  `torch_quant.round_fp4`, `_fp4_e2m1_code_rne`, the CUDA low-ratio path);
-- CUDA's `quant_fp4_e2m1` threshold quantizer in `main_norm_rope.cuh` /
-  `fused_norm_rope_v2.cuh`, which the ratio-4 CUDA indexer kernels use and
-  which sends the odd ties 0.75 / 1.75 / 3.5 toward zero.
-
-On ROCm the low-ratio paths run the same Triton quantizer as CUDA with
-`rne=True`, and both AITER ratio-4 kernels quantize through the gfx950
-`v_cvt_scalef32_pk_fp4_f32` instruction, which rounds to nearest even: the
-query kernel (`aiter_q_indexer_fp4`) keeps fp32 through the Hadamard rotation
-and quantizes with that instruction, where the CUDA ratio-4 query kernel casts
-to bf16 after the Hadamard and rounds the odd ties (0.75 / 1.75 / 3.5) toward
-zero (`quant_fp4_e2m1`); the K writer (`aiter_k_indexer_fp4_cache_write`)
-quantizes through the same hardware cvt, where CUDA's ratio-4 K kernel rounds
-the odd ties toward zero. The tests below feed exact ties (power-of-two block
-scales, so the division is exact) to every HIP path and assert the convention
-each one follows.
+The low-ratio Triton paths round ties to even like CUDA; both AITER ratio-4 kernels quantize
+through gfx950 `v_cvt_scalef32_pk_fp4_f32`, also ties-to-even, where CUDA's ratio-4 kernels
+send the odd ties 0.75 / 1.75 / 3.5 toward zero. Exact ties (power-of-two block scales) are
+fed to each path and the convention asserted.
 """
 
 import unittest

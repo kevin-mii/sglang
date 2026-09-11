@@ -1,10 +1,4 @@
-"""The ROCm fused mHC sublayer boundary (``hc_boundary_fused``) must match the torch forms it
-replaces, the reduce/sinkhorn kernel must match an fp64 reference, the gfx950 prefill regime
-(``_hc_boundary_partials(..., prefill=True)``) must give bitwise the Triton decode kernel's raw
-partials for every row at every M, so a row alone equals the same row inside a prefill batch,
-and the norm launch that hosts the pending reduce + sinkhorn (``rmsnorm_with_sinkhorn``) must
-give bitwise the two standalone launches.
-"""
+"""The ROCm fused mHC boundary, its gfx950 prefill regime and the norm launch hosting the reduce + sinkhorn must match the torch forms and the standalone launches bitwise."""
 
 import unittest
 

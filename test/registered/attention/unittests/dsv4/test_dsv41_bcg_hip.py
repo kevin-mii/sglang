@@ -1,8 +1,4 @@
-"""Breakable prefill CUDA graphs on ROCm for the DeepSeek-V4.1 radix backend: the
-captured metadata object stays active across a replay, the SWA store target keeps
-its storage and takes the padded static batch's values, and every break-time field
-is the eager build for the live batch.
-"""
+"""Breakable prefill graphs on the HIP radix backend: the captured metadata stays active across replays, only the SWA store target keeps its storage, every other field is the eager build."""
 
 import copy
 import dataclasses

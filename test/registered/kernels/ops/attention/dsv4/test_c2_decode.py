@@ -1,11 +1,4 @@
-"""Check ratio-2 pooling within tolerance, and pair state and cache stores bitwise.
-
-Closed-form softmax and FMA contraction can cross bf16 rounding boundaries.
-The pooling gate allows two bf16 ulps plus an absolute floor near cancellation;
-an aggregate mismatch bound detects systematic drift within that tolerance.
-The store gate uses the kernel's own latent, while the end-to-end byte check
-covers rows whose latents agree. Pair state is copied without arithmetic.
-"""
+"""Check ratio-2 pooling within two bf16 ulps and the pair state and cache stores bitwise."""
 
 import sys
 
@@ -30,14 +23,12 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="the fused c2 decode compressor requires CUDA",
+    reason="requires a GPU",
 )
 
 EPS = 1e-6
-# 512 only, and not merely because it is the served width: the kernel carries the
-# main-KV write, and a 584-byte FlashMLA slot is 448 fp8 nope plus 64 bf16 RoPE,
-# so no other `head_dim` has a layout to store into. The kernel asserts it rather
-# than letting the store go wrong.
+# The 584-byte FlashMLA layout fixes head_dim at 512:
+# 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIMS = (512,)
 BATCHES = (1, 8, 64)
 # `CompressStatePool.ring_size`, positions per request slot in the pair state.
@@ -53,10 +44,8 @@ PAGE_SIZE = 64
 SLOT_BYTES = 584
 PAGE_BYTES = -(-SLOT_BYTES * PAGE_SIZE // 576) * 576
 
-# Two bf16 ulp, worst case, in relative terms -- see the module docstring for
-# why the intermediate bf16 cast in `finish` makes one ulp reachable and two the
-# ceiling. The floor is 12 binary orders below a normalized output, so it only
-# ever engages on elements the pair pooling has cancelled to near zero.
+# Two bf16 ulp: the intermediate bf16 cast in `finish` makes one ulp reachable and two
+# the ceiling. The floor only engages on elements the pair pooling cancelled to near zero.
 POOL_RTOL = 2**-6
 POOL_ATOL = 2**-20
 

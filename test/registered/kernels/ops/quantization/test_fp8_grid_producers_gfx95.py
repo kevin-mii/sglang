@@ -1,8 +1,4 @@
-"""The gfx950 fused fp8-grid producers -- RMSNorm + fake-quant, the shared expert's clamp + silu *
-mul, and the wo_a decode GEMM with the fp8-grid epilogue -- against the unfused launches they
-replace: the fake-quant must be bit-identical to the reference applied to the same bf16 input,
-the GEMM bitwise aiter's, and rows batch-invariant.
-"""
+"""The gfx950 fused fp8-grid producers (RMSNorm + fake-quant, clamp + silu * mul, wo_a GEMM epilogue) must match the unfused launches bitwise on the quant step."""
 
 import unittest
 

@@ -1,8 +1,4 @@
-"""The gfx950 native MXFP8 skinny GEMM (`mxfp8_gemv`) against an fp64 reference on the CUDA
-route's quantized operands, and the native dense route against the bf16-dequant route: both
-activation encodings bitwise equal, every element within one bf16 ulp of the row's output scale,
-bitwise repeatable and batch-invariant, and the route runs under HIP graph capture.
-"""
+"""The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant, graph-capturable."""
 
 import unittest
 
