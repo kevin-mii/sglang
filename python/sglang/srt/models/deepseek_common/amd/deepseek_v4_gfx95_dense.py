@@ -140,15 +140,15 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
 
 
 def input_norm_fake_quant(
-    layer, hidden_states: torch.Tensor, sinkhorn=None
+    layer, hidden_states: torch.Tensor, coefficients=None
 ) -> Tuple[torch.Tensor, Optional[object]]:
     """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the fp8-grid operand
-    of its dense projections, or None for non-2-D / non-bf16 rows). ``sinkhorn`` rides in the norm
+    of its dense projections, or None for non-2-D / non-bf16 rows). ``coefficients`` rides in the norm
     launch when the fused kernel runs, else it is materialized here."""
     norm = layer.input_layernorm
     if not _fake_quant_applies(norm, hidden_states):
-        if sinkhorn is not None:
-            sinkhorn.materialize()
+        if coefficients is not None:
+            coefficients.materialize()
         return norm(hidden_states), None
     if not layer._wqkv_a_native_consumer_checked:
         # wqkv_a exists only when the q / kv projections are fused
@@ -157,12 +157,12 @@ def input_norm_fake_quant(
         )
         layer._wqkv_a_native_consumer_checked = True
     emit_fp8 = _emit_native_fp8(layer._wqkv_a_native_consumer, hidden_states.shape[0])
-    if sinkhorn is not None and not sinkhorn.materialized:
+    if coefficients is not None and not coefficients.materialized:
         x_quant, hidden_states = rmsnorm_with_sinkhorn(
             hidden_states,
             norm.weight.data,
             norm.variance_epsilon,
-            sinkhorn,
+            coefficients,
             emit_fp8=emit_fp8,
         )
         return hidden_states, x_quant
@@ -175,22 +175,22 @@ def input_norm_fake_quant(
     return hidden_states, x_quant
 
 
-def post_attention_norm(layer, x: torch.Tensor, sinkhorn=None) -> torch.Tensor:
-    """`layer.post_attention_layernorm(x)`; with ``sinkhorn`` (``HcCoefficients`` of the
+def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tensor:
+    """`layer.post_attention_layernorm(x)`; with ``coefficients`` (``HcCoefficients`` of the
     boundary that produced ``x``) still pending, the reduce + sinkhorn rides in the norm
     launch, which then is the Triton row norm rather than the aiter one."""
     norm = layer.post_attention_layernorm
     if (
-        sinkhorn is None
-        or sinkhorn.materialized
+        coefficients is None
+        or coefficients.materialized
         or rmsnorm_with_sinkhorn is None
         or not _fake_quant_applies(norm, x)
     ):
-        if sinkhorn is not None:
-            sinkhorn.materialize()
+        if coefficients is not None:
+            coefficients.materialize()
         return norm(x)
     _, out = rmsnorm_with_sinkhorn(
-        x, norm.weight.data, norm.variance_epsilon, sinkhorn, fake_quant=False
+        x, norm.weight.data, norm.variance_epsilon, coefficients, fake_quant=False
     )
     return out
 

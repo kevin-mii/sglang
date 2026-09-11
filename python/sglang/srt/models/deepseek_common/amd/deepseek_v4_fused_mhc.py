@@ -504,7 +504,7 @@ def forward_hc_pre_from_prev_fused_boundary(
         )
     # the boundary's reduce + sinkhorn rides in the norm launch
     x, x_quant = layer._input_norm(
-        x, allow_aiter_quant=False, sinkhorn=attn_coefficients
+        x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         x = layer.self_attn(
