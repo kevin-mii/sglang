@@ -653,6 +653,7 @@ def low_ratio_index_topk_hip_decode(
     indexer = layer.indexer
     indexer_metadata = metadata.low_ratio_indexer_metadata(ratio)
     assert indexer_metadata is not None, f"no decode indexer metadata for {ratio = }"
+    core.drop_folded_sparse_indices(ratio)
     page_indices = core.sparse_page_indices(ratio)
     raw_indices = core.sparse_raw_indices(ratio)
 
@@ -739,6 +740,7 @@ def low_ratio_index_topk_hip_extend(
     core = metadata.core_metadata
     ratio = layer.compress_ratio
     indexer = layer.indexer
+    core.drop_folded_sparse_indices(ratio)
     page_indices = core.sparse_page_indices(ratio)
     raw_indices = core.sparse_raw_indices(ratio)
     page_indices.fill_(-1)

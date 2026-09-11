@@ -278,6 +278,52 @@ class TestAiterSparseBackend(CustomTestCase):
         # no lengths: nothing to fold, the caller keeps its list
         self.assertEqual(_fold_lengths_into_index_lists(idx, None), (None, None))
 
+    def test_fold_cache_follows_the_index_source(self):
+        """Layers between two index sources fold the first source's list once; the layers
+        after the second source must fold its list, not reuse the first one's."""
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DSV4AttnMetadata,
+            _fold_lengths_for_aiter_sparse,
+        )
+
+        dev = "cuda"
+        i32 = dict(dtype=torch.int32, device=dev)
+        swa = torch.arange(2 * 1 * 64, **i32).view(2, 1, 64)
+        swa_len = torch.tensor([64, 64], **i32)
+        core = DSV4AttnMetadata(
+            page_size=64,
+            page_table=torch.zeros(1, **i32),
+            raw_out_loc=torch.zeros(1, **i32),
+            cuda_int32_kwargs={},
+            seq_lens_casual=torch.zeros(2, **i32),
+            positions_casual=torch.zeros(2, **i32),
+            swa_page_indices=swa,
+            swa_topk_lengths=swa_len,
+            index_topk=64,
+        )
+        core.c2_sparse_page_indices = torch.arange(2 * 1 * 64, **i32).view(2, 1, 64)
+        core.c2_sparse_topk_lengths = torch.tensor([3, 64], **i32)
+        extra = core.sparse_page_indices(2)
+
+        _, first = _fold_lengths_for_aiter_sparse(
+            core, 2, swa, swa_len, extra, core.c2_sparse_topk_lengths
+        )
+        self.assertEqual(first[0, 0, :4].tolist(), [0, 1, 2, -1])
+        # the next index source writes new picks into the same buffer
+        core.drop_folded_sparse_indices(2)
+        extra.add_(1000)
+        core.c2_sparse_topk_lengths.fill_(2)
+        _, second = _fold_lengths_for_aiter_sparse(
+            core, 2, swa, swa_len, extra, core.c2_sparse_topk_lengths
+        )
+        self.assertEqual(second[0, 0, :4].tolist(), [1000, 1001, -1, -1])
+        # ratio 1's folds survive a ratio-2 rewrite
+        core._aiter_sparse_masked_indices[(1, 0, (), None, None)] = "kept"
+        core.drop_folded_sparse_indices(2)
+        self.assertEqual(
+            list(core._aiter_sparse_masked_indices), [(1, 0, (), None, None)]
+        )
+
 
 SWA, TOPK = 128, 512
 
