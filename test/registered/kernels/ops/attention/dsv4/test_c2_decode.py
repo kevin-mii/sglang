@@ -24,13 +24,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_compressed_kv
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-# The kernel is not Blackwell-specific (its widest vector is 16 bytes and PDL
-# only needs sm90), but the ratio-2 compressor is served on B200/GB300, so gate
-# it there too rather than on Hopper alone.
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(

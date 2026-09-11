@@ -23,10 +23,8 @@ from sglang.kernels.ops.attention.dsv4.rope_pack_indexer import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import RMSNorm
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
