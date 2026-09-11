@@ -8,6 +8,7 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -355,6 +356,8 @@ def select_candidate_blocks_hip(
         ids = picked.indices.to(torch.int32).masked_fill(
             picked.values == -torch.inf, -1
         )
+        # the gather takes the width from ids and tiles it in 256-block programs
+        ids = F.pad(ids, (0, topk_blocks - ids.shape[1]), value=-1)
     compact_width = topk_blocks * block_size
     return CandidateBlocks(
         ids=ids,
@@ -653,7 +656,6 @@ def low_ratio_index_topk_hip_decode(
     indexer = layer.indexer
     indexer_metadata = metadata.low_ratio_indexer_metadata(ratio)
     assert indexer_metadata is not None, f"no decode indexer metadata for {ratio = }"
-    core.drop_folded_sparse_indices(ratio)
     page_indices = core.sparse_page_indices(ratio)
     raw_indices = core.sparse_raw_indices(ratio)
 
@@ -740,7 +742,6 @@ def low_ratio_index_topk_hip_extend(
     core = metadata.core_metadata
     ratio = layer.compress_ratio
     indexer = layer.indexer
-    core.drop_folded_sparse_indices(ratio)
     page_indices = core.sparse_page_indices(ratio)
     raw_indices = core.sparse_raw_indices(ratio)
     page_indices.fill_(-1)
