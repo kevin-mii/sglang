@@ -89,6 +89,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     out_stride_r,
     f_stride_t,
     rows_per_token,
+    num_pos,
     D: tl.constexpr,
     RD: tl.constexpr,
     BLK: tl.constexpr,
@@ -102,6 +103,8 @@ def _rope_tail_fake_quant_fp4_kernel(
     if HAS_POS:
         # freqs is the whole table: row t reads its position's entry (the freqs[positions] gather folded in)
         t = tl.load(pos_ptr + t).to(tl.int64)
+        # the caller owns positions < num_pos; an out-of-range row reads entry 0 instead of past the table
+        t = tl.where((t >= 0) & (t < num_pos), t, 0)
     out = rope_tail_fake_quant_fp4_row(
         x_ptr + r * x_stride_r,
         f_ptr + t * f_stride_t,
@@ -162,6 +165,7 @@ def rope_tail_fake_quant_fp4(
         d,
         f_real.stride(0),
         rows_per_token,
+        f_real.shape[0],
         D=d,
         RD=rope_dim,
         BLK=block_size,

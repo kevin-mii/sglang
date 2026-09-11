@@ -749,6 +749,7 @@ def _index_q_pack_weights_kernel(
     stride_pm,
     weight_scale,
     T,
+    num_pos,
     H: tl.constexpr,
     D: tl.constexpr,
     RD: tl.constexpr,
@@ -764,6 +765,8 @@ def _index_q_pack_weights_kernel(
         t = pid // H
         h = pid % H
         pos = tl.load(pos_ptr + t)
+        # the caller owns positions < num_pos; an out-of-range row reads entry 0 instead of past the table
+        pos = tl.where((pos >= 0) & (pos < num_pos), pos, 0)
         fq = rope_tail_fake_quant_fp4_row(
             q_ptr + t.to(tl.int64) * stride_qt + h * D,
             f_ptr + pos * RD,
@@ -859,6 +862,7 @@ def index_q_pack_weights_hip(
         head_weight_partials.stride(1),
         float(weight_scale),
         T,
+        f_real.shape[0],
         H=H,
         D=128,
         RD=rope_dim,
