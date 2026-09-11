@@ -286,6 +286,9 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
           out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + 4 * g + r] = f32_to_bf16_rne(acc[t][b][r]);
     }
   }
+#elif defined(__HIP_DEVICE_COMPILE__)
+// the JIT compiles one --offload-arch; an empty body here would launch and return `out` unwritten
+#error "mxfp8_gemv_gfx95 is gfx950-only"
 #endif  // __gfx950__
 }
 
