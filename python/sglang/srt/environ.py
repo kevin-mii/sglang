@@ -907,7 +907,7 @@ class Envs:
     # on the batch size past 64 rows; a pinned value makes decode batch-invariant at
     # every size. Measured per layer (SWA 128 + top-k 512, 16 heads): 8 is fastest up to
     # 32 rows (16.3 vs 19.0 us at 1 row), 4 at 64, 2 at 128, 1 at 256 (82 vs 50 us pinned 4).
-    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(0)
+    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
 
     # ===================================================================
     # Apple Silicon and MLX

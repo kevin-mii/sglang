@@ -672,7 +672,10 @@ class TestAiterSparseDecodeSplitPin(CustomTestCase):
         swa_idx = torch.stack([r[1] for r in rows])[:batch].to(torch.int32)
         topk_idx = torch.stack([r[2] for r in rows])[:batch].to(torch.int32)
         sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
-        lens = lambda n: torch.full((batch,), n, dtype=torch.int32, device=dev)
+
+        def lens(n):
+            return torch.full((batch,), n, dtype=torch.int32, device=dev)
+
         return flash_mla_with_kvcache_entrypoint(
             backend="aiter_sparse",
             q=q,
