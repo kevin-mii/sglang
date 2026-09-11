@@ -42,7 +42,9 @@ def aiter_sparse_decode_fwd(
     fp32 attention sink. Only ``-1`` entries are skipped, so callers fold ``topk_length`` into the
     index lists; padded query heads pass through, so the output keeps the caller's head layout.
     Returns ``(out, None)``: the LSE is not produced. Extend batches of
-    ``_AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS`` tokens or more run unsplit. Split partials are combined
+    ``_AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS`` tokens or more run unsplit; below that aiter's
+    cost model picks the split count from the batch size unless
+    ``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins it. Split partials are combined
     by ``aiter_sparse_split_reduce`` (bitwise aiter's reduce); ``inv_rope = (freqs_real [max_pos, 64]
     fp32, positions [n])`` folds the model's inverse RoPE of the last 64 dims of every head into the
     output.
@@ -75,6 +77,9 @@ def aiter_sparse_decode_fwd(
         )
     if n >= _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS:
         extra_kwargs["kv_splits"] = 1
+    elif envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() > 0:
+        # a pinned split count keeps the combine order, hence the bits, the same at every batch size
+        extra_kwargs["kv_splits"] = envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
     out = pa_decode_sparse(
         q3,
         cache,

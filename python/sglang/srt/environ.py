@@ -901,6 +901,13 @@ class Envs:
     # page table, widened indexer indices, the image-token select inside the Engram
     # gate. Set to 0 for the torch chains (bitwise the same).
     SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
+    # DSV4.1 decode attention on gfx950 (aiter_sparse): pin the split-KV count of the
+    # decode / verify rows. 0 keeps aiter's cost model, which picks 4 up to 64 rows, 2 at
+    # 96-128, 4 at 192 and 1 at 256, so a row's fp32 combine order (and its bits) depends
+    # on the batch size past 64 rows; a pinned value makes decode batch-invariant at
+    # every size. Measured per layer (SWA 128 + top-k 512, 16 heads): 8 is fastest up to
+    # 32 rows (16.3 vs 19.0 us at 1 row), 4 at 64, 2 at 128, 1 at 256 (82 vs 50 us pinned 4).
+    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(0)
 
     # ===================================================================
     # Apple Silicon and MLX
