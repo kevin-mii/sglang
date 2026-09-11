@@ -570,11 +570,18 @@ RUN pip uninstall -y aiter
 # preserve.
 # cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
+# docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch: the FlyDSL MoE stage-1
+# K-loop left LDS-DMA loads in flight across the K-step barrier (partial `s_waitcnt vmcnt(N)`
+# with the tile-derived N too large for t64x256/t128x* tiles, and the LLVM scheduler free to
+# hoist scale loads above the last DMA), so the a8w4 stage-1 output was not bitwise repeatable
+# run to run. Drop once the fix lands in AITER_COMMIT.
+COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
  && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
+ && git apply --verbose /tmp/aiter_patches/aiter_flydsl_moe_stage1_lds_dma_drain.patch \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -1178,6 +1185,12 @@ ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=0
 # Keep the fp4 MoE experts on the aiter path and route bf16 GEMMs through hipBLASLt.
 ENV AITER_BF16_FP8_MOE_BOUND=0
+# aiter FlyDSL a8w4 MoE kernel picks tuned on 4x MI350X for DeepSeek-V4.1 (TP4 + EP4): aiter's own
+# knob, kept out of the Python package and shipped with the image until it lands in aiter; keys are
+# gfx950-only, other targets fall back to aiter's heuristic. Bitwise-repeatable only together with the
+# stage-1 LDS-DMA drain patch applied to the aiter checkout above.
+COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
+ENV AITER_CONFIG_FMOE=/sgl-workspace/aiter_configs/fmoe_gfx950_dsv41_ep4_a8w4.csv
 # bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
 ENV AITER_FLYDSL_FORCE_REDUCE=1
 ENV TORCH_BLAS_PREFER_HIPBLASLT=1
