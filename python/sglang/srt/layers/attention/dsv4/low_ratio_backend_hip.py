@@ -425,11 +425,11 @@ def topk_within_candidate_blocks_hip(
     page_size: int,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor],
-    sort: bool = False,
+    sort_output: bool = False,
 ) -> None:
     """Level two for a consumer layer: the top-k of `logits` restricted to the published candidate
     blocks, written as the paged transform writes it (-1 padded, valid prefix first); the caller
-    orders the rows, or asks for it with ``sort`` (the same rows as ``sort_selection_rows`` after,
+    orders the rows, or asks for it with ``sort_output`` (the same rows as ``sort_selection_rows`` after,
     inside the mapping launch; k must be a power of two).
     The top-k runs on the compact candidate row, at most topk_blocks * block_size wide, so the
     consumer's cost stops growing with the context; a row's valid prefix is min(k, reachable
@@ -458,7 +458,7 @@ def topk_within_candidate_blocks_hip(
     if write_raw:
         assert raw_indices.shape == (rows, topk) and raw_indices.stride(1) == 1
         assert raw_indices.stride(0) == page_indices.stride(0)
-    assert not sort or topk & (topk - 1) == 0, topk
+    assert not sort_output or topk & (topk - 1) == 0, topk
     _map_compact_selection_kernel[(rows,)](
         compact_pos,
         candidates.ids,
@@ -475,7 +475,7 @@ def topk_within_candidate_blocks_hip(
         TOPK=topk,
         BLOCK=triton.next_power_of_2(topk),
         WRITE_RAW=write_raw,
-        SORT=sort,
+        SORT=sort_output,
         PAD_KEY=torch.iinfo(torch.int32).max,
     )
 
@@ -740,7 +740,7 @@ def low_ratio_index_topk_hip_decode(
             page_size=indexer_metadata.c4_page_size,
             page_indices=core.sparse_page_indices(ratio),
             raw_indices=core.sparse_raw_indices(ratio),
-            sort=True,
+            sort_output=True,
         )
         return
     if two_level and indexer.is_candidate_source:
@@ -998,7 +998,7 @@ def _select_topk_extend_hip(
                     page_size=page_size,
                     page_indices=rows_page,
                     raw_indices=rows_raw,
-                    sort=True,
+                    sort_output=True,
                 )
         return
     topk_transform_paged_sorted(

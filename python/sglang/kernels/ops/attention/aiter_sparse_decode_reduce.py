@@ -116,22 +116,24 @@ def aiter_sparse_split_reduce(
         return out
     has_sink = attn_sink is not None
     if inv_rope is not None:
-        fr, pos = inv_rope
+        freqs_real, positions = inv_rope
         assert (
-            fr.dtype == torch.float32 and fr.shape[1] == rope_dim and fr.stride(1) == 1
+            freqs_real.dtype == torch.float32
+            and freqs_real.shape[1] == rope_dim
+            and freqs_real.stride(1) == 1
         )
-        assert pos.shape == (T,), pos.shape
+        assert positions.shape == (T,), positions.shape
         assert rope_dim % 2 == 0 and rope_dim <= D
     else:
-        fr = pos = out  # unread placeholders
+        freqs_real = positions = out  # unread placeholders
     _aiter_sparse_decode_reduce_kernel[(T, H)](
         part_m,
         part_l,
         part_acc,
         attn_sink if has_sink else out,
         out,
-        fr,
-        pos,
+        freqs_real,
+        positions,
         part_m.stride(0),
         part_m.stride(1),
         part_acc.stride(0),
@@ -139,7 +141,7 @@ def aiter_sparse_split_reduce(
         part_acc.stride(2),
         out.stride(0),
         out.stride(1),
-        fr.stride(0) if inv_rope is not None else 0,
+        freqs_real.stride(0) if inv_rope is not None else 0,
         NUM_SPLITS=S,
         D=D,
         RD=rope_dim,

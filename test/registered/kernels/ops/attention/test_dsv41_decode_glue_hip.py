@@ -171,7 +171,7 @@ def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bo
                 page_size=page_size,
                 page_indices=page,
                 raw_indices=raw,
-                sort=sort,
+                sort_output=sort,
             )
             if not sort:
                 sort_selection_rows(page, raw)

@@ -406,8 +406,7 @@ def rmsnorm_with_sinkhorn(
     x = _row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
-    c = coefficients
-    assert c.num_rows == M, (c.num_rows, M)
+    assert coefficients.num_rows == M, (coefficients.num_rows, M)
     dev = x.device
     out_fq = (
         torch.empty(
@@ -432,8 +431,8 @@ def rmsnorm_with_sinkhorn(
         quant = None
     if M == 0:
         return quant, out_norm
-    m = 0 if c.materialized else M
-    c.materialized = True
+    m = 0 if coefficients.materialized else M
+    coefficients.materialized = True
     CHUNK = rmsnorm_row_chunk(K)
     _rmsnorm_sinkhorn_kernel[(M + m,)](
         x,
@@ -448,29 +447,29 @@ def rmsnorm_with_sinkhorn(
         out_scale.stride(0) if out_scale is not None else 0,
         eps,
         quant_eps,
-        c.part_mix,
-        c.part_sq,
-        c.scratch,
-        c.hc_scale,
-        c.hc_base,
-        c._pre,
-        c._post,
-        c._comb,
+        coefficients.part_mix,
+        coefficients.part_sq,
+        coefficients.scratch,
+        coefficients.hc_scale,
+        coefficients.hc_base,
+        coefficients._pre,
+        coefficients._post,
+        coefficients._comb,
         M,
         m,
-        1.0 / c.k,
-        c.rms_eps,
+        1.0 / coefficients.k,
+        coefficients.rms_eps,
         WRITE_NORM=out_norm is not None,
         EMIT_FP8=emit_fp8,
         FAKE_QUANT=fake_quant,
         CHUNK=CHUNK,
         NUM_CHUNKS=triton.cdiv(K, CHUNK),
-        MIX=c.mix,
-        HC=c.hc_mult,
-        NUM_SLICES=c.num_slices,
-        SLICES_PAD=triton.next_power_of_2(c.num_slices),
-        ITERS=c.sinkhorn_iters,
-        EPS=c.hc_eps,
+        MIX=coefficients.mix,
+        HC=coefficients.hc_mult,
+        NUM_SLICES=coefficients.num_slices,
+        SLICES_PAD=triton.next_power_of_2(coefficients.num_slices),
+        ITERS=coefficients.sinkhorn_iters,
+        EPS=coefficients.hc_eps,
         num_warps=_HC_SINKHORN_NUM_WARPS,
     )
     return quant, out_norm
@@ -670,20 +669,20 @@ def _hc_boundary_partials(
         return part_mix, part_sq
     if prefill is None:
         prefill = _hc_boundary_use_prefill(m, has_post, has_combine, x)
-    dummy = part_sq
+    placeholder = part_sq
     if prefill:
         mod = _hc_boundary_prefill_module()
         ctas = _hc_boundary_prefill_ctas(triton.cdiv(m, _HC_BOUNDARY_BLOCK_M))
         fn = mod.post_combine if has_post else mod.stats_only
         fn(
-            x if has_post else dummy,
+            x if has_post else placeholder,
             residual,
-            post_in if has_post else dummy,
-            comb_in if has_post else dummy,
-            pre_prev if has_combine else dummy,
+            post_in if has_post else placeholder,
+            comb_in if has_post else placeholder,
+            pre_prev if has_combine else placeholder,
             hc_fn,
-            residual_out if has_post else dummy,
-            y if has_combine else dummy,
+            residual_out if has_post else placeholder,
+            y if has_combine else placeholder,
             part_mix,
             part_sq,
             ctas,
@@ -695,12 +694,12 @@ def _hc_boundary_partials(
     _hc_boundary_partial_kernel[(grid_m, num_slices)](
         x if has_post else residual,
         residual,
-        post_in if has_post else dummy,
-        comb_in if has_post else dummy,
-        pre_prev if has_combine else dummy,
+        post_in if has_post else placeholder,
+        comb_in if has_post else placeholder,
+        pre_prev if has_combine else placeholder,
         hc_fn,
-        residual_out if has_post else dummy,
-        y if has_combine else dummy,
+        residual_out if has_post else placeholder,
+        y if has_combine else placeholder,
         part_mix,
         part_sq,
         m,

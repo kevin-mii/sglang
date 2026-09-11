@@ -51,9 +51,9 @@ def _mask_shape(indices: torch.Tensor, lengths: torch.Tensor) -> Tuple[int, int,
     assert lengths.dim() == 1 and lengths.is_contiguous()
     w = indices.shape[-1]
     rows = indices.numel() // w if w else 0
-    b = lengths.shape[0]
-    assert b > 0 and rows % b == 0, (indices.shape, lengths.shape)
-    return rows, rows // b, w
+    batch = lengths.shape[0]
+    assert batch > 0 and rows % batch == 0, (indices.shape, lengths.shape)
+    return rows, rows // batch, w
 
 
 def mask_indices_by_length(
@@ -209,14 +209,14 @@ def low_ratio_compression_metadata(
             )
     if not out or rows == 0:
         return out
-    dummy = seq_lens_casual
+    placeholder = seq_lens_casual
     _low_ratio_compression_metadata_kernel[(triton.cdiv(rows, 1024),)](
         seq_lens_casual,
         raw_out_loc,
-        out.get("c1_out_loc", dummy),
-        out.get("c1_topk_lengths_clamp1", dummy),
-        out.get("c2_out_loc", dummy),
-        out.get("c2_topk_lengths_clamp1", dummy),
+        out.get("c1_out_loc", placeholder),
+        out.get("c1_topk_lengths_clamp1", placeholder),
+        out.get("c2_out_loc", placeholder),
+        out.get("c2_topk_lengths_clamp1", placeholder),
         rows,
         nw,
         HAS_C1=1 in low_ratios,
@@ -333,7 +333,7 @@ def sparse_buffers(
             out[f"c{ratio}_sparse_page_indices"] = torch.empty((rows, width), **i32)
     if rows == 0:
         return out
-    dummy = out["c4_sparse_topk_lengths"]
+    placeholder = out["c4_sparse_topk_lengths"]
     fill_block = 1024
     per_buffer = triton.cdiv(rows * width, fill_block)
     n_buffers = 1 + int(has_c1) + int(has_c2)
@@ -343,12 +343,12 @@ def sparse_buffers(
         out["c4_sparse_topk_lengths"],
         out["c4_sparse_topk_lengths_raw"],
         out["c4_sparse_page_indices"],
-        c1_topk_lengths_clamp1 if has_c1 else dummy,
-        out.get("c1_sparse_topk_lengths", dummy),
-        out.get("c1_sparse_page_indices", dummy),
-        c2_topk_lengths_clamp1 if has_c2 else dummy,
-        out.get("c2_sparse_topk_lengths", dummy),
-        out.get("c2_sparse_page_indices", dummy),
+        c1_topk_lengths_clamp1 if has_c1 else placeholder,
+        out.get("c1_sparse_topk_lengths", placeholder),
+        out.get("c1_sparse_page_indices", placeholder),
+        c2_topk_lengths_clamp1 if has_c2 else placeholder,
+        out.get("c2_sparse_topk_lengths", placeholder),
+        out.get("c2_sparse_page_indices", placeholder),
         rows,
         index_topk,
         width,
