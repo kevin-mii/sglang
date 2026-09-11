@@ -613,10 +613,10 @@ def _hc_boundary_prefill_available() -> bool:
 def _hc_boundary_prefill_module():
     from sglang.kernels.jit.utils import load_jit
 
-    kernel = "hc_boundary_hip::HcBoundaryPrefillKernel"
+    kernel = "mhc_boundary_hip::HcBoundaryPrefillKernel"
     return load_jit(
-        "hc_boundary_prefill_rocm",
-        cuda_files=["deepseek_v4/hc_boundary_hip.cuh"],
+        "hc_boundary_prefill_hip",
+        cuda_files=["deepseek_v4/mhc_boundary_hip.cuh"],
         cuda_wrappers=[
             ("post_combine", f"{kernel}<true, true>::run"),
             ("stats_only", f"{kernel}<false, false>::run"),

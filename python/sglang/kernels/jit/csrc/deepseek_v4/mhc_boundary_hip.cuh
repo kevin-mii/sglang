@@ -18,7 +18,7 @@
 #include <cstdint>
 
 namespace sglang {
-namespace hc_boundary_hip {
+namespace mhc_boundary_hip {
 
 typedef float f32x2 __attribute__((ext_vector_type(2)));
 typedef float f32x4 __attribute__((ext_vector_type(4)));
@@ -599,5 +599,5 @@ struct HcBoundaryPrefillKernel {
   }
 };
 
-}  // namespace hc_boundary_hip
+}  // namespace mhc_boundary_hip
 }  // namespace sglang
