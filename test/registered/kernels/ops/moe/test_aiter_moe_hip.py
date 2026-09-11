@@ -602,7 +602,7 @@ class TestRocmRouterGateSort(CustomTestCase):
         self.reduce(partials, logits)
         return logits, partials
 
-    def _check(self, num_tokens, topk, block_size, num_local, rank, pad, ties):
+    def _assert_gate_sort_matches_two_launches(self, num_tokens, topk, block_size, num_local, rank, pad, ties):
         msg = f"M={num_tokens} topk={topk} block={block_size} local={num_local}/{rank} pad={pad} ties={ties}"
         mask = self._mask(num_local, rank)
         local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
@@ -687,7 +687,7 @@ class TestRocmRouterGateSort(CustomTestCase):
                     ):
                         for pad in (False, True):
                             for ties in (False, True):
-                                self._check(
+                                self._assert_gate_sort_matches_two_launches(
                                     num_tokens,
                                     topk,
                                     block_size,

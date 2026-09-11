@@ -82,7 +82,7 @@ def _reference(q, sink, sets):
     is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
 )
 class TestAiterSparseBackend(CustomTestCase):
-    def _case(self, batch, heads, swa_lengths, topk_lengths, seed=0):
+    def _assert_matches_reference_and_tilelang(self, batch, heads, swa_lengths, topk_lengths, seed=0):
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
         )
@@ -176,15 +176,15 @@ class TestAiterSparseBackend(CustomTestCase):
             self.assertTrue(torch.equal(again, got))
 
     def test_full_lists_16_heads(self):
-        self._case(1, 16, [128], [512])
+        self._assert_matches_reference_and_tilelang(1, 16, [128], [512])
 
     def test_short_context_lengths(self):
         # a context shorter than the window and the top-k width: the length masks live slots left in the list
-        self._case(3, 16, [101, 128, 5], [100, 512, 1], seed=1)
+        self._assert_matches_reference_and_tilelang(3, 16, [101, 128, 5], [100, 512, 1], seed=1)
 
     def test_padded_heads(self):
         # The model pads the per-rank heads to 64 (zero q, zero sink).
-        self._case(2, 64, [128, 64], [512, 300], seed=2)
+        self._assert_matches_reference_and_tilelang(2, 64, [128, 64], [512, 300], seed=2)
 
     def _real_vs_padded_heads(self, batch, seed):
         """The 16-head call must return bitwise what the padded 64-head call returned on the real heads."""
@@ -496,19 +496,19 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
     def _indptr(n, width):
         return torch.arange(0, (n + 1) * width, width, dtype=torch.int32, device="cuda")
 
-    def _aiter(self, t, kv_splits, skip_reduce):
+    def _aiter(self, inputs, kv_splits, skip_reduce):
         from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
-        n = t["q"].shape[0]
+        n = inputs["q"].shape[0]
         return pa_decode_sparse(
-            t["q"],
-            t["swa_cache"],
-            t["swa_idx"],
+            inputs["q"],
+            inputs["swa_cache"],
+            inputs["swa_idx"],
             self._indptr(n, 128),
-            t["sink"],
+            inputs["sink"],
             SCALE,
-            extra_cache=t["topk_cache"],
-            extra_indices=t["topk_idx"],
+            extra_cache=inputs["topk_cache"],
+            extra_indices=inputs["topk_idx"],
             extra_indptr=self._indptr(n, 512),
             kv_splits=kv_splits,
             skip_reduce=skip_reduce,
@@ -531,15 +531,15 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
             with self.subTest(batch=batch, heads=heads, splits=splits):
                 # Partial lists on the larger batches: some splits come out empty.
                 lens = (128, 512) if batch == 1 else (77, 301)
-                t = self._inputs(batch, heads, seed, *lens)
-                ref = self._aiter(t, splits, skip_reduce=False)
-                acc, m, lsum = self._aiter(t, splits, skip_reduce=True)
+                inputs = self._inputs(batch, heads, seed, *lens)
+                ref = self._aiter(inputs, splits, skip_reduce=False)
+                acc, m, lsum = self._aiter(inputs, splits, skip_reduce=True)
                 self.assertEqual(tuple(acc.shape), (batch, splits, heads, D))
-                got = aiter_sparse_split_reduce(acc, m, lsum, t["sink"])
+                got = aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"])
                 self.assertEqual(got.dtype, torch.bfloat16)
                 self.assertTrue(torch.equal(got, ref))
                 self.assertTrue(
-                    torch.equal(aiter_sparse_split_reduce(acc, m, lsum, t["sink"]), got)
+                    torch.equal(aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"]), got)
                 )
 
     def test_no_sink(self):
@@ -549,8 +549,8 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
             aiter_sparse_split_reduce,
         )
 
-        t = self._inputs(4, 16, 7, 77, 301)
-        args = (t["q"], t["swa_cache"], t["swa_idx"], self._indptr(4, 128), None, SCALE)
+        inputs = self._inputs(4, 16, 7, 77, 301)
+        args = (inputs["q"], inputs["swa_cache"], inputs["swa_idx"], self._indptr(4, 128), None, SCALE)
         ref = pa_decode_sparse(*args, kv_splits=4)
         acc, m, lsum = pa_decode_sparse(*args, kv_splits=4, skip_reduce=True)
         self.assertTrue(torch.equal(aiter_sparse_split_reduce(acc, m, lsum, None), ref))
@@ -568,14 +568,14 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
             (2, 64, 2, torch.int64),
         ]:
             with self.subTest(batch=batch, heads=heads, splits=splits):
-                t = self._inputs(batch, heads, 20 + batch)
-                acc, m, lsum = self._aiter(t, splits, skip_reduce=True)
+                inputs = self._inputs(batch, heads, 20 + batch)
+                acc, m, lsum = self._aiter(inputs, splits, skip_reduce=True)
                 pos = torch.randint(0, 8192, (batch,), device=dev, dtype=pos_dtype)
-                plain = aiter_sparse_split_reduce(acc, m, lsum, t["sink"])
+                plain = aiter_sparse_split_reduce(acc, m, lsum, inputs["sink"])
                 ref = plain.clone()
                 _model_inverse_rope(ref[..., -ROPE:], fr, pos)
                 got = aiter_sparse_split_reduce(
-                    acc, m, lsum, t["sink"], inv_rope=(fr, pos)
+                    acc, m, lsum, inputs["sink"], inv_rope=(fr, pos)
                 )
                 self.assertTrue(torch.equal(got, ref))
                 self.assertTrue(torch.equal(got[..., :-ROPE], plain[..., :-ROPE]))
@@ -602,23 +602,23 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         _, fr = _freqs(dev)
         for batch, heads, seed in [(1, 16, 30), (6, 16, 31), (2, 64, 32)]:
             with self.subTest(batch=batch, heads=heads):
-                t = self._inputs(batch, heads, seed, 77 if batch > 1 else 128, 512)
+                inputs = self._inputs(batch, heads, seed, 77 if batch > 1 else 128, 512)
                 pos = torch.randint(0, 8192, (batch,), device=dev)
                 kwargs = dict(
-                    q=t["q"].unsqueeze(1),
-                    k_cache=t["swa_cache"].unsqueeze(2).view(torch.float8_e4m3fn),
+                    q=inputs["q"].unsqueeze(1),
+                    k_cache=inputs["swa_cache"].unsqueeze(2).view(torch.float8_e4m3fn),
                     head_dim_v=D,
                     block_table=None,
                     cache_seqlens=None,
                     tile_scheduler_metadata=None,
                     softmax_scale=SCALE,
                     is_fp8_kvcache=True,
-                    attn_sink=t["sink"],
-                    indices=t["swa_idx"].view(batch, 1, 128),
-                    extra_k_cache=t["topk_cache"]
+                    attn_sink=inputs["sink"],
+                    indices=inputs["swa_idx"].view(batch, 1, 128),
+                    extra_k_cache=inputs["topk_cache"]
                     .unsqueeze(2)
                     .view(torch.float8_e4m3fn),
-                    extra_indices_in_kvcache=t["topk_idx"].view(batch, 1, 512),
+                    extra_indices_in_kvcache=inputs["topk_idx"].view(batch, 1, 512),
                 )
                 for backend in (
                     ("aiter_sparse", "tilelang") if heads == 64 else ("aiter_sparse",)

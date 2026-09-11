@@ -177,7 +177,7 @@ class TestRmsnormFakeQuantFp8(CustomTestCase):
         torch.testing.assert_close(fused_route, unfused_route, atol=0, rtol=1e-2)
 
 
-def _reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+def _silu_mul_clamp_reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
     g, u = gate_up.float().chunk(2, dim=-1)
     g = g.clamp(max=limit)
     u = u.clamp(min=-limit, max=limit)
@@ -196,7 +196,7 @@ class TestSiluAndMulClampTriton(CustomTestCase):
             (3, 2048, torch.float32),
         ]:
             x = torch.randn(m, 2 * half, device="cuda", dtype=dtype) * 6
-            ref = _reference(x, 10.0)
+            ref = _silu_mul_clamp_reference(x, 10.0)
             out = silu_and_mul_clamp_triton(x, 10.0)
             self.assertEqual(out.shape, ref.shape)
             self.assertEqual(out.dtype, dtype)

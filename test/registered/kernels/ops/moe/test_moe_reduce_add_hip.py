@@ -41,7 +41,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
     def setUp(self):
         from sglang.kernels.ops.moe.moe_reduce_add_hip import moe_topk_reduce_add
 
-        self.fn = moe_topk_reduce_add
+        self.reduce_add = moe_topk_reduce_add
 
     def test_matches_reference(self):
         for m in (1, 6, 33, 384):
@@ -49,7 +49,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
                 x, shared, ids, mask = _inputs(m, m)
                 for use_mask in (True, False):
                     out = torch.empty_like(shared)
-                    self.fn(
+                    self.reduce_add(
                         x,
                         shared,
                         out,
@@ -64,15 +64,15 @@ class TestMoeTopkReduceAdd(CustomTestCase):
     def test_repeatable_and_batch_invariant(self):
         x, shared, ids, mask = _inputs(300, 7)
         full = torch.empty_like(shared)
-        self.fn(x, shared, full, TOPK, ids, mask)
+        self.reduce_add(x, shared, full, TOPK, ids, mask)
         for _ in range(20):
             again = torch.empty_like(shared)
-            self.fn(x, shared, again, TOPK, ids, mask)
+            self.reduce_add(x, shared, again, TOPK, ids, mask)
             self.assertTrue(torch.equal(again, full))
         for rows in ([0], [299], list(range(3, 10)), list(range(0, 300, 7))):
             idx = torch.tensor(rows, device="cuda")
             sub = torch.empty(len(rows), D, device="cuda", dtype=torch.bfloat16)
-            self.fn(
+            self.reduce_add(
                 x.view(300, TOPK, D)[idx].reshape(-1, D).contiguous(),
                 shared[idx].contiguous(),
                 sub,
@@ -85,7 +85,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
     def test_empty(self):
         x, shared, ids, mask = _inputs(0, 0)
         out = torch.empty_like(shared)
-        self.fn(x, shared, out, TOPK, ids, mask)
+        self.reduce_add(x, shared, out, TOPK, ids, mask)
         self.assertEqual(out.shape, (0, D))
 
 

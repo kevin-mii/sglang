@@ -27,18 +27,18 @@ class TestEngramHistoryCommit(CustomTestCase):
                 slots = torch.tensor([8, 1, 5, 2, 10, 0, 7], device="cuda")
                 commit = torch.arange(7, device="cuda", dtype=torch.int32)
 
-                def update():
+                def commit_step():
                     engram_commit_history(history, tokens, slots, commit)
 
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    update()
+                    commit_step()
                 torch.cuda.current_stream().wait_stream(stream)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    update()
+                    commit_step()
                 for _ in range(3):
                     slots.copy_(slots.roll(1))
                     commit.copy_(commit.roll(2))
@@ -92,18 +92,18 @@ class TestEngramHistoryCommit(CustomTestCase):
         slots = torch.tensor([2, 5, 7, 1], device="cuda")
         out_loc = torch.tensor([3, 4, 0, 0], device="cuda")
 
-        def update():
+        def commit_step():
             engram_commit_decode_history(history, tokens, slots, out_loc, 8)
 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            update()
+            commit_step()
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            update()
+            commit_step()
         for _ in range(3):
             tokens.copy_(
                 torch.randint(0, 1000, (4, 4), device="cuda", dtype=torch.int32)
