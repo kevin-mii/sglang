@@ -49,7 +49,7 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
 )
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     build_low_ratio_decode_workspaces,
-    low_ratio_candidate_skip_span,
+    low_ratio_candidate_span,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
     low_ratio_index_topk_hip_decode,
@@ -87,7 +87,7 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 
 
-def _mask_indices_by_length(
+def _fold_lengths_into_index_lists(
     indices: torch.Tensor,
     lengths: Optional[torch.Tensor],
     extra_indices: Optional[torch.Tensor] = None,
@@ -107,12 +107,12 @@ def _mask_indices_by_length(
     second, second_len = (
         (extra_indices, extra_lengths) if indices is not None else (None, None)
     )
-    out, out2 = mask_indices_by_length(
+    masked, masked_second = mask_indices_by_length(
         first.contiguous(), first_len.contiguous(), second, second_len
     )
     if indices is None:
-        return None, out
-    return out, out2 if second is not None else extra_indices
+        return None, masked
+    return masked, masked_second if second is not None else extra_indices
 
 
 def _fold_lengths_for_aiter_sparse(
@@ -135,17 +135,17 @@ def _fold_lengths_for_aiter_sparse(
         None if extra_indices is None else extra_indices.data_ptr(),
         None if extra_indices is None else tuple(extra_indices.shape),
     )
-    hit = cache.get(key)
-    if hit is None:
-        masked, masked_extra = _mask_indices_by_length(
+    folded = cache.get(key)
+    if folded is None:
+        masked, masked_extra = _fold_lengths_into_index_lists(
             swa_page_indices, swa_topk_lengths, extra_indices, extra_topk_lengths
         )
-        hit = (
+        folded = (
             swa_page_indices if masked is None else masked,
             masked_extra,
         )
-        cache[key] = hit
-    return hit
+        cache[key] = folded
+    return folded
 
 
 def _create_flashmla_metadata():
@@ -753,7 +753,7 @@ class DeepseekV4HipRadixBackend(
         )
         # a decode batch whose longest context fits this span skips the candidate-block filter
         self.low_ratio_candidate_span: Optional[int] = (
-            low_ratio_candidate_skip_span(hf_text_config) if self.low_ratios else None
+            low_ratio_candidate_span(hf_text_config) if self.low_ratios else None
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
@@ -836,7 +836,7 @@ class DeepseekV4HipRadixBackend(
 
     def _init_low_ratio_indexer_metadata(
         self, core_attn_metadata: DSV4AttnMetadata, *, is_prefill: bool
-    ) -> dict:
+    ) -> Dict[str, PagedIndexerMetadata]:
         return {
             f"c{ratio}_indexer_metadata": self.init_forward_metadata_indexer(
                 core_attn_metadata, compress_ratio=ratio, is_prefill=is_prefill
@@ -964,7 +964,7 @@ class DeepseekV4HipRadixBackend(
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
-        low_ratio_metadata = (
+        low_ratio_indexer_metadata = (
             self._init_low_ratio_indexer_metadata(
                 core_attn_metadata, is_prefill=not low_ratio_decode_rows
             )
@@ -976,7 +976,7 @@ class DeepseekV4HipRadixBackend(
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
             c128_compress_metadata=create(compress_ratio=128),
-            **low_ratio_metadata,
+            **low_ratio_indexer_metadata,
         )
 
     def init_forward_metadata_target_verify(
@@ -1195,7 +1195,7 @@ class DeepseekV4HipRadixBackend(
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-        low_ratio_metadata = self._init_low_ratio_indexer_metadata(
+        low_ratio_indexer_metadata = self._init_low_ratio_indexer_metadata(
             core_attn_metadata, is_prefill=False
         )
 
@@ -1213,7 +1213,7 @@ class DeepseekV4HipRadixBackend(
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
             c128_compress_metadata=create(compress_ratio=128),
-            **low_ratio_metadata,
+            **low_ratio_indexer_metadata,
         )
 
     def init_forward_metadata_draft_extend(

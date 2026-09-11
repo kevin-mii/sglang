@@ -1236,7 +1236,7 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
         variant inside a graph."""
         import sglang.srt.model_executor.runner_utils.capture_mode as cm
         from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_candidate_skip_span,
+            low_ratio_candidate_span,
             low_ratio_decode_rows_fit_candidate_span,
         )
 
@@ -1245,9 +1245,9 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
             candidate_topk_blocks=TOPK_BLOCKS,
             candidate_block_size=BLOCK_SIZE,
         )
-        self.assertEqual(low_ratio_candidate_skip_span(cfg), SPAN)
+        self.assertEqual(low_ratio_candidate_span(cfg), SPAN)
         self.assertIsNone(
-            low_ratio_candidate_skip_span(
+            low_ratio_candidate_span(
                 SimpleNamespace(
                     candidate_source_layer_id=-1,
                     candidate_topk_blocks=TOPK_BLOCKS,
@@ -1255,7 +1255,7 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
                 )
             )
         )
-        self.assertIsNone(low_ratio_candidate_skip_span(SimpleNamespace()))
+        self.assertIsNone(low_ratio_candidate_span(SimpleNamespace()))
 
         backend = SimpleNamespace(low_ratio_candidate_span=SPAN)
         off = SimpleNamespace(low_ratio_candidate_span=None)

@@ -50,12 +50,12 @@ def _pack_cache(num_tokens_total, num_blocks, device, gen):
 
 
 def _masked(indices, lengths):
-    """One length-folded list; ``_mask_indices_by_length`` returns the (main, extra) pair."""
+    """One length-folded list; ``_fold_lengths_into_index_lists`` returns the (main, extra) pair."""
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-        _mask_indices_by_length,
+        _fold_lengths_into_index_lists,
     )
 
-    return _mask_indices_by_length(indices, lengths)[0]
+    return _fold_lengths_into_index_lists(indices, lengths)[0]
 
 
 def _reference(q, sink, sets):
@@ -256,20 +256,20 @@ class TestAiterSparseBackend(CustomTestCase):
         with envs.SGLANG_HACK_FLASHMLA_BACKEND.override("tilelang"):
             self.assertTrue(hip_attention_needs_head_pad())
 
-    def test_mask_indices_by_length(self):
+    def test_fold_lengths_into_index_lists(self):
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            _mask_indices_by_length,
+            _fold_lengths_into_index_lists,
         )
 
         idx = torch.arange(2 * 1 * 6, dtype=torch.int32, device="cuda").view(2, 1, 6)
-        out, extra = _mask_indices_by_length(
+        out, extra = _fold_lengths_into_index_lists(
             idx, torch.tensor([2, 6], dtype=torch.int32, device="cuda")
         )
         self.assertEqual(out[0, 0].tolist(), [0, 1, -1, -1, -1, -1])
         self.assertEqual(out[1, 0].tolist(), [6, 7, 8, 9, 10, 11])
         self.assertIsNone(extra)
         # no lengths: nothing to fold, the caller keeps its list
-        self.assertEqual(_mask_indices_by_length(idx, None), (None, None))
+        self.assertEqual(_fold_lengths_into_index_lists(idx, None), (None, None))
 
 
 NOPE, ROPE, D = 448, 64, 512

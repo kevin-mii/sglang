@@ -604,7 +604,7 @@ def low_ratio_decode_rows_are_identity(backend, forward_batch, ratio: int) -> bo
     return max_len is not None and max_len // ratio <= backend.index_topk
 
 
-def low_ratio_candidate_skip_span(hf_text_config) -> Optional[int]:
+def low_ratio_candidate_span(hf_text_config) -> Optional[int]:
     """The span (in positions) within which every block of a request is a
     candidate, when the model has a candidate source; None otherwise."""
     # optional HF-config keys: a model without a candidate source lacks them
@@ -755,15 +755,15 @@ def low_ratio_index_topk_hip_extend(
         return
 
     if backend.low_ratio_identity_skip:
-        identity = [
+        is_identity = [
             is_identity_request(s, ratio, indexer.index_topk) for s in seq_lens_cpu
         ]
     else:
-        identity = [False] * len(seq_lens_cpu)
+        is_identity = [False] * len(seq_lens_cpu)
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     consume = backend.candidate_masks if indexer.uses_candidates else None
-    published = [] if indexer.is_candidate_source else None
-    if any(identity):
+    publish = [] if indexer.is_candidate_source else None
+    if any(is_identity):
         # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
         slot_chunks, starts = backend._low_ratio_extend_k_slots(
             ratio=ratio,
@@ -781,8 +781,8 @@ def low_ratio_index_topk_hip_extend(
             rows = slice(tok, tok + t_len)
             tok += t_len
             if lc == 0:
-                if published is not None:
-                    published.append(None)
+                if publish is not None:
+                    publish.append(None)
                 continue
             _fill_identity_request(
                 indexer,
@@ -792,13 +792,13 @@ def low_ratio_index_topk_hip_extend(
                 page_rows=page_indices[rows],
                 raw_rows=None if raw_indices is None else raw_indices[rows],
             )
-            if published is not None:
-                published.append(None)
+            if publish is not None:
+                publish.append(None)
 
-    if all(identity):
+    if all(is_identity):
         fill_identity_requests(0, len(extend_lens_cpu), 0)
-        if published is not None:
-            backend.candidate_masks = published
+        if publish is not None:
+            backend.candidate_masks = publish
         return
 
     indexer_metadata = metadata.low_ratio_indexer_metadata(ratio)
@@ -825,7 +825,7 @@ def low_ratio_index_topk_hip_extend(
             prefill_workspace=prefill_workspace if rows.start == 0 else None,
         )
 
-    def select_rows(rows: slice, req_lo, req_hi, group_identity, consume_rows, publish):
+    def select_rows(rows: slice, req_lo, req_hi, group_is_identity, consume_rows, publish):
         _select_topk_extend_hip(
             indexer=indexer,
             logits=score_rows(rows),
@@ -833,7 +833,7 @@ def low_ratio_index_topk_hip_extend(
             extend_lens_cpu=[rows.stop - rows.start]
             if req_hi == req_lo + 1
             else extend_lens_cpu[req_lo:req_hi],
-            identity=group_identity,
+            is_identity=group_is_identity,
             compress_lens=compress_lens[rows],
             page_table=indexer_metadata.page_table[rows],
             page_size=indexer_metadata.c4_page_size,
@@ -849,8 +849,8 @@ def low_ratio_index_topk_hip_extend(
     )
     groups = _request_groups(extend_lens_cpu, rows_per_chunk)
     for req_lo, req_hi, tok_lo, tok_hi in groups:
-        group_identity = identity[req_lo:req_hi]
-        if all(group_identity):
+        group_is_identity = is_identity[req_lo:req_hi]
+        if all(group_is_identity):
             fill_identity_requests(req_lo, req_hi, tok_lo)
             continue
         if tok_hi - tok_lo <= rows_per_chunk:
@@ -858,9 +858,9 @@ def low_ratio_index_topk_hip_extend(
                 slice(tok_lo, tok_hi),
                 req_lo,
                 req_hi,
-                group_identity,
+                group_is_identity,
                 None if consume is None else consume[req_lo:req_hi],
-                published,
+                publish,
             )
             continue
         # a request wider than the logits block: scored in row chunks, its mask published in one piece
@@ -868,7 +868,7 @@ def low_ratio_index_topk_hip_extend(
         pieces = []
         for lo in range(tok_lo, tok_hi, rows_per_chunk):
             rows = slice(lo, min(lo + rows_per_chunk, tok_hi))
-            piece = [] if published is not None else None
+            piece = [] if publish is not None else None
             consume_rows = None
             if consume is not None:
                 consume_rows = [
@@ -878,13 +878,13 @@ def low_ratio_index_topk_hip_extend(
                         consume[req_lo], slice(lo - tok_lo, rows.stop - tok_lo)
                     )
                 ]
-            select_rows(rows, req_lo, req_hi, group_identity, consume_rows, piece)
+            select_rows(rows, req_lo, req_hi, group_is_identity, consume_rows, piece)
             if piece:
                 pieces.append(piece[0])
-        if published is not None:
-            published.append(cat_candidate_blocks(pieces))
-    if published is not None:
-        backend.candidate_masks = published
+        if publish is not None:
+            publish.append(cat_candidate_blocks(pieces))
+    if publish is not None:
+        backend.candidate_masks = publish
 
 
 def _select_topk_extend_hip(
@@ -893,7 +893,7 @@ def _select_topk_extend_hip(
     logits: torch.Tensor,
     lc_per_req: List[int],
     extend_lens_cpu: List[int],
-    identity: List[bool],
+    is_identity: List[bool],
     compress_lens: torch.Tensor,
     page_table: torch.Tensor,
     page_size: int,
@@ -914,7 +914,7 @@ def _select_topk_extend_hip(
         for b, (lc, t_len) in enumerate(zip(lc_per_req, extend_lens_cpu)):
             rows = slice(tok_start, tok_start + t_len)
             tok_start += t_len
-            if lc == 0 or t_len == 0 or identity[b]:
+            if lc == 0 or t_len == 0 or is_identity[b]:
                 # Consumers index the publication by request, so keep the slot.
                 publish.append(None)
                 continue
