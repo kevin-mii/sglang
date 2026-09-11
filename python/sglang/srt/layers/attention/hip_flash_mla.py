@@ -137,9 +137,9 @@ def hip_attention_needs_head_pad() -> bool:
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         # a caller may name one HIP kernel per forward mode; CUDA names fall back to the HIP default
-        if backend not in _HIP_BACKENDS:
-            backend = resolve_hip_flashmla_backend()
-        backend = resolve_hip_flashmla_backend(backend)
+        backend = resolve_hip_flashmla_backend(
+            backend if backend in _HIP_BACKENDS else None
+        )
         if backend != "aiter_sparse" and kwargs.get("inv_rope") is not None:
             # only the aiter kernel folds the inverse RoPE into its combine; apply it here for the rest
             inv_rope = kwargs.pop("inv_rope")

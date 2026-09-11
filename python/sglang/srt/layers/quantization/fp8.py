@@ -1225,11 +1225,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer, x.x, bias, input_on_fp8_grid=True
                 )
             x = x.x
+        x, input_scale = x if isinstance(x, tuple) else (x, None)
         if native_route:
-            if isinstance(x, tuple):
-                return self._apply_gfx95_native(layer, x[0], bias, input_scale=x[1])
-            return self._apply_gfx95_native(layer, x, bias)
-        if mxfp8_ready and not isinstance(x, tuple):
+            return self._apply_gfx95_native(layer, x, bias, input_scale=input_scale)
+        if mxfp8_ready and input_scale is None:
             return self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -1238,21 +1237,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         # a shape the gfx950 kernels do not tile, or a pre-quantized tuple off the native route
-        if isinstance(x, tuple):
-            return self.w8a8_block_fp8_linear(
-                input=x[0],
-                weight=layer.weight,
-                block_size=self.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
-                input_scale=x[1],
-                bias=bias,
-            )
         return self.w8a8_block_fp8_linear(
             input=x,
             weight=layer.weight,
             block_size=self.weight_block_size,
             weight_scale=layer.weight_scale_inv,
-            input_scale=None,
+            input_scale=input_scale,
             bias=bias,
         )
 

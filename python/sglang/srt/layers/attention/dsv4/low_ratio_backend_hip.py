@@ -457,16 +457,20 @@ def topk_within_candidate_blocks_hip(
     )
 
 
-def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
-    """`indexer.head_weights(x)` as the contiguous bf16 [T, H] the FlyDSL kernels take; decode row
-    counts run `rocm_indexer_head_weights` (same two roundings as aiter's GEMM plus the scale)."""
-    max_m = indexer.weights_proj_hip_max_tokens
-    if (
-        0 < x.shape[0] <= max_m
+def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
+    """Row counts `rocm_indexer_head_weights` / the split-K GEMV serve: a small contiguous bf16 batch."""
+    return (
+        0 < x.shape[0] <= indexer.weights_proj_hip_max_tokens
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.stride(1) == 1
-    ):
+    )
+
+
+def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
+    """`indexer.head_weights(x)` as the contiguous bf16 [T, H] the FlyDSL kernels take; decode row
+    counts run `rocm_indexer_head_weights` (same two roundings as aiter's GEMM plus the scale)."""
+    if _gemv_head_weight_rows(indexer, x):
         return rocm_indexer_head_weights(
             x, indexer.weights_proj.weight, indexer.head_weight_scale
         )
@@ -478,12 +482,8 @@ def _indexer_inputs(layer, x, q_lora, pos):
     indexer = layer.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    num_tokens = x.shape[0]
     if (
-        0 < num_tokens <= indexer.weights_proj_hip_max_tokens
-        and x.dim() == 2
-        and x.dtype == torch.bfloat16
-        and x.stride(1) == 1
+        _gemv_head_weight_rows(indexer, x)
         and indexer.n_heads % 16 == 0
         and indexer.n_heads <= 64
         and indexer.index_head_dim == 128
