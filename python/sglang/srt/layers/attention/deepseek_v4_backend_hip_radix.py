@@ -554,20 +554,18 @@ class DSV4AttnMetadata:
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
         ).items():
             setattr(self, name, value)
-        if is_prefill:
-            self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
+        # Decode too: without raw indices the AOT top-k orders a row by slot, so the
+        # sparse kernel's summation order follows the physical pages a request landed
+        # on (a radix prefix hit moves them), and the same context gives different bits.
+        self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
         if 1 in self.low_ratios:
-            self.c1_sparse_raw_indices = (
-                torch.empty_like(self.c1_sparse_page_indices) if is_prefill else None
-            )
+            self.c1_sparse_raw_indices = torch.empty_like(self.c1_sparse_page_indices)
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            self.c2_sparse_raw_indices = (
-                torch.empty_like(self.c2_sparse_page_indices) if is_prefill else None
-            )
+            self.c2_sparse_raw_indices = torch.empty_like(self.c2_sparse_page_indices)
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
