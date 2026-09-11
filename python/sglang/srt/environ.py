@@ -889,6 +889,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # DSV4.1 mHC on gfx950: the sublayer boundary's reduce + sinkhorn rides in the
+    # layer's next RMSNorm launch (rmsnorm_with_sinkhorn) instead of its own launch.
+    # Set to 0 to launch it alone (A/B; the values are bitwise the same).
+    SGLANG_OPT_HIP_HOSTED_SINKHORN = EnvBool(True)
 
     # ===================================================================
     # Apple Silicon and MLX

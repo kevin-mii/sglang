@@ -1,8 +1,11 @@
 import logging
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import triton
+
+if TYPE_CHECKING:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -433,14 +436,17 @@ def hc_boundary(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, "HcCoefficients"]:
     """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto
     ``residual`` (when given), collapse the new residual with ``pre_prev``
-    (copy 0 when None) and compute its mixing coefficients. Returns
-    (new_residual, y, pre, post, comb)."""
-    from sglang.kernels.ops.layernorm.mhc_boundary_hip import hc_boundary_fused
+    (copy 0 when None) and take its mixing statistics. Returns (new_residual, y,
+    coefficients); the coefficients' reduce + sinkhorn is still pending and rides in
+    the norm launch that follows (see ``HcCoefficients``)."""
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_boundary_fused_deferred,
+    )
 
-    new_residual, y, pre, post, comb = hc_boundary_fused(
+    new_residual, y, coefficients = hc_boundary_fused_deferred(
         x,
         residual,
         post,
@@ -454,11 +460,13 @@ def hc_boundary(
         layer.rms_norm_eps,
         layer.hc_eps,
     )
+    if not envs.SGLANG_OPT_HIP_HOSTED_SINKHORN.get():
+        coefficients.materialize()
     if new_residual is None:
         new_residual = residual
     if y is None:
         y = new_residual[:, 0, :].contiguous()
-    return new_residual, y, pre, post, comb
+    return new_residual, y, coefficients
 
 
 def forward_hc_pre_from_prev_fused_boundary(
@@ -478,7 +486,7 @@ def forward_hc_pre_from_prev_fused_boundary(
     post, comb)`` (``hidden_states`` is then unused); with ``defer_post`` this layer's
     is returned the same way and the returned ``hidden_states`` is None."""
     if pending_post is not None:
-        residual, x, attn_pre, attn_post, attn_comb = hc_boundary(
+        residual, x, attn_coefficients = hc_boundary(
             layer,
             *pending_post,
             prev_pre,
@@ -487,7 +495,7 @@ def forward_hc_pre_from_prev_fused_boundary(
             layer.hc_attn_base,
         )
     else:
-        residual, x, attn_pre, attn_post, attn_comb = hc_boundary(
+        residual, x, attn_coefficients = hc_boundary(
             layer,
             None,
             hidden_states,
@@ -498,26 +506,44 @@ def forward_hc_pre_from_prev_fused_boundary(
             layer.hc_attn_scale,
             layer.hc_attn_base,
         )
-    x, x_quant = layer._input_norm(x, allow_aiter_quant=False)
+    # the boundary's reduce + sinkhorn rides in the norm launch
+    x, x_quant = layer._input_norm(
+        x, allow_aiter_quant=False, sinkhorn=attn_coefficients
+    )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         x = layer.self_attn(
             x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
         )
-    residual, x, ffn_pre, ffn_post, ffn_comb = hc_boundary(
+    residual, x, ffn_coefficients = hc_boundary(
         layer,
         x,
         residual,
-        attn_post,
-        attn_comb,
-        attn_pre,
+        attn_coefficients.post,
+        attn_coefficients.comb,
+        attn_coefficients.pre,
         layer.hc_ffn_fn,
         layer.hc_ffn_scale,
         layer.hc_ffn_base,
     )
-    x = layer.post_attention_layernorm(x)
+    x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
     x = layer._run_moe_ffn_dp_sync(
         x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
     )
+    ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None
+
+
+def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
+    """``layer.post_attention_layernorm(x)`` hosting the pending reduce + sinkhorn where
+    the gfx950 norm kernel is available; the module norm plus a standalone reduce +
+    sinkhorn elsewhere."""
+    if _is_gfx95_supported:
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+            post_attention_norm,
+        )
+
+        return post_attention_norm(layer, x, coefficients)
+    coefficients.materialize()
+    return layer.post_attention_layernorm(x)

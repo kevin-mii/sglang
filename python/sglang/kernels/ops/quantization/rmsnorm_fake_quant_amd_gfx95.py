@@ -24,7 +24,8 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
 
 
 @triton.jit
-def _rmsnorm_fake_quant_fp8_kernel(
+def rmsnorm_fake_quant_row(
+    row,
     x_ptr,
     w_ptr,
     res_ptr,
@@ -42,12 +43,14 @@ def _rmsnorm_fake_quant_fp8_kernel(
     HAS_RESIDUAL: tl.constexpr,
     WRITE_NORM: tl.constexpr,
     EMIT_FP8: tl.constexpr,
+    FAKE_QUANT: tl.constexpr,
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
 ):
-    """One program per row: (residual add,) RMSNorm in fp32, bf16 rounding, then
-    the per-32 ue8m0 fp8 e4m3 quantize-dequantize of ``fake_quant_fp8_activation``."""
-    row = tl.program_id(0).to(tl.int64)
+    """One row: (residual add,) RMSNorm in fp32, bf16 rounding, then, with ``FAKE_QUANT``,
+    the per-32 ue8m0 fp8 e4m3 quantize-dequantize of ``fake_quant_fp8_activation``. Shared
+    by the standalone kernel below and the kernels that host a norm row next to other work
+    (the mHC boundary's reduce + sinkhorn)."""
     base = tl.arange(0, CHUNK)
     x_row = x_ptr + row * stride_xm
     res_row = res_ptr + row * stride_rm
@@ -79,26 +82,83 @@ def _rmsnorm_fake_quant_fp8_kernel(
         y = (x * rstd * w).to(out_norm_ptr.dtype.element_ty)
         if WRITE_NORM:
             tl.store(out_norm_ptr + row * stride_nm + offs, y, mask=mask)
-        yg = tl.reshape(y.to(tl.float32), (CHUNK // 32, 32))
-        if EMIT_FP8:
-            # fp8 codes plus ue8m0 exponent: the native MXFP8 operand, dequantizing exactly to the fake-quant below
-            q8, e8 = fp8_grid_quant(yg, quant_eps)
-            tl.store(
-                out_fq_ptr + row * stride_fm + offs, tl.reshape(q8, (CHUNK,)), mask=mask
-            )
-            goffs = c * (CHUNK // 32) + tl.arange(0, CHUNK // 32)
-            tl.store(
-                out_scale_ptr + row * stride_sm + goffs,
-                e8.to(tl.uint8),
-                mask=goffs < K // 32,
-            )
-        else:
-            q = fp8_grid_round(yg, quant_eps)
-            tl.store(
-                out_fq_ptr + row * stride_fm + offs,
-                tl.reshape(q, (CHUNK,)).to(out_fq_ptr.dtype.element_ty),
-                mask=mask,
-            )
+        if FAKE_QUANT:
+            yg = tl.reshape(y.to(tl.float32), (CHUNK // 32, 32))
+            if EMIT_FP8:
+                # fp8 codes plus ue8m0 exponent: the native MXFP8 operand, dequantizing exactly to the fake-quant below
+                q8, e8 = fp8_grid_quant(yg, quant_eps)
+                tl.store(
+                    out_fq_ptr + row * stride_fm + offs,
+                    tl.reshape(q8, (CHUNK,)),
+                    mask=mask,
+                )
+                goffs = c * (CHUNK // 32) + tl.arange(0, CHUNK // 32)
+                tl.store(
+                    out_scale_ptr + row * stride_sm + goffs,
+                    e8.to(tl.uint8),
+                    mask=goffs < K // 32,
+                )
+            else:
+                q = fp8_grid_round(yg, quant_eps)
+                tl.store(
+                    out_fq_ptr + row * stride_fm + offs,
+                    tl.reshape(q, (CHUNK,)).to(out_fq_ptr.dtype.element_ty),
+                    mask=mask,
+                )
+
+
+@triton.jit
+def _rmsnorm_fake_quant_fp8_kernel(
+    x_ptr,
+    w_ptr,
+    res_ptr,
+    out_fq_ptr,
+    out_norm_ptr,
+    out_scale_ptr,
+    K,
+    stride_xm,
+    stride_rm,
+    stride_fm,
+    stride_nm,
+    stride_sm,
+    eps,
+    quant_eps,
+    HAS_RESIDUAL: tl.constexpr,
+    WRITE_NORM: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+):
+    """One program per row of ``rmsnorm_fake_quant_row``."""
+    rmsnorm_fake_quant_row(
+        tl.program_id(0).to(tl.int64),
+        x_ptr,
+        w_ptr,
+        res_ptr,
+        out_fq_ptr,
+        out_norm_ptr,
+        out_scale_ptr,
+        K,
+        stride_xm,
+        stride_rm,
+        stride_fm,
+        stride_nm,
+        stride_sm,
+        eps,
+        quant_eps,
+        HAS_RESIDUAL=HAS_RESIDUAL,
+        WRITE_NORM=WRITE_NORM,
+        EMIT_FP8=EMIT_FP8,
+        FAKE_QUANT=True,
+        CHUNK=CHUNK,
+        NUM_CHUNKS=NUM_CHUNKS,
+    )
+
+
+def rmsnorm_row_chunk(K: int) -> int:
+    """The per-row chunk of ``rmsnorm_fake_quant_row``: it depends on K alone, so the
+    reduction tree, and a row's result, is the same at every batch size."""
+    return min(max(32, triton.next_power_of_2(K)), 2048)
 
 
 def _row_major_2d(x: torch.Tensor) -> torch.Tensor:
@@ -152,8 +212,7 @@ def rmsnorm_fake_quant_fp8(
 
     if M == 0:
         return wrap(), out_norm
-    # the chunk (and so the reduction tree) depends on K alone, so a row's result is the same at every batch size
-    CHUNK = min(max(32, triton.next_power_of_2(K)), 2048)
+    CHUNK = rmsnorm_row_chunk(K)
     _rmsnorm_fake_quant_fp8_kernel[(M,)](
         x,
         weight,

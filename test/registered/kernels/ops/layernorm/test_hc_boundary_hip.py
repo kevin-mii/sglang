@@ -1,7 +1,9 @@
 """The ROCm fused mHC sublayer boundary (``hc_boundary_fused``) must match the torch forms it
-replaces, the reduce/sinkhorn kernel must match an fp64 reference, and the gfx950 prefill regime
+replaces, the reduce/sinkhorn kernel must match an fp64 reference, the gfx950 prefill regime
 (``_hc_boundary_partials(..., prefill=True)``) must give bitwise the Triton decode kernel's raw
-partials for every row at every M, so a row alone equals the same row inside a prefill batch.
+partials for every row at every M, so a row alone equals the same row inside a prefill batch,
+and the norm launch that hosts the pending reduce + sinkhorn (``rmsnorm_with_sinkhorn``) must
+give bitwise the two standalone launches.
 """
 
 import unittest
@@ -211,6 +213,107 @@ class TestHcBoundaryFused(CustomTestCase):
         self.assertEqual(res_out.shape, (0, HC, H))
         self.assertEqual(y.shape, (0, H))
         self.assertEqual(comb.shape, (0, HC, HC))
+
+
+@unittest.skipUnless(_IS_HIP, "rmsnorm_with_sinkhorn is the ROCm path")
+class TestRmsnormWithSinkhorn(CustomTestCase):
+    """The norm launch hosting the boundary's reduce + sinkhorn."""
+
+    def setUp(self):
+        from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+            hc_boundary_fused,
+            hc_boundary_fused_deferred,
+            rmsnorm_with_sinkhorn,
+        )
+        from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+            rmsnorm_fake_quant_fp8,
+        )
+
+        self.fused = hc_boundary_fused
+        self.deferred = hc_boundary_fused_deferred
+        self.hosted = rmsnorm_with_sinkhorn
+        self.norm = rmsnorm_fake_quant_fp8
+        self.hc_fn, self.hc_scale, self.hc_base = _params("cuda")
+        self.weight = (torch.rand(H, device="cuda") + 0.5).to(torch.bfloat16)
+
+    def _boundary(self, fn, m, seed):
+        torch.manual_seed(seed)
+        residual = torch.randn(m, HC, H, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(m, H, device="cuda", dtype=torch.bfloat16)
+        pre_prev, post_in, comb_in = hc_mix_stats_sinkhorn(
+            residual.flatten(1),
+            self.hc_fn,
+            self.hc_scale,
+            self.hc_base,
+            HC,
+            ITERS,
+            RMS_EPS,
+            HC_EPS,
+        )
+        return fn(
+            x,
+            residual,
+            post_in,
+            comb_in,
+            pre_prev,
+            self.hc_fn,
+            self.hc_scale,
+            self.hc_base,
+            HC,
+            ITERS,
+            RMS_EPS,
+            HC_EPS,
+        )
+
+    def test_matches_standalone_launches(self):
+        for m in (1, 6, 33, 300, 1100):
+            for emit_fp8 in (False, True):
+                res, y, pre, post, comb = self._boundary(self.fused, m, m)
+                quant, norm = self.norm(y, self.weight, 1e-6, emit_fp8=emit_fp8)
+                res2, y2, coefficients = self._boundary(self.deferred, m, m)
+                self.assertFalse(coefficients.materialized)
+                quant2, norm2 = self.hosted(
+                    y2, self.weight, 1e-6, coefficients, emit_fp8=emit_fp8
+                )
+                self.assertTrue(coefficients.materialized)
+                self.assertTrue(_all_equal((res, y, norm), (res2, y2, norm2)))
+                self.assertTrue(_all_equal((pre, post, comb), coefficients.tensors()))
+                if emit_fp8:
+                    self.assertTrue(torch.equal(quant.q, quant2.q))
+                    self.assertTrue(torch.equal(quant.scale, quant2.scale))
+                else:
+                    self.assertTrue(torch.equal(quant.x, quant2.x))
+
+    def test_norm_only(self):
+        res, y, pre, post, comb = self._boundary(self.fused, 9, 3)
+        _, norm = self.norm(y, self.weight, 1e-6)
+        _, _, coefficients = self._boundary(self.deferred, 9, 3)
+        quant2, norm2 = self.hosted(
+            y, self.weight, 1e-6, coefficients, fake_quant=False
+        )
+        self.assertIsNone(quant2)
+        self.assertTrue(torch.equal(norm, norm2))
+        self.assertTrue(_all_equal((pre, post, comb), coefficients.tensors()))
+
+    def test_materialize_on_access_then_norm_alone(self):
+        res, y, pre, post, comb = self._boundary(self.fused, 5, 11)
+        _, _, coefficients = self._boundary(self.deferred, 5, 11)
+        # first access runs the standalone reduce + sinkhorn once
+        self.assertTrue(torch.equal(coefficients.comb, comb))
+        self.assertTrue(coefficients.materialized)
+        self.assertTrue(_all_equal((pre, post), (coefficients.pre, coefficients.post)))
+        # a norm launch given materialized coefficients only runs the norm rows
+        _, norm = self.norm(y, self.weight, 1e-6)
+        quant2, norm2 = self.hosted(y, self.weight, 1e-6, coefficients)
+        self.assertTrue(torch.equal(norm, norm2))
+        self.assertTrue(_all_equal((pre, post, comb), coefficients.tensors()))
+
+    def test_empty(self):
+        _, y, coefficients = self._boundary(self.deferred, 0, 0)
+        self.assertTrue(coefficients.materialized)
+        quant, norm = self.hosted(y, self.weight, 1e-6, coefficients)
+        self.assertEqual(norm.shape, (0, H))
+        self.assertEqual(coefficients.comb.shape, (0, HC, HC))
 
 
 HC, H = 4, 5120

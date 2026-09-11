@@ -33,7 +33,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 Fp8GridActivation = None
 Mxfp8Activation = None
 rmsnorm_fake_quant_fp8 = None
+rmsnorm_with_sinkhorn = None
 if _is_hip and _is_gfx95_supported:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
         Fp8GridActivation,
         Mxfp8Activation,
@@ -144,13 +146,17 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
 
 
 def input_norm_fake_quant(
-    layer, hidden_states: torch.Tensor
+    layer, hidden_states: torch.Tensor, sinkhorn=None
 ) -> Tuple[torch.Tensor, Optional[object]]:
     """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the
     operand of its dense projections already on the fp8 grid, or None when the rows are
-    not a 2-D bf16 batch)."""
+    not a 2-D bf16 batch). ``sinkhorn`` (``HcCoefficients`` of the boundary that produced
+    ``hidden_states``) rides in the norm launch when the fused kernel runs, else it is
+    materialized here."""
     norm = layer.input_layernorm
     if not _fake_quant_applies(norm, hidden_states):
+        if sinkhorn is not None:
+            sinkhorn.materialize()
         return norm(hidden_states), None
     if not layer._wqkv_a_native_consumer_checked:
         # wqkv_a exists only when the q / kv projections are fused
@@ -158,15 +164,43 @@ def input_norm_fake_quant(
             getattr(layer.self_attn, "wqkv_a", None)
         )
         layer._wqkv_a_native_consumer_checked = True
+    emit_fp8 = _emit_native_fp8(layer._wqkv_a_native_consumer, hidden_states.shape[0])
+    if sinkhorn is not None and not sinkhorn.materialized:
+        x_quant, hidden_states = rmsnorm_with_sinkhorn(
+            hidden_states,
+            norm.weight.data,
+            norm.variance_epsilon,
+            sinkhorn,
+            emit_fp8=emit_fp8,
+        )
+        return hidden_states, x_quant
     x_quant, hidden_states = rmsnorm_fake_quant_fp8(
         hidden_states,
         norm.weight.data,
         norm.variance_epsilon,
-        emit_fp8=_emit_native_fp8(
-            layer._wqkv_a_native_consumer, hidden_states.shape[0]
-        ),
+        emit_fp8=emit_fp8,
     )
     return hidden_states, x_quant
+
+
+def post_attention_norm(layer, x: torch.Tensor, sinkhorn=None) -> torch.Tensor:
+    """`layer.post_attention_layernorm(x)`; with ``sinkhorn`` (``HcCoefficients`` of the
+    boundary that produced ``x``) still pending, the reduce + sinkhorn rides in the norm
+    launch, which then is the Triton row norm rather than the aiter one."""
+    norm = layer.post_attention_layernorm
+    if (
+        sinkhorn is None
+        or sinkhorn.materialized
+        or rmsnorm_with_sinkhorn is None
+        or not _fake_quant_applies(norm, x)
+    ):
+        if sinkhorn is not None:
+            sinkhorn.materialize()
+        return norm(x)
+    _, out = rmsnorm_with_sinkhorn(
+        x, norm.weight.data, norm.variance_epsilon, sinkhorn, fake_quant=False
+    )
+    return out
 
 
 def live_rows(activation, num_tokens: int):

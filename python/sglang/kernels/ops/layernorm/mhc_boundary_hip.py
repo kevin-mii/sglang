@@ -1,15 +1,24 @@
 """HIP fused mHC sublayer boundary: `hc_boundary_fused`, hc_post + collapse +
 mixing statistics in one launch, then the reduce + sinkhorn kernel shared with
-`hc_mix_stats_sinkhorn`."""
+`hc_mix_stats_sinkhorn`. `hc_boundary_fused_deferred` leaves the reduce + sinkhorn
+as `HcCoefficients`, which the layer's next RMSNorm launch hosts
+(`rmsnorm_with_sinkhorn`) so decode pays no separate launch for it."""
 
 import functools
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _IS_HIP
+from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+    _row_major_2d,
+    rmsnorm_fake_quant_row,
+    rmsnorm_row_chunk,
+)
 from sglang.srt.utils.common import is_gfx95_supported
 
 # a CTA owns every HC copy of its tile, so a row's fp32 operation sequence depends on (H, HC), never on M
@@ -17,10 +26,13 @@ _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
+# the reduce + sinkhorn row runs with the norm kernel's warps whether it is hosted there or launched alone
+_HC_SINKHORN_NUM_WARPS = 4
 
 
 @triton.jit
-def _hc_mix_reduce_sinkhorn_vec_kernel(
+def _hc_mix_reduce_sinkhorn_row(
+    row,
     part_mix_ptr,
     part_sq_ptr,
     scratch_ptr,
@@ -39,13 +51,11 @@ def _hc_mix_reduce_sinkhorn_vec_kernel(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """HIP form of ``_hc_mix_reduce_sinkhorn_kernel``: one vector load per operand over all
-    slices; the tree order depends on NUM_SLICES only, never on M. ``scratch_ptr`` ([m, 32] fp32)
-    round-trips the reduced mixes so the sinkhorn starts from a plain blocked layout.
+    """HIP form of ``_hc_mix_reduce_sinkhorn_kernel`` for one row: one vector load per operand
+    over all slices; the tree order depends on NUM_SLICES only, never on M. ``scratch_ptr``
+    ([m, 32] fp32) round-trips the reduced mixes so the sinkhorn starts from a plain blocked
+    layout.
     """
-    row = tl.program_id(0)
-    if row >= m:
-        return
     j = tl.arange(0, HC)
     jj = j[:, None]
     kk = j[None, :]
@@ -111,6 +121,140 @@ def _hc_mix_reduce_sinkhorn_vec_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+@triton.jit
+def _hc_mix_reduce_sinkhorn_vec_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scratch_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """One program per row of ``_hc_mix_reduce_sinkhorn_row``."""
+    _hc_mix_reduce_sinkhorn_row(
+        tl.program_id(0),
+        part_mix_ptr,
+        part_sq_ptr,
+        scratch_ptr,
+        scale_ptr,
+        base_ptr,
+        pre_ptr,
+        post_ptr,
+        comb_ptr,
+        m,
+        inv_k,
+        rms_eps,
+        MIX=MIX,
+        HC=HC,
+        NUM_SLICES=NUM_SLICES,
+        SLICES_PAD=SLICES_PAD,
+        ITERS=ITERS,
+        EPS=EPS,
+    )
+
+
+@triton.jit
+def _rmsnorm_sinkhorn_kernel(
+    x_ptr,
+    w_ptr,
+    out_fq_ptr,
+    out_norm_ptr,
+    out_scale_ptr,
+    K,
+    stride_xm,
+    stride_fm,
+    stride_nm,
+    stride_sm,
+    eps,
+    quant_eps,
+    part_mix_ptr,
+    part_sq_ptr,
+    scratch_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    M,
+    m,
+    inv_k,
+    rms_eps,
+    WRITE_NORM: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
+    FAKE_QUANT: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    SLICES_PAD: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Grid (M + m,): programs [0, M) are ``rmsnorm_fake_quant_row`` on the norm's rows,
+    programs [M, M + m) are ``_hc_mix_reduce_sinkhorn_row`` on the pending boundary's rows.
+    The two are independent per-row work that decode would otherwise launch back to back;
+    hosting them in one launch removes a launch from the critical path while each row keeps
+    its standalone kernel's arithmetic (same tiles, same warps)."""
+    pid = tl.program_id(0)
+    if pid < M:
+        rmsnorm_fake_quant_row(
+            pid.to(tl.int64),
+            x_ptr,
+            w_ptr,
+            x_ptr,
+            out_fq_ptr,
+            out_norm_ptr,
+            out_scale_ptr,
+            K,
+            stride_xm,
+            0,
+            stride_fm,
+            stride_nm,
+            stride_sm,
+            eps,
+            quant_eps,
+            HAS_RESIDUAL=False,
+            WRITE_NORM=WRITE_NORM,
+            EMIT_FP8=EMIT_FP8,
+            FAKE_QUANT=FAKE_QUANT,
+            CHUNK=CHUNK,
+            NUM_CHUNKS=NUM_CHUNKS,
+        )
+    else:
+        _hc_mix_reduce_sinkhorn_row(
+            pid - M,
+            part_mix_ptr,
+            part_sq_ptr,
+            scratch_ptr,
+            scale_ptr,
+            base_ptr,
+            pre_ptr,
+            post_ptr,
+            comb_ptr,
+            m,
+            inv_k,
+            rms_eps,
+            MIX=MIX,
+            HC=HC,
+            NUM_SLICES=NUM_SLICES,
+            SLICES_PAD=SLICES_PAD,
+            ITERS=ITERS,
+            EPS=EPS,
+        )
+
+
 def hc_mix_reduce_sinkhorn_vec(
     part_mix: torch.Tensor,
     part_sq: torch.Tensor,
@@ -150,8 +294,188 @@ def hc_mix_reduce_sinkhorn_vec(
         SLICES_PAD=triton.next_power_of_2(num_slices),
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
-        num_warps=1,
+        num_warps=_HC_SINKHORN_NUM_WARPS,
     )
+
+
+class HcCoefficients:
+    """One boundary's mixing coefficients, held as the split-K partials of
+    ``_hc_boundary_partials`` until their reduce + sinkhorn runs: hosted by the layer's
+    next norm launch (``rmsnorm_with_sinkhorn``) or, on first access of ``pre`` /
+    ``post`` / ``comb``, launched alone (``materialize``)."""
+
+    def __init__(
+        self,
+        part_mix: torch.Tensor,
+        part_sq: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        *,
+        k: int,
+        rms_eps: float,
+        mix: int,
+        hc_mult: int,
+        num_slices: int,
+        sinkhorn_iters: int,
+        hc_eps: float,
+    ):
+        m = part_sq.shape[1]
+        dev = part_mix.device
+        self.part_mix = part_mix
+        self.part_sq = part_sq
+        self.hc_scale = hc_scale.float().contiguous()
+        self.hc_base = hc_base.float().contiguous()
+        self.k = k
+        self.rms_eps = rms_eps
+        self.mix = mix
+        self.hc_mult = hc_mult
+        self.num_slices = num_slices
+        self.sinkhorn_iters = sinkhorn_iters
+        self.hc_eps = hc_eps
+        self.num_rows = m
+        self._pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+        self._post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+        self._comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
+        # layout round trip for the reduce + sinkhorn row (see its docstring)
+        self.scratch = torch.empty((m, 32), dtype=torch.float32, device=dev)
+        self.materialized = m == 0
+
+    def materialize(self) -> None:
+        """Run the reduce + sinkhorn alone unless a norm launch already hosted it."""
+        if self.materialized:
+            return
+        self.materialized = True
+        _hc_mix_reduce_sinkhorn_vec_kernel[(self.num_rows,)](
+            self.part_mix,
+            self.part_sq,
+            self.scratch,
+            self.hc_scale,
+            self.hc_base,
+            self._pre,
+            self._post,
+            self._comb,
+            self.num_rows,
+            1.0 / self.k,
+            self.rms_eps,
+            MIX=self.mix,
+            HC=self.hc_mult,
+            NUM_SLICES=self.num_slices,
+            SLICES_PAD=triton.next_power_of_2(self.num_slices),
+            ITERS=self.sinkhorn_iters,
+            EPS=self.hc_eps,
+            num_warps=_HC_SINKHORN_NUM_WARPS,
+        )
+
+    @property
+    def pre(self) -> torch.Tensor:
+        self.materialize()
+        return self._pre
+
+    @property
+    def post(self) -> torch.Tensor:
+        self.materialize()
+        return self._post
+
+    @property
+    def comb(self) -> torch.Tensor:
+        self.materialize()
+        return self._comb
+
+    def tensors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.pre, self.post, self.comb
+
+
+def rmsnorm_with_sinkhorn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    coefficients: HcCoefficients,
+    *,
+    return_norm: bool = True,
+    quant_eps: float = 1e-10,
+    emit_fp8: bool = False,
+    fake_quant: bool = True,
+) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation, None], Optional[torch.Tensor]]:
+    """``rmsnorm_fake_quant_fp8(x, weight, eps)`` (the plain bf16 RMSNorm when ``fake_quant`` is
+    False) with the pending reduce + sinkhorn of ``coefficients`` in the same launch. ``x`` is
+    the ``[M, K]`` collapsed sublayer input the boundary produced from the rows the coefficients
+    belong to. Returns ``(fake_quant, norm)`` as ``rmsnorm_fake_quant_fp8`` does; ``fake_quant``
+    is None without the quant."""
+    assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
+    assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
+    assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
+    assert return_norm or fake_quant, "nothing to produce"
+    x = _row_major_2d(x)
+    weight = weight.contiguous()
+    M, K = x.shape
+    c = coefficients
+    assert c.num_rows == M, (c.num_rows, M)
+    dev = x.device
+    out_fq = (
+        torch.empty(
+            (M, K), dtype=torch.float8_e4m3fn if emit_fp8 else x.dtype, device=dev
+        )
+        if fake_quant
+        else None
+    )
+    out_scale = (
+        torch.empty((M, K // 32), dtype=torch.uint8, device=dev)
+        if fake_quant and emit_fp8
+        else None
+    )
+    out_norm = torch.empty((M, K), dtype=x.dtype, device=dev) if return_norm else None
+    if fake_quant:
+        quant = (
+            Mxfp8Activation(out_fq, out_scale)
+            if emit_fp8
+            else Fp8GridActivation(out_fq)
+        )
+    else:
+        quant = None
+    if M == 0:
+        return quant, out_norm
+    m = 0 if c.materialized else M
+    c.materialized = True
+    CHUNK = rmsnorm_row_chunk(K)
+    _rmsnorm_sinkhorn_kernel[(M + m,)](
+        x,
+        weight,
+        out_fq if out_fq is not None else x,
+        out_norm if out_norm is not None else x,
+        out_scale if out_scale is not None else x,
+        K,
+        x.stride(0),
+        out_fq.stride(0) if out_fq is not None else 0,
+        out_norm.stride(0) if out_norm is not None else 0,
+        out_scale.stride(0) if out_scale is not None else 0,
+        eps,
+        quant_eps,
+        c.part_mix,
+        c.part_sq,
+        c.scratch,
+        c.hc_scale,
+        c.hc_base,
+        c._pre,
+        c._post,
+        c._comb,
+        M,
+        m,
+        1.0 / c.k,
+        c.rms_eps,
+        WRITE_NORM=out_norm is not None,
+        EMIT_FP8=emit_fp8,
+        FAKE_QUANT=fake_quant,
+        CHUNK=CHUNK,
+        NUM_CHUNKS=triton.cdiv(K, CHUNK),
+        MIX=c.mix,
+        HC=c.hc_mult,
+        NUM_SLICES=c.num_slices,
+        SLICES_PAD=triton.next_power_of_2(c.num_slices),
+        ITERS=c.sinkhorn_iters,
+        EPS=c.hc_eps,
+        num_warps=_HC_SINKHORN_NUM_WARPS,
+    )
+    return quant, out_norm
 
 
 @triton.jit
@@ -400,6 +724,67 @@ def _hc_boundary_partials(
     return part_mix, part_sq
 
 
+def hc_boundary_fused_deferred(
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post_in: Optional[torch.Tensor],
+    comb_in: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], HcCoefficients]:
+    """``hc_boundary_fused`` with the reduce + sinkhorn left pending: returns
+    ``(residual_out, y, coefficients)``; see ``HcCoefficients`` for how the last launch is
+    hosted by the norm that follows the boundary."""
+    assert _IS_HIP, "hc_boundary_fused is the HIP path"
+    assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
+    assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
+    assert hc_fn.dtype == torch.float32 and hc_fn.stride(1) == 1
+    m, _, h = residual.shape
+    k = hc_mult * h
+    mix = hc_fn.shape[0]
+    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
+    assert h % _HC_BOUNDARY_BLOCK_K == 0, h
+    dev = residual.device
+    has_post = x is not None
+    has_combine = pre_prev is not None
+    if has_post:
+        assert post_in is not None and comb_in is not None
+        assert x.shape == (m, h) and x.stride(1) == 1
+        post_in = post_in.contiguous().float()
+        comb_in = comb_in.contiguous().float()
+        residual_out = torch.empty_like(residual)
+    else:
+        residual_out = None
+    if has_combine:
+        pre_prev = pre_prev.contiguous()
+        y = torch.empty((m, h), dtype=residual.dtype, device=dev)
+    else:
+        y = None
+    part_mix, part_sq = _hc_boundary_partials(
+        x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, hc_mult=hc_mult
+    )
+    coefficients = HcCoefficients(
+        part_mix,
+        part_sq,
+        hc_scale,
+        hc_base,
+        k=k,
+        rms_eps=rms_eps,
+        mix=mix,
+        hc_mult=hc_mult,
+        num_slices=h // _HC_BOUNDARY_BLOCK_K,
+        sinkhorn_iters=sinkhorn_iters,
+        hc_eps=hc_eps,
+    )
+    return residual_out, y, coefficients
+
+
 def hc_boundary_fused(
     x: Optional[torch.Tensor],
     residual: torch.Tensor,
@@ -429,55 +814,18 @@ def hc_boundary_fused(
     y, pre, post, comb)``, the first two None when not requested. Batch-invariant and repeatable;
     pre/post/comb are not bitwise ``hc_mix_stats_sinkhorn``'s. Only hc_mult == 4 is supported.
     """
-    assert _IS_HIP, "hc_boundary_fused is the HIP path"
-    assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
-    assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
-    assert hc_fn.dtype == torch.float32 and hc_fn.stride(1) == 1
-    m, _, h = residual.shape
-    k = hc_mult * h
-    mix = hc_fn.shape[0]
-    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
-    assert h % _HC_BOUNDARY_BLOCK_K == 0, h
-    dev = residual.device
-    has_post = x is not None
-    has_combine = pre_prev is not None
-    if has_post:
-        assert post_in is not None and comb_in is not None
-        assert x.shape == (m, h) and x.stride(1) == 1
-        post_in = post_in.contiguous().float()
-        comb_in = comb_in.contiguous().float()
-        residual_out = torch.empty_like(residual)
-    else:
-        residual_out = None
-    if has_combine:
-        pre_prev = pre_prev.contiguous()
-        y = torch.empty((m, h), dtype=residual.dtype, device=dev)
-    else:
-        y = None
-    pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
-    post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
-    comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
-    if m == 0:
-        return residual_out, y, pre, post, comb
-
-    part_mix, part_sq = _hc_boundary_partials(
-        x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, hc_mult=hc_mult
-    )
-    num_slices = h // _HC_BOUNDARY_BLOCK_K
-    hc_mix_reduce_sinkhorn_vec(
-        part_mix,
-        part_sq,
+    residual_out, y, coefficients = hc_boundary_fused_deferred(
+        x,
+        residual,
+        post_in,
+        comb_in,
+        pre_prev,
+        hc_fn,
         hc_scale,
         hc_base,
-        pre,
-        post,
-        comb,
-        k=k,
-        rms_eps=rms_eps,
-        mix=mix,
-        hc_mult=hc_mult,
-        num_slices=num_slices,
-        sinkhorn_iters=sinkhorn_iters,
-        hc_eps=hc_eps,
+        hc_mult,
+        sinkhorn_iters,
+        rms_eps,
+        hc_eps,
     )
-    return residual_out, y, pre, post, comb
+    return (residual_out, y, *coefficients.tensors())

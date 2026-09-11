@@ -2430,11 +2430,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def _input_norm(
-        self, hidden_states: torch.Tensor, allow_aiter_quant: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        allow_aiter_quant: bool = True,
+        sinkhorn=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the
-        pre-quantized operand of its dense projections or None)."""
+        pre-quantized operand of its dense projections or None). ``sinkhorn`` is the
+        ROCm boundary's pending reduce + sinkhorn (``HcCoefficients``), hosted by the
+        gfx950 norm launch when that one runs."""
         if self.fused_rmsnorm_fp8_quant and allow_aiter_quant:
+            if sinkhorn is not None:
+                sinkhorn.materialize()
             x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                 hidden_states,
                 self.input_layernorm.weight,
@@ -2442,7 +2449,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return hidden_states, x_quant
         if self.fused_rmsnorm_fake_quant:
-            return _gfx95_dense.input_norm_fake_quant(self, hidden_states)
+            return _gfx95_dense.input_norm_fake_quant(self, hidden_states, sinkhorn)
+        if sinkhorn is not None:
+            sinkhorn.materialize()
         return self.input_layernorm(hidden_states), None
 
     def hc_pre(
