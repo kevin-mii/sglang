@@ -893,6 +893,10 @@ class Envs:
     # layer's next RMSNorm launch (rmsnorm_with_sinkhorn) instead of its own launch.
     # Set to 0 to launch it alone (A/B; the values are bitwise the same).
     SGLANG_OPT_HIP_HOSTED_SINKHORN = EnvBool(True)
+    # DSV4 MoE on aiter: the FlyDSL top-k reduction adds the shared expert (and the
+    # routed scale) in the same launch (moe_topk_reduce_add). Set to 0 for aiter's
+    # reduction plus the separate shared-expert add.
+    SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
 
     # ===================================================================
     # Apple Silicon and MLX

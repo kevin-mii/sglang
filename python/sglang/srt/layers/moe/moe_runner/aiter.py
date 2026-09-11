@@ -163,6 +163,116 @@ _AITER_MOE_SORTING_PARAMS = (
 )
 
 
+@dataclass
+class _FusedReduceRequest:
+    """A scope in which aiter's FlyDSL top-k reduction also adds the shared expert."""
+
+    shared_output: torch.Tensor
+    alpha: float  # scale of the routed sum, as the shared-add outside would apply it
+    fired: bool = False
+
+
+_fused_reduce_request: contextvars.ContextVar[Optional[_FusedReduceRequest]] = (
+    contextvars.ContextVar("aiter_fused_reduce_request", default=None)
+)
+_FLYDSL_REDUCTION_PARAMS = (
+    "target",
+    "out",
+    "token_num",
+    "topk",
+    "model_dim",
+    "expert_mask",
+    "topk_ids",
+    "stream",
+    "is_fp8",
+    "topk_weights",
+)
+
+
+@functools.cache
+def _install_fused_reduce_override() -> bool:
+    """Wrap the FlyDSL stage2 reduction (``_run_moe_reduction``) once; False when aiter
+    differs. Inside ``aiter_fused_reduce_shared_add`` the dense bf16 / fp16 reduction
+    becomes one launch that also adds the shared expert (``moe_topk_reduce_add``)."""
+    try:
+        import aiter.ops.flydsl.moe_kernels as flydsl_moe
+    except ImportError:
+        return False
+    original = getattr(flydsl_moe, "_run_moe_reduction", None)
+    if original is None:
+        return False
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return False
+    if tuple(signature.parameters)[: len(_FLYDSL_REDUCTION_PARAMS)] != (
+        _FLYDSL_REDUCTION_PARAMS
+    ):
+        logger.warning(
+            "aiter FlyDSL _run_moe_reduction has an unexpected signature; keeping "
+            "aiter's reduction and the separate shared-expert add"
+        )
+        return False
+
+    from sglang.kernels.ops.moe.moe_reduce_add_hip import moe_topk_reduce_add
+
+    def run_moe_reduction_with_shared_add(*args, **kwargs):
+        request = _fused_reduce_request.get()
+        if request is None:
+            return original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        a = bound.arguments
+        target, out, shared = a["target"], a["out"], request.shared_output
+        token_num, topk, model_dim = (
+            int(a["token_num"]),
+            int(a["topk"]),
+            int(a["model_dim"]),
+        )
+        eligible = (
+            not a["is_fp8"]
+            and a["topk_weights"] is None
+            and a["stream"] is None
+            and out.dtype in (torch.bfloat16, torch.float16)
+            and target.dtype == out.dtype == shared.dtype
+            and tuple(out.shape) == (token_num, model_dim) == tuple(shared.shape)
+            and target.numel() == token_num * topk * model_dim
+            and (a["expert_mask"] is None or a["topk_ids"] is not None)
+        )
+        if not eligible:
+            return original(*args, **kwargs)
+        moe_topk_reduce_add(
+            target,
+            shared,
+            out,
+            topk,
+            a["topk_ids"],
+            a["expert_mask"],
+            alpha=request.alpha,
+        )
+        request.fired = True
+
+    flydsl_moe._run_moe_reduction = run_moe_reduction_with_shared_add
+    return True
+
+
+@contextlib.contextmanager
+def aiter_fused_reduce_shared_add(shared_output: torch.Tensor, alpha: float):
+    """While active, the FlyDSL stage2 top-k reduction writes ``alpha * routed + shared_output``
+    instead of ``routed``. Yields the request, whose ``fired`` tells the caller whether the
+    add happened (else the caller adds the shared expert as usual); None when the override
+    is unavailable."""
+    if not (is_hip() and _install_fused_reduce_override()):
+        yield None
+        return
+    request = _FusedReduceRequest(shared_output, float(alpha))
+    token = _fused_reduce_request.set(request)
+    try:
+        yield request
+    finally:
+        _fused_reduce_request.reset(token)
+
+
 def _fill_padded_rows_pair(topk_ids, topk_weights, num_token_non_padded) -> None:
     """The two fills select_experts deferred: ids to 0, weights to 0.0."""
     from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows

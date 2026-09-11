@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -106,6 +107,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.moe_runner.aiter import (
+    aiter_fused_reduce_shared_add,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -133,6 +137,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp8RoutedInputPreQuant,
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
+    shared_add_alpha,
     should_use_fuse_finalize_all_reduce,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1230,6 +1235,18 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
+        # ROCm aiter: the shared expert runs first so the experts' top-k reduction can add it
+        # in the same launch (aiter_fused_reduce_shared_add); the routed-scale/shared-add
+        # step below then has nothing left to do.
+        fuse_shared_into_reduce = (
+            _use_aiter
+            and envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()
+            and self.shared_experts is not None
+            and not self._shared_expert_tp1
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+            and hidden_states.shape[0] > 0
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
@@ -1243,7 +1260,7 @@ class DeepseekV2MoE(nn.Module):
                 else self._maybe_quant_moe_input_once(hidden_states)
             )
             if (
-                not defer_shared
+                (not defer_shared or fuse_shared_into_reduce)
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
@@ -1316,17 +1333,27 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
+        fused_reduce_scope = (
+            aiter_fused_reduce_shared_add(
+                shared_output,
+                shared_add_alpha(self.experts, self.routed_scaling_factor),
             )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+            if fuse_shared_into_reduce and shared_output is not None
+            else contextlib.nullcontext()
+        )
+        with fused_reduce_scope as fused_reduce:
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                )
+        shared_added = fused_reduce is not None and fused_reduce.fired
         if (
             not _is_cuda
             and not _is_musa
@@ -1339,6 +1366,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             defer_shared
+            and shared_output is None
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
@@ -1349,12 +1377,13 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if not shared_added:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
