@@ -315,7 +315,6 @@ def test_pad_last_dim_is_identity_when_aligned():
 def _ref_init_compression_metadata(
     seq_lens, positions, raw_out_loc, page_table, page_size
 ):
-    bs = seq_lens.shape[0]
     nw = raw_out_loc.shape[0]
     out = []
     for ratio in (4, 128):
