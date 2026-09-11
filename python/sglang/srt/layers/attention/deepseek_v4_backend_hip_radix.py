@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     create_paged_compressor_data,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
+from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
@@ -1318,7 +1319,7 @@ class DeepseekV4HipRadixBackend(
                 and forward_batch.positions.is_cuda
                 and forward_batch.req_pool_indices.shape
                 == forward_batch.positions.shape
-                and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+                and hip_fused_decode_glue()
             ):
                 # both widenings in one launch
                 metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
@@ -2422,7 +2423,7 @@ class DeepseekV4HipRadixBackend(
             )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
 
-        if req_to_token.is_cuda and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get():
+        if req_to_token.is_cuda and hip_fused_decode_glue():
             # the gather, the floor division and the cast in one launch
             page_table = page_table_from_req_to_token(
                 req_to_token, req_pool_indices_repeated, max_seq_len, self.page_size

@@ -34,6 +34,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -348,7 +349,7 @@ class EngramHasher(nn.Module):
             commit_rows is not None
             and commit_last is None
             and input_ids.is_cuda
-            and _fused_decode_glue()
+            and hip_fused_decode_glue()
         ):
             # decode: the where / flip / cast / index_put chain below in one launch
             engram_commit_decode_history(
@@ -867,13 +868,6 @@ class EngramEmbedding(nn.Module):
         else:
             dp_scatter(local, tensor_model_parallel_all_reduce(values), forward_batch)
         return local.view(*indices.shape, self.dim)
-
-
-def _fused_decode_glue() -> bool:
-    from sglang.srt.environ import envs
-    from sglang.srt.utils import is_hip
-
-    return is_hip() and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
 
 
 def engram_gate(

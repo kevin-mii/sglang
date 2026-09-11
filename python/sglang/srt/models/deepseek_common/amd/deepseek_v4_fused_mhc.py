@@ -458,7 +458,7 @@ def hc_boundary(
         layer.rms_norm_eps,
         layer.hc_eps,
     )
-    if not envs.SGLANG_OPT_HIP_HOSTED_SINKHORN.get():
+    if not envs.SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM.get():
         coefficients.materialize()
     if new_residual is None:
         new_residual = residual

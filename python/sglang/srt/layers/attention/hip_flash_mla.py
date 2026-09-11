@@ -112,6 +112,12 @@ def _apply_inverse_rope(
     )
 
 
+def hip_fused_decode_glue() -> bool:
+    """Whether the DSV4.1 decode glue (Engram commit, page table, index widening, image select)
+    runs as fused HIP launches; the torch chains are bitwise the same."""
+    return is_hip() and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
+
+
 def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:
     """The HIP decode attention kernel name; "auto" (the default) is aiter's
     gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere."""
