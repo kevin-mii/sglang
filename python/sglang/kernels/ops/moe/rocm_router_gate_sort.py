@@ -312,6 +312,10 @@ def _handoff_buffer(device: torch.device) -> torch.Tensor:
         with _handoff_lock:
             buf = _handoff_state.get(key)
             if buf is None:
+                assert not torch.cuda.is_current_stream_capturing(), (
+                    "rocm_router_gate_sort: the hand-off buffer must be allocated by an "
+                    "eager launch, or its zero fill is captured instead of executed"
+                )
                 buf = torch.zeros(
                     _HANDOFF_ROWS * _HANDOFF_SLOTS, dtype=torch.int64, device=device
                 )
