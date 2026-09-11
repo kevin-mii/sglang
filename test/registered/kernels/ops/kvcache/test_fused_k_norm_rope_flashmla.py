@@ -16,7 +16,7 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_k_norm_rope_flashmla,
     fused_rope_inplace,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,7 +83,11 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                     got[:, NOPE_DIM:], expected[:, NOPE_DIM:], atol=2e-2, rtol=2e-2
                 )
 
-    @unittest.skipUnless(is_hip(), "the query rope rides the HIP K launch")
+    @unittest.skipUnless(
+        is_hip() and is_gfx95_supported(),
+        "the query rope rides the HIP K launch; its bitwise parity with the flat rope"
+        " kernel is claimed on gfx950 only",
+    )
     def test_query_rope_in_the_k_launch(self):
         """With `q` the K launch must rope every query head's trailing ROPE_DIM bitwise like the flat
         rope kernel, leave the cache bytes and the nope part untouched, and rope rows without a slot."""
