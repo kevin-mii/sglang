@@ -479,19 +479,9 @@ def _apply_wo_a_bf16_matmul(
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows write token-major output directly to avoid
-    the layout copy before wo_b. Other CUDA shapes and prefill use torch.einsum.
-
-    On ROCm decode, when the reroute is enabled
-    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
-    been disabled by a prior runtime failure, call the pre-imported aiter
-    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
-    gate off, or after a failure -- use the numerically-equivalent
-    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
-    disables the reroute for the process (logged once).
-
-    On gfx950 decode the fp8-grid fork runs instead; with ``fp8_grid`` its epilogue
-    also rounds the result onto ``wo_b``'s fp8 grid and returns it as an
-    ``Fp8GridActivation`` ``[T, G * R]``.
+    the layout copy before wo_b. ROCm decode takes aiter's batched GEMM (on
+    gfx950 the fp8-grid fork; with ``fp8_grid`` it returns an ``Fp8GridActivation``
+    [T, G * R] already on wo_b's grid). Other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -2441,10 +2431,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         allow_aiter_quant: bool = True,
         sinkhorn=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple]]:
-        """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the
-        pre-quantized operand of its dense projections or None). ``sinkhorn`` is the
-        ROCm boundary's pending reduce + sinkhorn (``HcCoefficients``), hosted by the
-        gfx950 norm launch when that one runs."""
+        """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the pre-quantized
+        operand of its dense projections or None). ``sinkhorn`` is the ROCm boundary's pending
+        reduce + sinkhorn, hosted by the gfx950 norm launch when that one runs."""
         if self.fused_rmsnorm_fp8_quant and allow_aiter_quant:
             if sinkhorn is not None:
                 sinkhorn.materialize()

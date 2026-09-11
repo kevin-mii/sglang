@@ -1,12 +1,6 @@
-"""ROCm activation route of the DeepSeek dense MLP (``DeepseekV2MLP``).
-
-Once the weights are loaded the route is fixed per layer: the aiter fused clamp +
-silu-and-mul (128-wide half width, fp8 output for a 128x128-block ``down_proj``), or
-the Triton silu-and-mul-clamp for any half width, whose epilogue on gfx950 lands the
-activation on ``down_proj``'s fp8 grid or hands the native MXFP8 kernels fp8 + ue8m0
-directly. Both helpers take the MLP and read / write its flags; ``deepseek_v2`` binds
-this module only under ``_is_hip``.
-"""
+"""ROCm activation route of ``DeepseekV2MLP``: aiter's fused clamp + silu-and-mul for 128-wide half
+widths (fp8 out for a 128x128-block ``down_proj``), else the Triton silu-and-mul-clamp, whose gfx950
+epilogue lands on ``down_proj``'s fp8 grid or emits native MXFP8. Bound by ``deepseek_v2`` under ``_is_hip``."""
 
 from __future__ import annotations
 
@@ -20,9 +14,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
-    """Fix ``mlp``'s activation route from ``down_proj``'s loaded weight: sets
-    ``use_fused_clamp_act_mul``, ``_fused_clamp_use_fp8``, ``_hip_act_fp8_grid``,
-    ``_hip_act_native_consumer`` and marks ``_fused_clamp_fp8_checked``."""
+    """Fix ``mlp``'s activation route from ``down_proj``'s loaded weight (once per layer)."""
     qm = getattr(mlp.down_proj, "quant_method", None)
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
     mlp.use_fused_clamp_act_mul = half_width % 128 == 0

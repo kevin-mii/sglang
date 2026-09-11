@@ -36,19 +36,10 @@ def aiter_sparse_decode_fwd(
     inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **_unused,
 ):
-    """``flash_mla_with_kvcache`` shapes on aiter's gfx950 gluon sparse decode kernel
-    (``pa_decode_sparse``): packed fp8 KV block cache (448 fp8 + 64 bf16 rope + per-64 ue8m0
-    scales), a gathered int32 index list per token, the SWA and top-k caches merged in one softmax,
-    fp32 attention sink. Only ``-1`` entries are skipped, so callers fold ``topk_length`` into the
-    index lists; padded query heads pass through, so the output keeps the caller's head layout.
-    Returns ``(out, None)``: the LSE is not produced. Extend batches of
-    ``_AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS`` tokens or more run unsplit; below that aiter's
-    cost model picks the split count from the batch size unless
-    ``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins it. Split partials are combined
-    by ``aiter_sparse_split_reduce`` (bitwise aiter's reduce); ``inv_rope = (freqs_real [max_pos, 64]
-    fp32, positions [n])`` folds the model's inverse RoPE of the last 64 dims of every head into the
-    output.
-    """
+    """aiter's gfx950 gluon sparse decode kernel (``pa_decode_sparse``) behind the
+    ``flash_mla_with_kvcache`` shapes. Only ``-1`` index entries are skipped, so callers fold
+    ``topk_length`` into the index lists; ``inv_rope = (freqs_real, positions)`` folds the
+    model's inverse RoPE of the last 64 dims of every head into the output. Returns ``(out, None)``."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
     from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (

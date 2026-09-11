@@ -1,9 +1,5 @@
-"""DeepSeek V4.1 low-ratio indexer on ROCm: the FlyDSL fp4 paged MQA-logits kernels score the
-c1 / c2 index-K pools (64-slot pages, split payload / scale layout) and the AOT top-k transform
-selects the sparse set, the same contract as the CUDA DeepGEMM path. Level one of the two-level
-top-k runs bounded by the real compressed lengths (`select_candidate_blocks_hip`,
-`topk_within_candidate_blocks_hip`) because the decode logits rectangle is page-table wide.
-"""
+"""DeepSeek V4.1 low-ratio (1 / 2) indexer on ROCm: FlyDSL fp4 paged MQA logits over the split
+payload / scale index-K pools, then the AOT top-k transform -- the DeepGEMM path's contract."""
 
 from __future__ import annotations
 
@@ -235,12 +231,9 @@ def _map_compact_selection_kernel(
     SORT: tl.constexpr,
     PAD_KEY: tl.constexpr,
 ):
-    """Compact position c -> real position ids[c // BLOCK_SIZE] * BLOCK_SIZE +
-    c % BLOCK_SIZE -> slot through the row's page table, with the reachable
-    selections packed to the front of the row and -1 after them (the sparse
-    kernels take a -1 padded list with the valid prefix first). With SORT the
-    valid prefix is ascending: the key and padding rule of
-    ``_sort_selection_rows_kernel``, so the row equals pack-then-sort."""
+    """Compact position c -> real position ids[c // BLOCK_SIZE] * BLOCK_SIZE + c % BLOCK_SIZE ->
+    slot via the row's page table; reachable selections packed first, -1 after. With SORT the valid
+    prefix is ascending (the key rule of ``_sort_selection_rows_kernel``)."""
     row = tl.program_id(0)
     length = tl.load(seq_lens_ptr + row)
     j = tl.arange(0, BLOCK)
@@ -416,14 +409,9 @@ def topk_within_candidate_blocks_hip(
     raw_indices: Optional[torch.Tensor],
     sort_output: bool = False,
 ) -> None:
-    """Level two for a consumer layer: the top-k of `logits` restricted to the published candidate
-    blocks, written as the paged transform writes it (-1 padded, valid prefix first); the caller
-    orders the rows, or asks for it with ``sort_output`` (the same rows as ``sort_selection_rows`` after,
-    inside the mapping launch; k must be a power of two).
-    The top-k runs on the compact candidate row, at most topk_blocks * block_size wide, so the
-    consumer's cost stops growing with the context; a row's valid prefix is min(k, reachable
-    candidates) long.
-    """
+    """Level two for a consumer layer: the top-k of ``logits`` inside the published candidate
+    blocks, written as the paged transform writes it (-1 padded, valid prefix first; ascending with
+    ``sort_output``, k a power of two). Runs on the compact row, so the cost stops growing with context."""
     rows, width = logits.shape
     topk = page_indices.shape[1]
     block_size = candidates.block_size
@@ -629,10 +617,8 @@ def low_ratio_candidate_skip_span(hf_text_config) -> Optional[int]:
 
 
 def low_ratio_decode_rows_fit_candidate_span(backend, forward_batch) -> bool:
-    """Decode: every request's context fits the candidate span, so the two-level top-k equals the
-    plain paged top-k. Inside a captured graph the answer is the variant being captured; eagerly it
-    is the host-side batch maximum. Keyed on tokens (conservative at ratio 2); target-verify rows
-    keep the filtered path."""
+    """Decode: every request's context fits the candidate span, so two-level top-k equals the plain
+    paged top-k. Captured: the variant being captured; eager: the host-side batch maximum."""
     span = backend.low_ratio_candidate_span
     if span is None or forward_batch is None:
         return False
@@ -746,10 +732,8 @@ def low_ratio_index_topk_hip_extend(
     backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
 ) -> None:
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
-    the candidate masks are published or applied per request in place, and one paged top-k launch
-    selects every row at its own length (`_select_topk_extend_hip`). Identity requests
-    (`is_identity_request`) are written without scores; a batch made only of them skips the query
-    projection and the kernel."""
+    candidate masks are published or applied per request, one paged top-k selects every row.
+    Identity requests are written without scores; an all-identity batch skips the kernel."""
     pool = backend.token_to_kv_pool
     metadata = backend.forward_metadata
     core = metadata.core_metadata
@@ -790,8 +774,7 @@ def low_ratio_index_topk_hip_extend(
         k_slots = torch.cat(slot_chunks)
 
     def fill_identity_requests(req_lo, req_hi, tok_lo):
-        """Requests req_lo..req_hi are all identity: write their rows without scores. A request with
-        no compressed position publishes an empty mask so consumers keep indexing masks by request."""
+        """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
         tok = tok_lo
         for b in range(req_lo, req_hi):
             t_len, lc = extend_lens_cpu[b], lc_per_req[b]
@@ -919,13 +902,9 @@ def _select_topk_extend_hip(
     consume: Optional[List[Optional[CandidateBlocks]]],
     publish: Optional[List[Optional[CandidateBlocks]]],
 ) -> None:
-    """Row t of `logits` scores its request's compressed positions 0..lc-1 in columns 0..lc-1,
-    reachable up to compress_lens[t]. A source layer publishes one `CandidateBlocks` per request
-    (None for an identity or empty request: every reachable block is a candidate); a consumer
-    selects each request's rows inside its published blocks on the compact candidate row
-    (`topk_within_candidate_blocks_hip`), identity rows through the plain launch; every other
-    layer runs one paged top-k launch over the group. Rows are ordered by position, -1 padded.
-    Level one walks the rows in chunks of _TORCH_INDEXER_SCORE_BUDGET_BYTES."""
+    """Row t of ``logits`` scores its request's compressed positions in columns 0..lc-1, reachable
+    up to ``compress_lens[t]``. A source layer publishes one ``CandidateBlocks`` per request (None
+    for identity / empty), a consumer selects inside its published blocks, others run one paged top-k."""
     assert page_indices.shape[1] == indexer.index_topk, (
         f"the paged top-k selects page_indices.shape[1] = {page_indices.shape[1]} "
         f"slots, the indexer wants {indexer.index_topk}"

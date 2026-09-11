@@ -843,11 +843,8 @@ class LowRatioBackendMixin:
         return slot_chunks, starts
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
-        """Extend indexer inside the graph: paged fp4 logits on per-token metadata
-        of a static width, then the eager path's selection (torch top-k over the
-        reachable columns, ascending) so the two agree bitwise. The paged top-k
-        kernel breaks ties by launch order and is not replay-stable. `q` and `w`
-        come from the source-projection break, computed on the live rows."""
+        """q/w come from live rows; metadata fixes the graph's context width. Torch top-k,
+        not the paged kernel, so the graph agrees bitwise with eager."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             quantize_fp4_indexer_tensor,
         )

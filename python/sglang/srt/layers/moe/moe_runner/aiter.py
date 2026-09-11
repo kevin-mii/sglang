@@ -258,10 +258,8 @@ def _install_fused_reduce_override() -> bool:
 
 @contextlib.contextmanager
 def aiter_fused_reduce_shared_add(shared_output: torch.Tensor, alpha: float):
-    """While active, the FlyDSL stage2 top-k reduction writes ``alpha * routed + shared_output``
-    instead of ``routed``. Yields the request, whose ``fired`` tells the caller whether the
-    add happened (else the caller adds the shared expert as usual); None when the override
-    is unavailable."""
+    """While active, the FlyDSL stage2 top-k reduction writes ``alpha * routed + shared_output``.
+    Yields the request (``fired`` says whether it happened), or None when the override is unavailable."""
     if not (is_hip() and _install_fused_reduce_override()):
         yield None
         return
@@ -287,10 +285,8 @@ def _local_expert_ids(
     device,
     cache: dict[tuple, tuple[torch.Tensor, int, Optional[torch.Tensor]]],
 ) -> Optional[tuple[torch.Tensor, int]]:
-    """``(local ids, local expert count)`` for a mask, cached in ``cache`` by its storage (the
-    entry keeps the mask alive, so the storage cannot be recycled under the key); None while a
-    CUDA graph is being captured (counting the mask is a device sync), so that call keeps
-    aiter's sorting."""
+    """``(local ids, local expert count)`` for a mask, cached by storage (the entry keeps the mask
+    alive). None during CUDA-graph capture: counting the mask is a device sync."""
     from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
         local_expert_ids_from_mask,
     )

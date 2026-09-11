@@ -1,12 +1,6 @@
-"""gfx950 dense route of the DeepSeek-V4 attention for 32-wide-block (V4.1) fp8 checkpoints.
-
-The fused RMSNorm + fake-quant producers hand ``wqkv_a`` / ``wq_b`` their operand
-already on the fp8 grid (``Fp8GridActivation``), or as native MXFP8 when the consumer
-runs the native kernels (``Mxfp8Activation``), and the ``wo_a`` batched GEMM fork rounds
-its epilogue onto ``wo_b``'s grid. Every helper takes the attention / decoder layer,
-caching what it resolves from the loaded weights on that layer behind a ``*_checked``
-flag; ``deepseek_v4`` binds this module only under ``_is_hip``.
-"""
+"""gfx950 dense route of the DeepSeek-V4 attention for 32-wide-block (V4.1) fp8 checkpoints: the
+fused RMSNorm + fake-quant producers hand ``wqkv_a`` / ``wq_b`` their operand on the fp8 grid
+(``Fp8GridActivation``) or as native MXFP8 (``Mxfp8Activation``); ``deepseek_v4`` binds it under ``_is_hip``."""
 
 from __future__ import annotations
 
@@ -148,11 +142,9 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
 def input_norm_fake_quant(
     layer, hidden_states: torch.Tensor, sinkhorn=None
 ) -> Tuple[torch.Tensor, Optional[object]]:
-    """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the
-    operand of its dense projections already on the fp8 grid, or None when the rows are
-    not a 2-D bf16 batch). ``sinkhorn`` (``HcCoefficients`` of the boundary that produced
-    ``hidden_states``) rides in the norm launch when the fused kernel runs, else it is
-    materialized here."""
+    """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the fp8-grid operand
+    of its dense projections, or None for non-2-D / non-bf16 rows). ``sinkhorn`` rides in the norm
+    launch when the fused kernel runs, else it is materialized here."""
     norm = layer.input_layernorm
     if not _fake_quant_applies(norm, hidden_states):
         if sinkhorn is not None:

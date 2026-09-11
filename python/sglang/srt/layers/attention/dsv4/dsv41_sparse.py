@@ -24,9 +24,9 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
-    """RoPE plus fake FP4 quantization, fused for BF16 inputs on CUDA and ROCm. The compressed
-    KV latent takes per-16 E4M3 scales; everything else per-32 UE8M0. With ``positions``,
-    ``freqs`` is the whole table and the fused kernel gathers ``freqs[positions]`` itself."""
+    """RoPE plus fake FP4 quantization, fused for bf16 on CUDA and ROCm; the compressed KV latent
+    takes per-16 E4M3 scales, everything else per-32 UE8M0. With ``positions``, ``freqs`` is the
+    whole table and the fused kernel gathers ``freqs[positions]`` itself."""
     if x.is_cuda and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,

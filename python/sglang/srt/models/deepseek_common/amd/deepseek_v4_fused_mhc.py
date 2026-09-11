@@ -437,11 +437,9 @@ def hc_boundary(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, "HcCoefficients"]:
-    """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto
-    ``residual`` (when given), collapse the new residual with ``pre_prev``
-    (copy 0 when None) and take its mixing statistics. Returns (new_residual, y,
-    coefficients); the coefficients' reduce + sinkhorn is still pending and rides in
-    the norm launch that follows (see ``HcCoefficients``)."""
+    """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto ``residual``, collapse
+    with ``pre_prev`` (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
+    coefficients); the coefficients' reduce + sinkhorn is still pending (see ``HcCoefficients``)."""
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
     )
@@ -480,11 +478,9 @@ def forward_hc_pre_from_prev_fused_boundary(
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``
-    (``layer.hc_boundary_fused``): each sublayer boundary is one fused launch.
-    ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual,
-    post, comb)`` (``hidden_states`` is then unused); with ``defer_post`` this layer's
-    is returned the same way and the returned ``hidden_states`` is None."""
+    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``: one fused launch per
+    boundary. ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual, post,
+    comb)``; with ``defer_post`` this layer's is returned the same way and ``hidden_states`` is None."""
     if pending_post is not None:
         residual, x, attn_coefficients = hc_boundary(
             layer,

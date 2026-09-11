@@ -1,11 +1,7 @@
-"""Glue for the one-launch ROCm MoE front (:func:`rocm_router_gate_sort`): the gate runs in
-``select_experts`` but aiter's sorting arguments (block size, expert mask, output dtype) only
-appear later, inside ``aiter.fused_moe``'s call to ``moe_sorting``. The sorting override
-records them per router key the first time it answers, the gate uses them on the next call
-of that key to sort in the same launch, and the override hands back those outputs after
-checking they were computed for exactly the arguments it received. Any mismatch falls back to
-sorting the gate's (valid) ids again, so the outputs never depend on the record being right.
-"""
+"""Glue for the one-launch ROCm MoE front (:func:`rocm_router_gate_sort`). aiter's sorting arguments
+appear only inside ``aiter.fused_moe``'s ``moe_sorting`` call, so the override records them per router
+on first sight and the next gate launch of that router sorts in the same launch; the override hands
+those outputs back only after checking they match its arguments, else it sorts the ids again."""
 
 from __future__ import annotations
 

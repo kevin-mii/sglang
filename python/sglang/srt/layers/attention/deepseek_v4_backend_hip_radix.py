@@ -93,10 +93,8 @@ def _mask_indices_by_length(
     extra_indices: Optional[torch.Tensor] = None,
     extra_lengths: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Set the entries of ``indices`` ([b, s, w]) at position >= ``lengths`` ([b])
-    to -1, the sentinel the aiter sparse decode kernel skips; likewise the
-    optional second list. One Triton launch in place of the arange / compare /
-    fill / where chain per list (bitwise the same tensors)."""
+    """Entries of ``indices`` ([b, s, w]) at position >= ``lengths`` ([b]) set to -1 (the aiter
+    sparse kernel skips -1), likewise the optional second list; one launch for both."""
     if lengths is None:
         indices, lengths = None, None
     if extra_indices is not None and extra_lengths is None:
@@ -390,11 +388,8 @@ class DSV4AttnMetadata:
     )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
-        """Point the captured metadata at ``other``, built for the live batch.
-
-        Every field is rebound to the live tensor except the SWA store target, which
-        the captured segments read by address: its contents are copied instead.
-        """
+        """Rebind every field to ``other``'s (built for the live batch), except the SWA store
+        target, which the captured segments read by address and is copied instead."""
         assert self.page_size == other.page_size
         assert self.index_topk == other.index_topk
         assert self.low_ratios == other.low_ratios
@@ -1701,10 +1696,8 @@ class DeepseekV4HipRadixBackend(
             )
         if self.has_c4 or self.has_c128:
             raise NotImplementedError(
-                "breakable prefill CUDA graphs on HIP are wired for the DeepSeek-V4.1 "
-                "layout (ratios 1 / 2, whose sources run at eager breaks); the c4 / "
-                "c128 compressor and indexer run inside the captured segments and "
-                "their metadata is not pinned here"
+                "breakable prefill CUDA graphs on HIP support only the DeepSeek-V4.1 layout "
+                "(ratios 1 / 2); the c4 / c128 metadata is not pinned for the captured segments"
             )
         if get_parallel().attn_cp_size != 1:
             raise NotImplementedError(
@@ -2320,11 +2313,9 @@ class DeepseekV4HipRadixBackend(
         raise NotImplementedError("ragged attention")
 
     def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
-        """FlyDSL fp4 paged logits for decode and ragged prefill;
-        ``SGLANG_DSV41_TORCH_PREFILL_INDEXER`` keeps the torch oracle.
-
-        Target-verify takes the decode body: the torch body syncs with the host per
-        request and cannot be recorded into the verify graph."""
+        """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;
+        ``SGLANG_DSV41_TORCH_PREFILL_INDEXER`` keeps the torch oracle for prefill. Target-verify
+        takes the decode body: the torch body syncs per request and cannot be captured."""
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
