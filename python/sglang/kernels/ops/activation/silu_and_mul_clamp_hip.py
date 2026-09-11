@@ -92,7 +92,9 @@ def silu_and_mul_clamp_triton(
     inter_size = N // 2
     fp8_grid = fp8_grid or emit_fp8
     if fp8_grid:
-        assert silu_and_mul_clamp_fp8_grid_supported(inter_size), inter_size
+        assert silu_and_mul_clamp_fp8_grid_supported(
+            inter_size
+        ), f"inter_size {inter_size}: the fp8-grid epilogue needs a multiple of 32 up to 1024"
     out = torch.empty(
         (M, inter_size),
         dtype=torch.float8_e4m3fn if emit_fp8 else gate_up.dtype,

@@ -406,7 +406,9 @@ def rmsnorm_with_sinkhorn(
     x = _row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
-    assert coefficients.num_rows == M, (coefficients.num_rows, M)
+    assert (
+        coefficients.num_rows == M
+    ), f"coefficients hold {coefficients.num_rows} rows, the norm input {M}"
     dev = x.device
     out_fq = (
         torch.empty(
@@ -738,7 +740,7 @@ def hc_boundary_fused_deferred(
     """``hc_boundary_fused`` with the reduce + sinkhorn left pending: returns
     ``(residual_out, y, coefficients)``; see ``HcCoefficients`` for how the last launch is
     hosted by the norm that follows the boundary."""
-    assert _is_hip, "hc_boundary_fused is the HIP path"
+    assert _is_hip, "hc_boundary_fused_deferred launches HIP-only kernels"
     assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
     assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
     assert hc_fn.dtype == torch.float32 and hc_fn.stride(1) == 1

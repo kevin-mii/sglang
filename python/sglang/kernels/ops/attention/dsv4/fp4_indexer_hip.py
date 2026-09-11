@@ -686,7 +686,9 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     FlyDSL MQA-logits layout: head h, chunk c's e8m0 byte at [t, 0, c, h % 16, h // 16] (H <= 64),
     RNE as the CUDA low-ratio path."""
     num_tokens, heads = q.shape[0], q.shape[1]
-    assert heads % 16 == 0 and heads <= 64, heads
+    assert (
+        heads % 16 == 0 and heads <= 64
+    ), f"{heads} heads: the FlyDSL scale layout holds 16-head groups up to 64"
     assert q.shape[-1] == _HEAD_DIM
     x = q.contiguous().view(-1, _HEAD_DIM)
     q_fp4 = torch.empty(
@@ -883,7 +885,9 @@ def index_q_pack_weights_hip(
     if T == 0:
         return q_fp4, q_scale, weights
     w_block = triton.next_power_of_2(T * H)
-    assert w_block <= 4096, T
+    assert (
+        w_block <= 4096
+    ), f"T * H = {T * H} exceeds the 4096-wide head-weight reduce block"
     _index_q_pack_weights_kernel[(T * H + 1,)](
         q,
         f_real,

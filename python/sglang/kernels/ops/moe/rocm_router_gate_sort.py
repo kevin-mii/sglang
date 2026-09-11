@@ -337,7 +337,9 @@ def rocm_router_gate_sort(
     """
     M, n_experts = gating_output.shape
     assert n_experts == _GATE_NUM_EXPERTS == num_experts and 0 < topk <= _MAX_TOPK
-    assert 0 < M <= ROCM_GATE_SORT_MAX_TOKENS
+    assert (
+        0 < M <= ROCM_GATE_SORT_MAX_TOKENS
+    ), f"{M} rows: the fused gate + sort serves at most {ROCM_GATE_SORT_MAX_TOKENS}"
     assert gating_output.stride(1) == 1
     if partials is not None:
         assert partials.shape[1:] == (M, n_experts) and partials.dtype == torch.float32
@@ -370,6 +372,7 @@ def rocm_router_gate_sort(
     else:
         moe_buf = torch.empty((0, 0), dtype=moe_buf_dtype, device=device)
     m_pad = max(2, triton.next_power_of_2(M))
+    assert m_pad <= _HANDOFF_ROWS, (m_pad, _HANDOFF_ROWS)
     topk_pad = triton.next_power_of_2(topk)
     n = m_pad * topk_pad
     jc = n if n <= 32 else 16

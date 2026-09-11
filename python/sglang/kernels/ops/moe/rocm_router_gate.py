@@ -112,7 +112,9 @@ def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     M, K = x.shape
     N, K_w = w.shape
     assert K == K_w and K % _BLOCK_K == 0 and N % _BLOCK_N == 0
-    assert 0 < M <= ROCM_ROUTER_MAX_TOKENS
+    assert (
+        0 < M <= ROCM_ROUTER_MAX_TOKENS
+    ), f"{M} rows: the split-K GEMV serves at most {ROCM_ROUTER_MAX_TOKENS}"
     assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
     assert x.stride(1) == 1 and w.stride(1) == 1
     split_k = K // _BLOCK_K
