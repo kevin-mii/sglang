@@ -284,10 +284,6 @@ def _sparse_buffers_kernel(
                 tl.store(c2_page_ptr + i, -1, mask=m)
 
 
-def _ceil_align(x: int, m: int) -> int:
-    return (x + m - 1) // m * m
-
-
 def sparse_buffers(
     *,
     c4_topk_lengths_clamp1: torch.Tensor,
@@ -318,7 +314,7 @@ def sparse_buffers(
     rows = c4_topk_lengths_clamp1.shape[0]
     assert c4_topk_lengths_raw.shape[0] == rows
     device = c4_topk_lengths_clamp1.device
-    width = _ceil_align(index_topk, page_index_align)
+    width = triton.cdiv(index_topk, page_index_align) * page_index_align
     i32 = dict(dtype=torch.int32, device=device)
     out = {
         "c4_sparse_topk_lengths": torch.empty(rows, **i32),

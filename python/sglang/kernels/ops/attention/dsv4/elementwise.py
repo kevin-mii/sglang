@@ -69,6 +69,25 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
+def _jit_main_k_norm_rope_q_flashmla_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+):
+    """ROCm only: the K kernel above with the in-place query rope in the same launch."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_q_flashmla_hip"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope_hip.cuh"],
+        cuda_wrappers=[
+            ("forward_with_q", f"FusedKNormRopeQFlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -287,13 +306,11 @@ def fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     elif q is not None:
-        # HIP only: the query rope rides the K launch
-        from sglang.kernels.ops.attention.dsv4.elementwise_hip import (
-            fused_k_norm_rope_flashmla_with_q,
+        module = _jit_main_k_norm_rope_q_flashmla_module(
+            kv.dtype, head_dim, rope_dim, page_size
         )
-
-        fused_k_norm_rope_flashmla_with_q(
-            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size, q
+        module.forward_with_q(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, q
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(

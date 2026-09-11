@@ -100,19 +100,16 @@ def silu_and_mul_clamp_triton(
         dtype=torch.float8_e4m3fn if emit_fp8 else gate_up.dtype,
         device=gate_up.device,
     )
-    scale = (
-        torch.empty((M, inter_size // 32), dtype=torch.uint8, device=gate_up.device)
-        if emit_fp8
-        else None
-    )
-
-    def wrap_output():
-        if emit_fp8:
-            return Mxfp8Activation(out, scale)
-        return Fp8GridActivation(out) if fp8_grid else out
-
+    if emit_fp8:
+        scale = torch.empty(
+            (M, inter_size // 32), dtype=torch.uint8, device=gate_up.device
+        )
+        result = Mxfp8Activation(out, scale)
+    else:
+        scale = None
+        result = Fp8GridActivation(out) if fp8_grid else out
     if M == 0:
-        return wrap_output()
+        return result
     block_i = 1024 if inter_size >= 1024 else triton.next_power_of_2(inter_size)
     _silu_and_mul_clamp_kernel[(M, triton.cdiv(inter_size, block_i))](
         gate_up,
@@ -130,4 +127,4 @@ def silu_and_mul_clamp_triton(
         EMIT_FP8=emit_fp8,
         num_warps=4,
     )
-    return wrap_output()
+    return result

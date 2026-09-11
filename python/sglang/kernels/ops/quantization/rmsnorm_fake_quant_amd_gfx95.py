@@ -202,14 +202,11 @@ def rmsnorm_fake_quant_fp8(
     if residual is not None:
         assert residual.shape == x.shape and residual.dtype == x.dtype
         assert residual.stride(1) == 1, "residual is updated in place"
-
-    def wrap_output():
-        if emit_fp8:
-            return Mxfp8Activation(out_fq, out_scale)
-        return Fp8GridActivation(out_fq)
-
+    quant = (
+        Mxfp8Activation(out_fq, out_scale) if emit_fp8 else Fp8GridActivation(out_fq)
+    )
     if M == 0:
-        return wrap_output(), out_norm
+        return quant, out_norm
     CHUNK = rmsnorm_row_chunk(K)
     _rmsnorm_fake_quant_fp8_kernel[(M,)](
         x,
@@ -233,4 +230,4 @@ def rmsnorm_fake_quant_fp8(
         NUM_CHUNKS=triton.cdiv(K, CHUNK),
         num_warps=4,
     )
-    return wrap_output(), out_norm
+    return quant, out_norm

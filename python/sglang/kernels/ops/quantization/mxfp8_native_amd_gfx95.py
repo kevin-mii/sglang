@@ -86,15 +86,15 @@ def m_bucket(m: int) -> int:
     )
 
 
-@functools.lru_cache(maxsize=1)
-def _load_config_table() -> Dict[str, str]:
-    """{'gfx950:N:K:Mbucket': config key} from the JSON next to this file."""
+@functools.lru_cache(maxsize=None)
+def _config_table(section: str) -> Dict[str, str]:
+    """One ``{'gfx950:N:K:M_bucket': entry}`` section of ``CONFIG_FILE``."""
     try:
         with open(CONFIG_FILE) as f:
             table = json.load(f)
     except (OSError, ValueError):
         return {}
-    return {str(key): str(value) for key, value in table.get("configs", {}).items()}
+    return {str(key): str(value) for key, value in table.get(section, {}).items()}
 
 
 @functools.lru_cache(maxsize=None)
@@ -104,7 +104,7 @@ def gfx_name() -> str:
 
 def select_config(m: int, n: int, k: int) -> GemvConfig:
     """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
-    table = _load_config_table()
+    table = _config_table("configs")
     key = f"{gfx_name()}:{n}:{k}:{m_bucket(m)}"
     if key in table:
         cfg = GemvConfig.parse(table[key])
@@ -198,17 +198,9 @@ def large_m_bucket(m: int) -> int:
     return LARGE_M_BUCKETS[-1]
 
 
-@functools.lru_cache(maxsize=2)
 def _large_m_table(fp8_in: bool) -> Dict[str, str]:
-    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}`` from the table's
-    ``large_m`` / ``large_m_fp8in`` section."""
-    try:
-        with open(CONFIG_FILE) as f:
-            table = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    section = table.get("large_m_fp8in" if fp8_in else "large_m", {})
-    return {str(k): str(v) for k, v in section.items()}
+    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}``."""
+    return _config_table("large_m_fp8in" if fp8_in else "large_m")
 
 
 def large_m_plan(

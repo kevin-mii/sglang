@@ -338,33 +338,26 @@ class HcCoefficients:
         self.scratch = torch.empty((m, 32), dtype=torch.float32, device=dev)
         self.materialized = m == 0
 
-    def mark_hosted(self) -> None:
-        self.materialized = True
-
     def materialize(self) -> None:
         """Run the reduce + sinkhorn alone unless a norm launch already hosted it."""
         if self.materialized:
             return
         self.materialized = True
-        _hc_mix_reduce_sinkhorn_vec_kernel[(self.num_rows,)](
+        hc_mix_reduce_sinkhorn_vec(
             self.part_mix,
             self.part_sq,
-            self.scratch,
             self.hc_scale,
             self.hc_base,
             self._pre,
             self._post,
             self._comb,
-            self.num_rows,
-            1.0 / self.k,
-            self.rms_eps,
-            MIX=self.mix,
-            HC=self.hc_mult,
-            NUM_SLICES=self.num_slices,
-            SLICES_PAD=triton.next_power_of_2(self.num_slices),
-            ITERS=self.sinkhorn_iters,
-            EPS=self.hc_eps,
-            num_warps=_HC_SINKHORN_NUM_WARPS,
+            k=self.k,
+            rms_eps=self.rms_eps,
+            mix=self.mix,
+            hc_mult=self.hc_mult,
+            num_slices=self.num_slices,
+            sinkhorn_iters=self.sinkhorn_iters,
+            hc_eps=self.hc_eps,
         )
 
     @property
@@ -435,7 +428,7 @@ def rmsnorm_with_sinkhorn(
     if M == 0:
         return quant, out_norm
     m = 0 if coefficients.materialized else M
-    coefficients.mark_hosted()
+    coefficients.materialized = True
     CHUNK = rmsnorm_row_chunk(K)
     _rmsnorm_sinkhorn_kernel[(M + m,)](
         x,
