@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _IS_HIP
+from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _is_hip
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
@@ -606,7 +606,7 @@ _HC_BOUNDARY_PREFILL_MIN_M = 1024
 
 def _hc_boundary_prefill_available() -> bool:
     """The prefill kernel needs gfx950 (v_permlane*_swap, 16-byte LDS DMA)."""
-    return _IS_HIP and torch.cuda.is_available() and is_gfx95_supported()
+    return _is_hip and torch.cuda.is_available() and is_gfx95_supported()
 
 
 @functools.lru_cache(maxsize=None)
@@ -739,7 +739,7 @@ def hc_boundary_fused_deferred(
     """``hc_boundary_fused`` with the reduce + sinkhorn left pending: returns
     ``(residual_out, y, coefficients)``; see ``HcCoefficients`` for how the last launch is
     hosted by the norm that follows the boundary."""
-    assert _IS_HIP, "hc_boundary_fused is the HIP path"
+    assert _is_hip, "hc_boundary_fused is the HIP path"
     assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
     assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
     assert hc_fn.dtype == torch.float32 and hc_fn.stride(1) == 1

@@ -15,7 +15,7 @@ from triton.language.extra import libdevice
 from sglang.srt.utils import is_hip
 
 # libdevice.exp / div_rn do not lower on HIP; tl.exp and `/` are exact against torch on gfx950
-_LIBDEVICE_EXACT = not is_hip()
+_USE_LIBDEVICE = not is_hip()
 
 
 @triton.jit
@@ -166,7 +166,7 @@ def pair_pool_decode(
         STATE_SCORE_STRIDE=state_score.stride(0),
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
-        LIBDEVICE=_LIBDEVICE_EXACT,
+        LIBDEVICE=_USE_LIBDEVICE,
         num_warps=4,
     )
     return pooled, group_pos, slots
