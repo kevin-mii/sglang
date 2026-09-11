@@ -3792,8 +3792,12 @@ class DeepseekV4Model(nn.Module):
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
-                    tail.rows(hidden_states),
+                if pending_post is not None:
+                    # the fused boundary carries the residual stream here, not in hidden_states
+                    pending_post = tuple(tail.rows(t) for t in pending_post)
+                else:
+                    hidden_states = tail.rows(hidden_states)
+                prev_pre, input_ids, input_ids_global = (
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
                     tail.rows(input_ids_global),
