@@ -2491,6 +2491,10 @@ class DeepseekV4HipRadixBackend(
         """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;
         ``SGLANG_DSV41_TORCH_PREFILL_INDEXER`` keeps the torch oracle for prefill. Target-verify
         takes the decode body: the torch body syncs per request and cannot be captured."""
+        # every body below rewrites the ratio's page indices in place
+        self.forward_metadata.core_metadata.drop_folded_sparse_indices(
+            layer.compress_ratio
+        )
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
