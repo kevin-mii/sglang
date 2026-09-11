@@ -45,9 +45,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
             x.is_cuda
-            and torch.version.cuda is not None
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
