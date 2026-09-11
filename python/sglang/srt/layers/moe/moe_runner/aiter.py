@@ -285,10 +285,11 @@ def _local_expert_ids(
     expert_mask: Optional[torch.Tensor],
     num_experts: int,
     device,
-    cache: dict[tuple, tuple[torch.Tensor, int]],
+    cache: dict[tuple, tuple[torch.Tensor, int, Optional[torch.Tensor]]],
 ) -> Optional[tuple[torch.Tensor, int]]:
-    """``(local ids, local expert count)`` for a mask, cached in ``cache`` by its storage; None
-    while a CUDA graph is being captured (counting the mask is a device sync), so that call keeps
+    """``(local ids, local expert count)`` for a mask, cached in ``cache`` by its storage (the
+    entry keeps the mask alive, so the storage cannot be recycled under the key); None while a
+    CUDA graph is being captured (counting the mask is a device sync), so that call keeps
     aiter's sorting."""
     from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
         local_expert_ids_from_mask,
@@ -309,9 +310,10 @@ def _local_expert_ids(
         entry = (
             local_expert_ids_from_mask(expert_mask, num_experts, device),
             num_local,
+            expert_mask,
         )
         cache[key] = entry
-    return entry
+    return entry[0], entry[1]
 
 
 @functools.cache
@@ -339,9 +341,16 @@ def _install_fused_sorting_override() -> bool:
         AITER_FUSED_SORT_MAX_TOKENS,
         fused_aiter_moe_sorting,
     )
+    from sglang.srt.layers.moe.rocm_fused_front import (
+        SortConfig,
+        disable_pending_sort,
+        take_pending_sort,
+    )
 
     # masks are static per layer, so the table lives with the override installed once per process
-    local_expert_ids_by_mask: dict[tuple, tuple[torch.Tensor, int]] = {}
+    local_expert_ids_by_mask: dict[
+        tuple, tuple[torch.Tensor, int, Optional[torch.Tensor]]
+    ] = {}
 
     def moe_sorting_with_fused_small_m(*args, **kwargs):
         request = _fused_sorting_request.get()
@@ -381,22 +390,37 @@ def _install_fused_sorting_override() -> bool:
             else None
         )
         if local is None:
+            disable_pending_sort(topk_ids)
             if request.num_token_non_padded is not None:
                 _fill_padded_rows_pair(
                     topk_ids, topk_weights, request.num_token_non_padded
                 )
             return original(*args, **kwargs)
         local_ids, num_local = local
+        config = SortConfig(
+            local_expert_ids=local_ids,
+            num_experts=num_experts,
+            model_dim=int(a["model_dim"]),
+            moe_buf_dtype=a["moebuf_dtype"],
+            block_size=block_size,
+            zero_moe_buf=(expert_mask is not None) or bool(a["accumulate"]),
+        )
+        # the gate launch of this batch may have sorted already (rocm_fused_front)
+        sorted_outputs = take_pending_sort(
+            topk_ids, config, request.num_token_non_padded
+        )
+        if sorted_outputs is not None:
+            return sorted_outputs
         return fused_aiter_moe_sorting(
             topk_ids,
             topk_weights,
             local_ids,
             num_local,
-            num_experts,
-            int(a["model_dim"]),
-            a["moebuf_dtype"],
-            block_size,
-            zero_moe_buf=(expert_mask is not None) or bool(a["accumulate"]),
+            config.num_experts,
+            config.model_dim,
+            config.moe_buf_dtype,
+            config.block_size,
+            zero_moe_buf=config.zero_moe_buf,
             num_token_non_padded=request.num_token_non_padded,
         )
 

@@ -1407,16 +1407,18 @@ def biased_topk_jit_kernel_impl(
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
         if router_logits_partials is not None:
-            # ROCm decode router: reduces the split-K partials and gates them in one launch
-            from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
+            # ROCm decode router: reduces the split-K partials and gates them in one launch,
+            # sorting for the aiter runner in the same launch when the batch is small enough
+            from sglang.srt.layers.moe.rocm_fused_front import gate_partials
 
-            return rocm_router_gate(
+            return gate_partials(
                 gating_output,
                 correction_bias,
                 topk,
                 renormalize,
                 routed_scaling_factor,
-                partials=router_logits_partials,
+                router_logits_partials,
+                num_token_non_padded,
             )
 
         from aiter import topk_gating
