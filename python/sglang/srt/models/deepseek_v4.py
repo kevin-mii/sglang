@@ -440,10 +440,7 @@ _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
 _gfx95_dense = None
 if _is_hip:
-    from sglang.srt.layers.attention.hip_flash_mla import (
-        hip_attention_fuses_inverse_rope,
-        hip_attention_needs_head_pad,
-    )
+    from sglang.srt.layers.attention.hip_flash_mla import hip_attention_needs_head_pad
     from sglang.srt.models.deepseek_common.amd import (
         deepseek_v4_gfx95_dense as _gfx95_dense,
     )
@@ -2090,7 +2087,6 @@ class MQALayer(MqaAttentionBase):
             and not (
                 forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             )
-            and hip_attention_fuses_inverse_rope()
         ):
             inv_rope = (torch.view_as_real(self.freqs_cis).flatten(-2), positions)
         if is_unified_kv_triton():

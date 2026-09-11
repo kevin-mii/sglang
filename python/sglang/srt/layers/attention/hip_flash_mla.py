@@ -112,12 +112,6 @@ def _apply_inverse_rope(
     )
 
 
-def hip_attention_fuses_inverse_rope() -> bool:
-    """Whether ``flash_mla_with_kvcache_entrypoint`` applies the inverse RoPE of the attention
-    output itself when the caller passes ``inv_rope`` (every HIP kernel behind it does)."""
-    return is_hip()
-
-
 def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:
     """The HIP decode attention kernel name; "auto" (the default) is aiter's
     gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere."""

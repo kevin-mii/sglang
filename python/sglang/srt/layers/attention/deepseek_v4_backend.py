@@ -60,14 +60,12 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.low_ratio_backend import (  # noqa: F401
+from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
     LowRatioBackendMixin,
     _as_int_list,
-    _dense_fp4_mqa_logits,
     _expand_index_page_table,
     _low_ratio_compression_metadata,
-    _low_ratio_source_projections,
     _low_ratio_sparse_buffers,
     _pad_last_dim,
 )

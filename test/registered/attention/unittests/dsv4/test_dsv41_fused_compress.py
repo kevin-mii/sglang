@@ -65,7 +65,7 @@ def _make_pool():
 
 def _build(n: int, ratio: int, seed: int):
     """One decode step against the real pool."""
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
+    from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
         _low_ratio_compression_metadata,
     )
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import (

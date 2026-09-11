@@ -67,7 +67,7 @@ class _PrefillIndexerFixture(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
             _low_ratio_sparse_buffers,
         )
         from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4

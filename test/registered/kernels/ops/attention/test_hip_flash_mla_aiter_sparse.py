@@ -596,10 +596,8 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         """With `inv_rope` the entrypoint must equal the kernel plus the flat inverse rope, for every HIP kernel."""
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
-            hip_attention_fuses_inverse_rope,
         )
 
-        self.assertTrue(hip_attention_fuses_inverse_rope())
         dev = torch.device("cuda")
         _, fr = _freqs(dev)
         for batch, heads, seed in [(1, 16, 30), (6, 16, 31), (2, 64, 32)]:

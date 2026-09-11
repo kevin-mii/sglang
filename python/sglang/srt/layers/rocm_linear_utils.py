@@ -9,8 +9,6 @@ from sglang.kernels.ops.moe.rocm_router_gate import (
     rocm_router_gemv_split_k,
     rocm_router_max_tokens,
 )
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.runtime_context import get_exec
 
 __all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
@@ -35,7 +33,7 @@ def aiter_dsv3_router_split_k_max_tokens(config, weight_dtype: torch.dtype) -> i
 
 
 def aiter_dsv3_router_split_k(
-    gate, hidden_states: torch.Tensor, forward_batch=None
+    gate, hidden_states: torch.Tensor
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """The ROCm decode router for ``gate`` (a ``MoEGate``): an fp32 logits buffer plus
     the split-K partials whose fixed-order sum fills it, or None when ``gate.forward``
@@ -45,15 +43,6 @@ def aiter_dsv3_router_split_k(
     if not 0 < num_tokens <= gate.rocm_router_max_tokens:
         return None
     if get_exec().deterministic.enable_deterministic_inference:
-        return None
-    if (
-        not gate.is_deepseek_v4
-        and forward_batch is not None
-        and (
-            dsa_use_prefill_cp(forward_batch, gate.dsa_enable_prefill_cp)
-            or mla_use_prefill_cp(forward_batch, gate.mla_enable_prefill_cp)
-        )
-    ):
         return None
     partials = rocm_router_gemv_split_k(hidden_states, gate.weight)
     logits = torch.empty(

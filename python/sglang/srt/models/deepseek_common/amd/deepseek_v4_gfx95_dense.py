@@ -14,7 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
-from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 Fp8GridActivation = None
 Mxfp8Activation = None
@@ -45,7 +45,7 @@ if _use_aiter and _is_gfx95_supported and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM
         from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
             batched_gemm_bf16_fp8_grid as _wo_a_fp8_grid_gemm,
         )
-    except Exception as err:  # pragma: no cover - env-dependent
+    except (ImportError, RuntimeError) as err:
         logger.warning(
             "wo_a fp8-grid batched GEMM import failed; the aiter kernel and a "
             "separate fake-quant serve wo_a -> wo_b for this process: %s",
