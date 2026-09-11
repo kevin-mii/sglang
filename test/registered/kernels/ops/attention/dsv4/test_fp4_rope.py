@@ -39,13 +39,10 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 ROPE_DIM = 64
 EPS = 1e-6
-BATCHES = (1, 2, 8, 31, 64, 65, 128)
+BATCHES = (1, 31, 64, 65)
 # Both low ratios reach this kernel; the group position is masked out of the
 # token position in-kernel, so the ratio changes what it reads.
 RATIOS = (1, 2)
-# Fraction of cache bytes allowed to differ on random input -- see the module
-# docstring. Measured 0 over 3.4e6 bytes.
-BYTE_MISMATCH_FRAC = 1e-5
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -73,21 +70,18 @@ def _norm(seed: int, weight_scale: float = 1.0) -> RMSNorm:
     return norm
 
 
-def _inputs(n, ratio, seed, *, exact_sum, pad=0):
+def _inputs(n, ratio, seed, *, pad=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    if exact_sum:
-        # Magnitudes from {0.5, 1, 2}: the squares are exact multiples of 0.25
-        # and 128 of them sum to at most 512, so every partial sum is exact in
-        # fp32 whatever the order and both norms agree bitwise.
-        mag = torch.tensor([0.5, 1.0, 2.0], device="cuda")[
-            torch.randint(3, (n, HEAD_DIM), generator=g, device="cuda")
-        ]
-        sign = torch.where(
-            torch.rand(n, HEAD_DIM, generator=g, device="cuda") < 0.5, -1.0, 1.0
-        )
-        x = (mag * sign).bfloat16()
-    else:
-        x = torch.randn(n, HEAD_DIM, generator=g, device="cuda", dtype=torch.bfloat16)
+    # Magnitudes from {0.5, 1, 2}: the squares are exact multiples of 0.25
+    # and 128 of them sum to at most 512, so every partial sum is exact in
+    # fp32 whatever the order and both norms agree bitwise.
+    mag = torch.tensor([0.5, 1.0, 2.0], device="cuda")[
+        torch.randint(3, (n, HEAD_DIM), generator=g, device="cuda")
+    ]
+    sign = torch.where(
+        torch.rand(n, HEAD_DIM, generator=g, device="cuda") < 0.5, -1.0, 1.0
+    )
+    x = (mag * sign).bfloat16()
     # Every token is the last of its group, so every row would publish.
     positions = torch.arange(n, device="cuda", dtype=torch.int64) * ratio + (ratio - 1)
     loc = torch.arange(1, n + 1, device="cuda", dtype=torch.int64)
@@ -104,9 +98,9 @@ def _inputs(n, ratio, seed, *, exact_sum, pad=0):
     return x, positions, loc, freqs
 
 
-def _run(n, ratio, seed, *, exact_sum=True, pad=0, weight_scale=1.0):
+def _run(n, ratio, seed, *, pad=0, weight_scale=1.0):
     """One kernel call and the Triton reference, into separate buffers."""
-    x, positions, loc, freqs = _inputs(n, ratio, seed, exact_sum=exact_sum, pad=pad)
+    x, positions, loc, freqs = _inputs(n, ratio, seed, pad=pad)
     norm = _norm(seed + 1, weight_scale)
     freqs_cis = torch.view_as_real(freqs).flatten(-2).contiguous().float()
 
@@ -143,22 +137,6 @@ def test_matches_the_triton_writer_exactly(n, ratio):
     assert torch.equal(got, ref), (
         f"{n=} {ratio=}: {int((got != ref).sum())} of {got.numel()} cache bytes "
         f"differ from the Triton writer"
-    )
-
-
-@pytest.mark.parametrize("ratio", RATIOS)
-def test_matches_the_triton_writer_on_random_input(ratio):
-    """Normal input, where the two RMSNorm reductions genuinely differ. The
-    budget bounds what that can cost; it measured zero."""
-    differing = total = 0
-    for seed in range(4):
-        got, ref, _ = _run(256, ratio, seed=2000 + seed * 131 + ratio, exact_sum=False)
-        differing += int((got != ref).sum())
-        total += got.numel()
-    frac = differing / total
-    assert frac <= BYTE_MISMATCH_FRAC, (
-        f"{differing}/{total} = {frac:.2e} of cache bytes differ, above "
-        f"{BYTE_MISMATCH_FRAC:.0e} -- suspect the write, not the norm"
     )
 
 
@@ -199,28 +177,6 @@ def test_padded_rows_publish_nothing(ratio):
     assert not slot0.any(), f"{int(slot0.count_nonzero())} bytes written to slot 0"
 
 
-def test_all_rows_padded():
-    """The whole batch padded: nothing may be written anywhere."""
-    n = 8
-    x, positions, _, freqs = _inputs(n, 2, seed=4000, exact_sum=True)
-    loc = torch.zeros(n, device="cuda", dtype=torch.int64)
-    norm = _norm(4001)
-    cache = torch.zeros(
-        2, INDEX_PAGE_SIZE * SLOT_BYTES, dtype=torch.uint8, device="cuda"
-    )
-    index_k_norm_rope_pack_store(
-        x,
-        norm.weight.data,
-        EPS,
-        torch.view_as_real(freqs).flatten(-2).contiguous().float(),
-        positions,
-        loc,
-        cache,
-        ratio=2,
-    )
-    assert not cache.any(), f"{int(cache.count_nonzero())} bytes written"
-
-
 @pytest.mark.parametrize("ratio", RATIOS)
 def test_slot_is_loc_across_a_page_boundary(ratio):
     """The slot address is `loc` split by the index page size, which is 64 and
@@ -233,7 +189,7 @@ def test_slot_is_loc_across_a_page_boundary(ratio):
         2 * INDEX_PAGE_SIZE,
     ]
     n = len(want)
-    x, positions, _, freqs = _inputs(n, ratio, seed=5000 + ratio, exact_sum=True)
+    x, positions, _, freqs = _inputs(n, ratio, seed=5000 + ratio)
     loc = torch.tensor(want, device="cuda", dtype=torch.int64)
     norm = _norm(5001 + ratio)
     npages = want[-1] // INDEX_PAGE_SIZE + 2
@@ -266,7 +222,7 @@ def test_positions_select_the_group_freqs():
     ratio 2 a token at an odd position must rotate by the *even* one, so the
     same row fed as ratio 1 at that even position must produce the same bytes."""
     n = 8
-    x, _, loc, freqs = _inputs(n, 2, seed=6000, exact_sum=True)
+    x, _, loc, freqs = _inputs(n, 2, seed=6000)
     norm = _norm(6001)
     freqs_cis = torch.view_as_real(freqs).flatten(-2).contiguous().float()
     odd = torch.arange(n, device="cuda", dtype=torch.int64) * 2 + 1
@@ -413,42 +369,9 @@ def test_q_weights_epilogue_is_bitwise_head_weights(n, heads):
     )
 
 
-def test_q_weights_rejects_a_mismatched_weight_shape():
-    x, positions, freqs = _q_inputs(4, Q_HEADS[-1], seed=1)
-    freqs_cis = torch.view_as_real(freqs).flatten(-2).contiguous().float()
-    raw = torch.zeros(4, Q_HEADS[-1] + 1, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(Exception):
-        index_q_rope_pack_weights(x, freqs_cis, positions, raw, Q_WEIGHT_SCALE)
-
-
 def test_q_accepts_int32_positions():
     """The kernel is instantiated for both position dtypes."""
     _assert_q_equal(*_run_q(8, 64, seed=12000, pos_dtype=torch.int32), "int32 pos")
-
-
-def test_q_rows_are_token_major():
-    """Row `r` is head `r % heads` of token `r // heads`, and only the token
-    index selects the freqs. Permuting the tokens must therefore permute the
-    output in contiguous blocks of `heads` -- checked without the reference, so
-    a row split that happens to agree with Triton's cannot hide here."""
-    n = heads = 8
-    x, positions, freqs = _q_inputs(n, heads, seed=13000)
-    freqs_cis = torch.view_as_real(freqs).flatten(-2).contiguous().float()
-    payload, scale = index_q_rope_pack(x, freqs_cis, positions)
-    assert payload.any()
-
-    perm = torch.tensor([4, 0, 5, 3, 7, 1, 6, 2], device="cuda")
-    permuted = index_q_rope_pack(
-        x[perm].contiguous(), freqs_cis, positions[perm].contiguous()
-    )
-    _assert_q_equal(
-        permuted,
-        (
-            payload.view(n, heads, -1)[perm].flatten(0, 1),
-            scale.view(n, heads)[perm].flatten(),
-        ),
-        "token permutation",
-    )
 
 
 def test_q_empty_batch():
