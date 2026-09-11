@@ -83,6 +83,7 @@ def rope_tail_fake_quant_fp4_row(
 def _rope_tail_fake_quant_fp4_kernel(
     x_ptr,
     f_ptr,
+    pos_ptr,
     out_ptr,
     x_stride_r,
     out_stride_r,
@@ -94,9 +95,14 @@ def _rope_tail_fake_quant_fp4_kernel(
     AMAX_FLOOR: tl.constexpr,
     INVERSE: tl.constexpr,
     COMPRESSED_KV: tl.constexpr,
+    HAS_POS: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r // rows_per_token
+    if HAS_POS:
+        # freqs is the whole table; row t reads the entry of its position (the
+        # freqs[positions] gather folded into this launch)
+        t = tl.load(pos_ptr + t).to(tl.int64)
     out = rope_tail_fake_quant_fp4_row(
         x_ptr + r * x_stride_r,
         f_ptr + t * f_stride_t,
@@ -120,10 +126,14 @@ def rope_tail_fake_quant_fp4(
     block_size: int = 32,
     *,
     compressed_kv: bool = False,
+    positions: torch.Tensor = None,
 ) -> torch.Tensor:
     """RoPE and FP4 round-trip: per-16 E4M3 for compressed KV, per-32 UE8M0 otherwise.
 
-    x: [T, ..., D] contiguous in the last dim; freqs: complex [T, rope_dim // 2].
+    x: [T, ..., D] contiguous in the last dim; freqs: complex [T, rope_dim // 2],
+    or with ``positions`` ([T] int) the whole table [N, rope_dim // 2] that row t
+    reads at positions[t] (the same values as ``freqs[positions]``, without the
+    gather launch; every position must be below N).
     """
     x = x.contiguous()
     if compressed_kv:
@@ -138,9 +148,16 @@ def rope_tail_fake_quant_fp4(
         return out
     rows_per_token = rows // x.shape[0]
     f_real = torch.view_as_real(freqs.contiguous()).contiguous()
+    if positions is not None:
+        assert positions.dim() == 1 and positions.shape[0] == x.shape[0], (
+            positions.shape,
+            x.shape,
+        )
+        positions = positions.contiguous()
     _rope_tail_fake_quant_fp4_kernel[(rows,)](
         x2,
         f_real,
+        positions if positions is not None else f_real,
         out.reshape(-1, d),
         x2.stride(0),
         d,
@@ -152,6 +169,7 @@ def rope_tail_fake_quant_fp4(
         AMAX_FLOOR=FP4_AMAX_FLOOR,
         INVERSE=inverse,
         COMPRESSED_KV=compressed_kv,
+        HAS_POS=positions is not None,
         num_warps=4,
     )
     return out

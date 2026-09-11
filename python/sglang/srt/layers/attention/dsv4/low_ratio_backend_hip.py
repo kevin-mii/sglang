@@ -527,7 +527,8 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
-    q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
+    # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
+    q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
     return q_fp4, q_scale, weights

@@ -57,9 +57,13 @@ def _seed(seed: int) -> random.Random:
 
 
 def _topk_inputs(rng, bs, width, topk, page_size, lens):
-    scores = torch.randn(bs, width, device=DEVICE)
-    # repeated columns so equal scores (ties) occur in every row
-    scores[:, 7::7] = scores[:, :-7:7][:, : scores[:, 7::7].shape[1]]
+    # distinct scores per row: the radix top-k breaks a tie at the threshold in
+    # atomic-counter order, so two launches over tied scores can select different
+    # sets, and this compares two launches
+    scores = (
+        torch.stack([torch.randperm(width, device=DEVICE).float() for _ in range(bs)])
+        * 0.37
+    )
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=DEVICE)
     n_pages = (width + page_size - 1) // page_size
     page_table = torch.randint(
@@ -401,3 +405,27 @@ def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
     empty = torch.empty(0, heads, 128, device=DEVICE, dtype=dtype)
     fp4, scale = pack_fp4_query_flydsl(empty)
     assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
+
+
+@pytest.mark.parametrize("compressed_kv", [False, True])
+def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
+    from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        rope_tail_fake_quant_fp4,
+    )
+
+    _seed(19)
+    table = torch.polar(
+        torch.ones(4096, 32, device=DEVICE),
+        torch.rand(4096, 32, device=DEVICE) * 6.283,
+    )
+    for tokens, heads in ((1, 64), (5, 64), (17, 1)):
+        x = torch.randn(tokens, heads, 128, device=DEVICE, dtype=torch.bfloat16) * 3
+        for pos_dtype in (torch.int64, torch.int32):
+            pos = torch.randint(0, 4096, (tokens,), device=DEVICE, dtype=pos_dtype)
+            ref = rope_tail_fake_quant_fp4(
+                x, table[pos], 64, compressed_kv=compressed_kv
+            )
+            out = rope_tail_fake_quant_fp4(
+                x, table, 64, compressed_kv=compressed_kv, positions=pos
+            )
+            assert torch.equal(out, ref)

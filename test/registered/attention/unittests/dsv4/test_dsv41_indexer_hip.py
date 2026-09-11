@@ -140,7 +140,9 @@ class _StubIndexer:
         self.owns_k = False
         self.n_local_heads = self.n_heads = q.shape[1]
 
-    def queries(self, q_lora, freqs):
+    def queries(self, q_lora, freqs, positions=None):
+        # the HIP path hands over the whole freqs table plus positions; the stub's
+        # queries are precomputed per token so both are ignored
         return self.q[q_lora]
 
     def head_weights(self, x):
