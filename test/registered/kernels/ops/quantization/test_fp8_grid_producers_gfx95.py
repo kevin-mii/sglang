@@ -269,6 +269,17 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         self.gemm = batched_gemm_bf16_fp8_grid
         self.fake_quant = fake_quant_fp8_activation
 
+    def _assert_within_bf16_of_exact(self, out, x, w, ctx):
+        """One bf16 rounding (half an ulp of the result) of an fp32 sum whose association
+        differs from aiter's: the fp32 error is bounded by the sum of absolute products."""
+        exact = torch.einsum("tgd,grd->tgr", x.double(), w.double()).flatten(1)
+        absprod = torch.einsum(
+            "tgd,grd->tgr", x.abs().float(), w.abs().float()
+        ).flatten(1)
+        err = (out.double() - exact).abs()
+        bound = exact.abs() * 2.0**-8 + absprod.double() * 2.0**-20 + 1e-6
+        self.assertTrue(bool((err <= bound).all()), (*ctx, err.max().item()))
+
     def test_bitwise_against_aiter_and_separate_fake_quant(self):
         """The single-launch regime (T above the split-K cap, or forced) is bitwise aiter's."""
         cases = [
@@ -295,14 +306,14 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
                 )
                 # Idempotent: the output is already on the grid.
                 self.assertTrue(torch.equal(self.fake_quant(grid), grid))
-            # above the split-K cap the default regime is the single launch (aiter's own
-            # kernel changes tile there, so it is only compared against itself)
+            # Above the split-K cap the default regime is the single launch. aiter's own
+            # kernel changes tile there, so the gate is the fp64 bound rather than bitwise.
             torch.manual_seed(99)
             w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
             x = torch.randn(65, g, d, device="cuda").bfloat16()
-            self.assertTrue(
-                torch.equal(self.gemm(x, w), self.gemm(x, w, split_k=False))
-            )
+            plain = self.gemm(x, w, fp8_grid=False)
+            self._assert_within_bf16_of_exact(plain, x, w, (g, r, d, 65))
+            self.assertTrue(torch.equal(self.gemm(x, w), self.fake_quant(plain)))
 
     def test_split_k_regime(self):
         """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product (the
@@ -317,22 +328,13 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
             torch.manual_seed(5)
             w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
             x = (torch.randn(64, g, d, device="cuda") * 1.5).bfloat16()
-            exact = torch.einsum("tgd,grd->tgr", x.double(), w.double()).flatten(1)
             full_plain = self.gemm(x, w, fp8_grid=False)
             self.assertTrue(
                 torch.equal(full_plain, self.gemm(x, w, fp8_grid=False, split_k=True))
             )
-            # one bf16 rounding (half an ulp of the result) of an fp32 sum whose association
-            # differs from aiter's: the fp32 error is bounded by the sum of absolute products
-            absprod = torch.einsum(
-                "tgd,grd->tgr", x.abs().float(), w.abs().float()
-            ).flatten(1)
-            err = (full_plain.double() - exact).abs()
-            bound = exact.abs() * 2.0**-8 + absprod.double() * 2.0**-20 + 1e-6
-            self.assertTrue(bool((err <= bound).all()), (g, r, d, err.max().item()))
+            self._assert_within_bf16_of_exact(full_plain, x, w, (g, r, d, "split"))
             single = self.gemm(x, w, fp8_grid=False, split_k=False)
-            err_single = (single.double() - exact).abs()
-            self.assertTrue(bool((err_single <= bound).all()), (g, r, d))
+            self._assert_within_bf16_of_exact(single, x, w, (g, r, d, "single"))
             full_grid = self.gemm(x, w)
             self.assertTrue(torch.equal(full_grid, self.fake_quant(full_plain)))
             for t in (1, 2, 6, 17):
