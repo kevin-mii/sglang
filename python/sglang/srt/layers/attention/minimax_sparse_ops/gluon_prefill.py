@@ -9,7 +9,7 @@ context is gathered into persistent SHUFFLE 5D scratch pages:
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize``. Each request occupies a contiguous,
+with ``x = 16 // dtype.itemsize`` (8 for bf16, 16 for an fp8 KV pool). Each request occupies a contiguous,
 position-ordered page range rounded up to whole sparse blocks.
 """
 
@@ -361,6 +361,41 @@ def _unit_or_none(scale) -> bool:
     return scale is None or scale == 1.0
 
 
+def _aiter_fp8_dtype() -> Optional[torch.dtype]:
+    """The fp8 storage dtype AITER's Gluon kernel accepts on this arch
+    (float8_e4m3fn on gfx950, float8_e4m3fnuz on gfx942), or None."""
+    try:
+        import aiter
+
+        return aiter.dtypes.fp8
+    except Exception:
+        return None
+
+
+def _kv_dtype_supported(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
+    if k_cache.dtype != v_cache.dtype:
+        return False
+    if k_cache.dtype == q.dtype:
+        return True
+    # fp8 KV pool with a bf16/fp16 q: the kernel dequantizes K/V in-register
+    # with per-tensor key/value scales (kv_quant_mode 0).
+    return k_cache.dtype == _aiter_fp8_dtype()
+
+
+# Per-tensor fp8 KV scales handed to the kernel: (device, value) -> fp32 [1].
+_SCALE_CACHE: dict = {}
+
+
+def _scale_tensor(value: Optional[float], device: torch.device) -> torch.Tensor:
+    v = 1.0 if value is None else float(value)
+    key = (device, v)
+    t = _SCALE_CACHE.get(key)
+    if t is None:
+        t = torch.full((1,), v, dtype=torch.float32, device=device)
+        _SCALE_CACHE[key] = t
+    return t
+
+
 def can_use_gluon_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -393,13 +428,13 @@ def can_use_gluon_prefill(
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k_cache.dtype == q.dtype
-        and v_cache.dtype == q.dtype
+        and _kv_dtype_supported(q, k_cache, v_cache)
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
-        and _unit_or_none(k_scale)
-        and _unit_or_none(v_scale)
+        # bf16 KV: the kernel takes no scales, so they must be unit. fp8 KV:
+        # per-tensor k/v scales are forwarded to the kernel.
+        and (k_cache.dtype != q.dtype or (_unit_or_none(k_scale) and _unit_or_none(v_scale)))
     )
 
 
@@ -417,6 +452,8 @@ def gluon_sparse_prefill(
     seq_lens_cpu: torch.Tensor,
     block_size_k: int,
     sm_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Run per-page Gluon sparse prefill over the NHD KV pool.
 
@@ -471,6 +508,10 @@ def gluon_sparse_prefill(
         topk_idx, req_id, abs_pos, page_start, block_size_k
     )
 
+    kv_is_fp8 = k_cache.dtype != q.dtype
+    key_scale = _scale_tensor(k_scale, q.device) if kv_is_fp8 else None
+    value_scale = _scale_tensor(v_scale, q.device) if kv_is_fp8 else None
+
     out = torch.empty_like(q)
     num_seqs = total_q
     ctx_part = 256
@@ -494,8 +535,8 @@ def gluon_sparse_prefill(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,

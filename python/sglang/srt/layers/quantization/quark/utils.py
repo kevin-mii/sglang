@@ -70,10 +70,22 @@ def should_ignore_layer(
 
         # Layer should be ignored if shards are ignored.
         should_ignore_layer = None
-        for shard_name in shard_names:
+        ignore = list(ignore)
+        for shard_proj_name, shard_name in zip(shard_proj_names, shard_names):
             should_ignore_shard = check_equal_or_regex_match(
                 layer_name=shard_name, targets=ignore
             )
+            # A packed shard whose projection name never appears in the
+            # producer's exclude list is one the checkpoint does not carry
+            # at all (e.g. MiniMax-M3 `index_v_proj` on value-disabled
+            # indexer layers). Its "not excluded" verdict says nothing about
+            # the fused layer's scheme, so do not let it veto the siblings.
+            if (
+                not should_ignore_shard
+                and should_ignore_layer
+                and not any(shard_proj_name in target for target in ignore)
+            ):
+                continue
 
             # If shard_idx=0, set layer ignore to match shard.
             if should_ignore_layer is None:
