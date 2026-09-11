@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
@@ -232,7 +233,10 @@ def wo_a_fp8_grid_matmul(o: torch.Tensor, wo_a: torch.Tensor, fp8_grid: bool):
     an ``Fp8GridActivation`` ``[T, G * R]``; None when the fork did not import."""
     if _wo_a_fp8_grid_gemm is None:
         return None
-    y = _wo_a_fp8_grid_gemm(o, wo_a, fp8_grid=fp8_grid)
+    # the split-K regime ends at 64 rows, so a request's verify and decode rows would
+    # take different reduction orders; deterministic inference keeps the single chain
+    split_k = False if get_exec().deterministic.enable_deterministic_inference else None
+    y = _wo_a_fp8_grid_gemm(o, wo_a, fp8_grid=fp8_grid, split_k=split_k)
     if fp8_grid:
         return Fp8GridActivation(y)
     return y.view(o.shape[0], wo_a.shape[0], wo_a.shape[1])
