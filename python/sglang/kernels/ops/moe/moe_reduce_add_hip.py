@@ -1,13 +1,8 @@
-"""The MoE top-k reduction with the shared-expert add folded in (ROCm).
-
-aiter's FlyDSL stage2 in ``mode="reduce"`` writes one row per (token, slot) and sums the
-slots in a separate launch (``moe_reduction_kernel``); the model then adds the shared
-expert's output (and, on some routes, the routed scaling factor) in another.
-``moe_topk_reduce_add`` does all of it in one launch: ``out[t] = alpha * sum_k valid[t, k] *
-x[t, k] + shared[t]`` accumulated in fp32, slots in ascending order as aiter sums them, one
-rounding at the end. Per-row work with a fixed order, so a row's result does not depend on
-the batch.
-"""
+"""The MoE top-k reduction with the shared-expert add folded in (ROCm): ``out[t] = alpha *
+sum_k valid[t, k] * x[t, k] + shared[t]``, fp32 accumulation over the slots in ascending order (as
+aiter's ``moe_reduction_kernel`` sums them), one rounding at the end; replaces aiter's separate
+reduce launch and the model's shared-expert add. Per-row fixed order, so a row does not depend on
+the batch."""
 
 from __future__ import annotations
 

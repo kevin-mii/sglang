@@ -202,11 +202,9 @@ def _rmsnorm_sinkhorn_kernel(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """Grid (M + m,): programs [0, M) are ``rmsnorm_fake_quant_row`` on the norm's rows,
-    programs [M, M + m) are ``_hc_mix_reduce_sinkhorn_row`` on the pending boundary's rows.
-    The two are independent per-row work that decode would otherwise launch back to back;
-    hosting them in one launch removes a launch from the critical path while each row keeps
-    its standalone kernel's arithmetic (same tiles, same warps)."""
+    """Grid (M + m,): programs [0, M) run ``rmsnorm_fake_quant_row`` on the norm's rows, programs
+    [M, M + m) ``_hc_mix_reduce_sinkhorn_row`` on the pending boundary's rows; each row keeps its
+    standalone kernel's arithmetic (same tiles, same warps)."""
     pid = tl.program_id(0)
     if pid < M:
         rmsnorm_fake_quant_row(

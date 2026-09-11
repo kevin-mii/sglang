@@ -1,9 +1,5 @@
-"""ROCm-only DeepSeek-V4 main-path K norm + RoPE + FlashMLA store that also ropes the
-query heads in the same launch.
-
-The HIP counterpart of ``fused_k_norm_rope_flashmla`` in elementwise.py, which
-dispatches here when it is handed ``q``.
-"""
+"""ROCm-only ``fused_k_norm_rope_flashmla`` that also ropes the query heads in the same launch;
+elementwise.py dispatches here when handed ``q``."""
 
 from __future__ import annotations
 
@@ -49,9 +45,8 @@ def fused_k_norm_rope_flashmla_with_q(
     page_size: int,
     q: torch.Tensor,
 ) -> None:
-    """``fused_k_norm_rope_flashmla``'s K store, and the trailing ``rope_dim`` of every head of
-    ``q`` ([B, H, head_dim], the same tokens) rotated in place by the same launch, bitwise what
-    ``fused_rope_inplace`` produces. ``freqs_real`` is the real view of ``freqs_cis``."""
+    """``fused_k_norm_rope_flashmla``'s K store plus the in-place rope of ``q`` ([B, H, head_dim],
+    the same tokens); ``freqs_real`` is the real view of ``freqs_cis``."""
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_k_norm_rope_flashmla_q_module(

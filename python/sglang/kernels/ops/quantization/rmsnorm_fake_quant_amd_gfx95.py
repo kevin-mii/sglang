@@ -47,10 +47,8 @@ def rmsnorm_fake_quant_row(
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
 ):
-    """One row: (residual add,) RMSNorm in fp32, bf16 rounding, then, with ``FAKE_QUANT``,
-    the per-32 ue8m0 fp8 e4m3 quantize-dequantize of ``fake_quant_fp8_activation``. Shared
-    by the standalone kernel below and the kernels that host a norm row next to other work
-    (the mHC boundary's reduce + sinkhorn)."""
+    """One row: (residual add,) RMSNorm in fp32, bf16 rounding, then, with ``FAKE_QUANT``, the
+    per-32 ue8m0 fp8 e4m3 quantize-dequantize of ``fake_quant_fp8_activation``."""
     base = tl.arange(0, CHUNK)
     x_row = x_ptr + row * stride_xm
     res_row = res_ptr + row * stride_rm

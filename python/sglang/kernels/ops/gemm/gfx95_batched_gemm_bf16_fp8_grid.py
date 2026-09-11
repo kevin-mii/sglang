@@ -2,17 +2,12 @@
 """Batched bf16 GEMM ``Y[g] = X[g] @ W[g]^T`` with the consumer's fp8-grid rounding in the
 epilogue: the DeepSeek-V4 ``wo_a`` absorb GEMM at decode on gfx950. Requires ``R % 32 == 0``.
 
-Two regimes, both batch-invariant and repeatable:
-
-* ``T > _SPLIT_K_MAX_M``: aiter's ``_batched_gemm_bf16_kernel`` main loop at a fixed
-  16 x 32 x 512 tile, so the bf16 result is bitwise aiter's and with ``fp8_grid=True`` bitwise
-  ``fake_quant_fp8_activation(batched_gemm_bf16(...))``.
-* ``T <= _SPLIT_K_MAX_M`` (decode, target verify): the same tile split eight ways along K, fp32
-  partials, then a reduce launch with the epilogue. At these row counts the single-launch
-  kernel only fills 64 CUs and streams the 16 MB weight in 12 us; the split fills the machine
-  and takes 7.5 us including the reduce (cold weights). The fp32 sum order is fixed
-  (per-split MFMA chain, then splits in order), so rows are still batch-invariant; the bits
-  differ from aiter's single chain by the reassociation.
+Two batch-invariant regimes. Above ``_SPLIT_K_MAX_M`` rows: aiter's ``_batched_gemm_bf16_kernel``
+loop at a fixed 16 x 32 x 512 tile, bitwise aiter's (with ``fp8_grid`` bitwise
+``fake_quant_fp8_activation(batched_gemm_bf16(...))``). At or below: the same tile split eight
+ways along K, fp32 partials, then a reduce launch with the epilogue, which fills the machine at
+decode row counts; the fixed sum order keeps rows batch-invariant, the bits differ from aiter's
+single chain by the reassociation.
 """
 
 from __future__ import annotations

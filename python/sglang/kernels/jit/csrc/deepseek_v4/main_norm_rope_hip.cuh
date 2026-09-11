@@ -1,8 +1,6 @@
-/// The K rmsnorm + RoPE + FlashMLA store of `main_norm_rope.cuh` with the
-/// query heads of the same tokens roped in place by the same launch, replacing
-/// the standalone query rope launch on ROCm. The K path is dev's
-/// `fused_k_norm_rope_flashmla` repeated verbatim, so the shared file stays
-/// dev's; the query rope is the block after the norm.
+/// `main_norm_rope.cuh`'s K rmsnorm + RoPE + FlashMLA store with the same tokens' query heads
+/// roped in place by the same launch, replacing the standalone query rope launch on ROCm. The K
+/// path repeats `fused_k_norm_rope_flashmla` verbatim; the query rope is the block after the norm.
 
 #pragma once
 

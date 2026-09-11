@@ -1,16 +1,12 @@
-"""One launch for the DeepSeek-V4 MoE front at decode row counts on ROCm: the sqrtsoftplus
-top-k gate of :mod:`rocm_router_gate` (on split-K partials or logits) followed by aiter's MoE
-sorting (:mod:`aiter_moe_sorting_fused`). Every output is bit for bit what the two launches
-produce: ``weights``/``ids`` as aiter's ``topk_gating``, the five sorting tensors as
-``aiter.fused_moe.moe_sorting`` (padded rows as expert 0, weight 0).
+"""One launch for the DeepSeek-V4 MoE front at decode row counts on ROCm: the sqrtsoftplus top-k
+gate of :mod:`rocm_router_gate` followed by aiter's MoE sorting (:mod:`aiter_moe_sorting_fused`),
+every output bit for bit the two launches'.
 
-One program per row runs the per-row gate of the gate launch, writes the row's outputs and
-zeroes its ``moe_buf`` row. Program 0 then sorts all ``M * TOPK`` entries at once: with so
-few entries, the deduplication, the per-expert counts, the block prefix and the token ranks
-are all pairwise comparisons, no histogram. At ``M == 1`` the entries are program 0's own
-lane tensors; otherwise the rows reach program 0 through a fence-free hand-off: each row's
-slots are ``int64`` words with a valid bit, published and polled with device-scope atomic
-adds (coherent across XCDs without an L2 writeback) and cleared by program 0 once read.
+One program per row runs the gate and zeroes its ``moe_buf`` row; program 0 then sorts all
+``M * TOPK`` entries by pairwise comparison. At ``M == 1`` they are its own lanes; otherwise rows
+reach program 0 through a fence-free hand-off: ``int64`` slots with a valid bit, published and
+polled with device-scope atomic adds (coherent across XCDs without an L2 writeback), cleared
+once read.
 """
 
 from __future__ import annotations

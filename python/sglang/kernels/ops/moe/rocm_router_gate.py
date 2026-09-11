@@ -107,7 +107,7 @@ def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """``x[M, K] @ w[N, K].T`` as fp32 split-K partials ``[K // 512, M, N]``.
 
     Sum the partials over dim 0 in order (:func:`rocm_router_reduce_partials`,
-    or the fused gate) to get the logits.  ``M <= ROCM_ROUTER_MAX_TOKENS``.
+    or the fused gate) to get the logits. ``M <= ROCM_ROUTER_MAX_TOKENS``.
     """
     M, K = x.shape
     N, K_w = w.shape

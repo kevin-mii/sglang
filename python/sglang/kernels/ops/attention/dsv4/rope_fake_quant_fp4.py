@@ -27,9 +27,7 @@ def rope_tail_fake_quant_fp4_row(
     COMPRESSED_KV: tl.constexpr,
 ):
     """One row of ``rope_tail_fake_quant_fp4`` as an fp32 ``[D]`` vector: ``x_row_ptr`` points
-    at the row, ``f_row_ptr`` at the token's ``[RD // 2, 2]`` real view of the complex freqs.
-    Shared by the standalone kernel and the kernels that pack the result further (the
-    HIP index-Q launch)."""
+    at the row, ``f_row_ptr`` at the token's ``[RD // 2, 2]`` real view of the complex freqs."""
     offs = tl.arange(0, D)
     v = tl.load(x_row_ptr + offs).to(tl.float32)
 

@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints.
 
-The weight is kept in fp8, permuted once at load into the scaled-MFMA lane order
-(``shuffle_mxfp8_weight``, ``[N/16, K/128, 2048]``) with its block scales as ue8m0 exponent bytes
-``[N/32, K/32]``; a bf16 copy is kept only for a shape whose ``large_m_plan`` picks hipBLASLt.
-Every path multiplies the CUDA MXFP8 route's operands (fp8 e4m3 x fp8 e4m3, per-32 ue8m0 scales,
-fp32 accumulation) with a summation order fixed by its tile, so repeated calls are bitwise
-identical and rows are batch-invariant inside one M range. ``M <= 32`` runs ``mxfp8_gemv`` with
-the per-shape config from ``mxfp8_gemv_gfx95_configs.json``; larger M runs the Triton
-``tl.dot_scaled`` GEMM over the shuffled weight or hipBLASLt bf16, per ``large_m_plan``.
-Skinny kernel limits: 1 <= M <= 32, K % 128 == 0, N % 32 == 0; gfx950 only.
+The weight stays fp8, permuted once at load into the scaled-MFMA lane order
+(``shuffle_mxfp8_weight``) with its block scales as ue8m0 bytes; a bf16 copy exists only for
+shapes whose ``large_m_plan`` picks hipBLASLt. Every path multiplies the CUDA MXFP8 route's
+operands with a tile-fixed sum order, so calls are repeatable and rows batch-invariant within one
+M range: ``M <= 32`` runs ``mxfp8_gemv`` with the per-shape config from
+``mxfp8_gemv_gfx95_configs.json``, larger M the ``tl.dot_scaled`` GEMM or hipBLASLt bf16 per
+``large_m_plan``. gfx950 only; ``K % 128 == 0``, ``N % 32 == 0``.
 """
 
 from __future__ import annotations
@@ -175,8 +173,8 @@ def mxfp8_gemv(
     """``out[M, N] bf16 = x[M, K] . W^T`` on the gfx950 scaled matrix core.
 
     ``x`` is fp8 e4m3 with ``x_scale`` ue8m0 ``[M, K/32]``, or bf16 (quantized in-kernel with
-    the same rule; ``x_scale`` unused).  ``weight_shuffled`` / ``weight_scale_ue8m0`` come from
-    ``shuffle_mxfp8_weight`` / ``ue8m0_weight_scale``.  ``config`` overrides the table lookup."""
+    the same rule; ``x_scale`` unused). ``weight_shuffled`` / ``weight_scale_ue8m0`` come from
+    ``shuffle_mxfp8_weight`` / ``ue8m0_weight_scale``. ``config`` overrides the table lookup."""
     assert x.dim() == 2 and x.is_contiguous(), x.shape
     m, k = x.shape
     n = weight_shuffled.shape[0] * _TILE_N
@@ -214,7 +212,8 @@ def large_m_bucket(m: int) -> int:
 
 @functools.lru_cache(maxsize=2)
 def _large_m_table(fp8_in: bool) -> Dict[str, str]:
-    """{'gfx950:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,splitk'} from the table's "large_m" section."""
+    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,splitk'}`` from the table's
+    ``large_m`` / ``large_m_fp8in`` section."""
     try:
         with open(CONFIG_FILE) as f:
             table = json.load(f)
@@ -367,7 +366,7 @@ def mxfp8_shuffled_gemm(
     splitk: int,
 ) -> torch.Tensor:
     """``[M, N] bf16 = xq[M, K] fp8 . W^T`` over the shuffled fp8 weight with the table's
-    ``tile`` (BM, BN, BK, warps).  With ``splitk > 1`` the K partitions' fp32 partials are
+    ``tile`` (BM, BN, BK, warps). With ``splitk > 1`` the K partitions' fp32 partials are
     summed in partition order (deterministic)."""
     m, k = xq.shape
     n = weight_shuffled.shape[0] * 16
@@ -427,7 +426,7 @@ def mxfp8_native_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
     input_on_fp8_grid: bool = False,
 ) -> torch.Tensor:
-    """Dense linear of the native route.  ``input`` is bf16 (plain, or on the fp8 grid
+    """Dense linear of the native route. ``input`` is bf16 (plain, or on the fp8 grid
     when ``input_on_fp8_grid``), or fp8 e4m3 with ``input_scale`` ue8m0 ``[M, K/32]``."""
     input_2d = input.view(-1, input.shape[-1])
     m, k = input_2d.shape

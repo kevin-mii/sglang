@@ -682,12 +682,9 @@ def _quantize_fp4_query_flydsl_kernel(
 
 
 def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """fp4-grid query [T, H, 128] -> (payload int8 [T, H, 64], scale uint8
-    [T, 1, 4, 16, 4]) in the FlyDSL MQA-logits layout: the e8m0 byte of head h,
-    chunk c sits at [t, 0, c, h % 16, h // 16] (H <= 64). Ties round to even
-    (`rne=True`), the same quantizer and convention as the CUDA low-ratio path.
-    One launch: the quantizer writes the scale layout itself (bitwise the
-    quantize / zeros / permute-copy chain of ``pack_fp4_query_flydsl_torch``)."""
+    """fp4-grid query [T, H, 128] -> (payload int8 [T, H, 64], scale uint8 [T, 1, 4, 16, 4]) in the
+    FlyDSL MQA-logits layout: head h, chunk c's e8m0 byte at [t, 0, c, h % 16, h // 16] (H <= 64),
+    RNE as the CUDA low-ratio path."""
     num_tokens, heads = q.shape[0], q.shape[1]
     assert heads % 16 == 0 and heads <= 64, heads
     assert q.shape[-1] == _HEAD_DIM
@@ -816,12 +813,9 @@ def _index_q_pack_weights_kernel(
     SPLIT_K: tl.constexpr,
     W_BLOCK: tl.constexpr,
 ):
-    """Grid (T * H + 1,). Programs [0, T * H): the (token, head) query row through
-    ``rope_tail_fake_quant_fp4_row`` (rounded to bf16 as the standalone kernel stores it),
-    then ``quantize_fp4_indexer_row`` (RNE), stored in the FlyDSL MQA-logits layout: payload
-    row ``t * H + h``, the four e8m0 bytes at ``[t, 0, c, h % 16, h // 16]``; heads of group 0
-    also zero the unused group slots. Program T * H: the head weights'
-    ``_reduce_scale_bf16_block``. Bitwise the three standalone launches."""
+    """Grid (T * H + 1,). Program t * H + h: the query row through ``rope_tail_fake_quant_fp4_row``
+    (rounded to bf16 as the standalone kernel stores it) and ``quantize_fp4_indexer_row`` (RNE), in
+    the FlyDSL MQA-logits layout; program T * H: the head weights' ``_reduce_scale_bf16_block``."""
     pid = tl.program_id(0)
     if pid < T * H:
         t = pid // H
@@ -935,7 +929,7 @@ def rocm_indexer_head_weights(
     x: torch.Tensor, weight: torch.Tensor, scale: float
 ) -> torch.Tensor:
     """``bf16(bf16(x @ weight.T) * scale)`` as a contiguous bf16 ``[M, N]``, the
-    layout the FlyDSL logits kernels take.  ``x`` bf16 ``[M, K]`` with
+    layout the FlyDSL logits kernels take. ``x`` bf16 ``[M, K]`` with
     ``M <= rocm_indexer_head_weights_max_tokens(...)``, ``weight`` bf16 ``[N, K]``."""
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
@@ -987,13 +981,10 @@ def _sort_selection_rows_kernel(
 def sort_selection_rows(
     page_indices: torch.Tensor, raw_indices: Optional[torch.Tensor] = None
 ) -> None:
-    """Order every row of a top-k selection ascending by position, -1 padding
-    last, in place. The AOT radix top-k emits its picks in atomic-counter order
-    and the sparse attention accumulates in the order given, so an unsorted row
-    is a different floating-point sum on every launch; the torch reference
-    (``LowRatioBackendMixin``) sorts the same way. ``page_indices`` int32
-    ``[rows, k]`` with ``k`` a power of two; ``raw_indices`` the matching
-    positions, or None to order by slot."""
+    """Order every row of a top-k selection ascending by position, -1 padding last, in place: the
+    sparse attention sums in the order given, so an unordered row is a different fp32 sum per launch.
+    ``page_indices`` int32 ``[rows, k]``, ``k`` a power of two; ``raw_indices`` the positions, or
+    None to order by slot."""
     rows, k = page_indices.shape
     assert k & (k - 1) == 0, k
     assert page_indices.stride(1) == 1 and (
