@@ -12,7 +12,7 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 _HIP_BACKENDS = ("tilelang", "triton", "aiter_sparse", "torch", "comparison")
 
-# from this many query tokens the aiter sparse kernel runs unsplit, keeping a prefill row batch-invariant
+# at this many query tokens and above the aiter sparse kernel runs unsplit (batch-invariant prefill)
 _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS = 1024
 
 
@@ -110,7 +110,7 @@ def _apply_inverse_rope(
 
     freqs_real, positions = inv_rope
     n = out.shape[0]
-    # freqs_real is the model's view_as_real(freqs_cis).flatten(-2); the rope entry takes the complex table
+    # freqs_real is view_as_real(freqs_cis).flatten(-2); fused_rope_inplace takes the complex table
     freqs_cis = torch.view_as_complex(freqs_real.view(freqs_real.shape[0], -1, 2))
     fused_rope_inplace(
         out.view(n, -1, out.shape[-1])[..., -freqs_real.shape[-1] :],
@@ -151,12 +151,12 @@ def hip_attention_needs_head_pad() -> bool:
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
-        # a caller may pick one HIP kernel per forward mode; the CUDA names fall back to the HIP default
+        # a caller may name one HIP kernel per forward mode; CUDA names fall back to the HIP default
         if backend not in _HIP_BACKENDS:
             backend = resolve_hip_flashmla_backend()
         backend = resolve_hip_flashmla_backend(backend)
         if backend != "aiter_sparse" and kwargs.get("inv_rope") is not None:
-            # only the aiter kernel folds the inverse RoPE into its combine; apply it to the others' output
+            # only the aiter kernel folds the inverse RoPE into its combine; apply it here for the rest
             inv_rope = kwargs.pop("inv_rope")
             out, lse = flash_mla_with_kvcache_entrypoint(backend=backend, **kwargs)
             b, s_q, h, d = out.shape

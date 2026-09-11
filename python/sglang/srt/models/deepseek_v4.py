@@ -1143,7 +1143,7 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        # the fused qk-norm-rope store quantizes for a 128x128-block wq_b; a 32-block checkpoint keeps the plain path
+        # the fused qk-norm-rope store quantizes for a 128x128-block wq_b; 32-block keeps the plain path
         self.use_fused_qk_norm_rope = (
             _is_hip
             and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
@@ -1843,7 +1843,7 @@ class MQALayer(MqaAttentionBase):
             )
             q = self._compute_q_b(q_for_wq_b, positions, q_out, skip_rope=fuse_q_rope)
             if q_for_wq_b is not q_lora:
-                # the indexer's wq_b would re-round q_lora onto the same fp8 grid, so hand it the fused operand
+                # the indexer's wq_b would re-round onto the same grid, so hand it the fused operand
                 q_lora = q_for_wq_b
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -1996,7 +1996,7 @@ class MQALayer(MqaAttentionBase):
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
         skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
-        # only the tilelang decode kernel is built for the padded head widths; aiter and Triton take the real count
+        # only tilelang is built for padded head widths; aiter and Triton take the real head count
         skip_hip_pad = (
             _is_hip and self.attn_tp_size > 1 and not hip_attention_needs_head_pad()
         )
@@ -2092,8 +2092,7 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
-        # the aiter sparse kernel applies the inverse RoPE itself; the fp8 route and the
-        # breakable-graph op keep the standalone launch
+        # the attention kernel applies the inverse RoPE itself; fp8 wo_a and the graph op keep theirs
         inv_rope = None
         if (
             _is_hip
@@ -2235,12 +2234,10 @@ class MQALayer(MqaAttentionBase):
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    # ROCm: the 16-row decode kernels also serve target-verify rows
                     o = _apply_wo_a_bf16_matmul(
                         o,
                         wo_a,
-                        # ROCm: target verify has a few rows per request, and the
-                        # decode kernels (16-row tiles) serve it as well; CUDA keeps
-                        # its own verify route behind is_target_verify
                         is_decode=(
                             forward_batch.forward_mode.is_decode()
                             or (
@@ -2394,7 +2391,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
-        # ROCm: hc_post, the predecessor-pre collapse and the mixing statistics in one launch per boundary
+        # ROCm: hc_post, pre-collapse and mixing stats in one launch; the kernel only supports hc_mult 4
         self.hc_boundary_fused = (
             _is_hip and self.hc_pre_from_prev_sublayer and hc_mult == 4
         )
@@ -2745,7 +2742,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # the Triton fused post+pre does not fold the input layernorm, so _input_norm runs it
+                    # the Triton fused post+pre does not fold the input layernorm
                     hidden_states, x_quant = self._input_norm(hidden_states)
                 else:
                     x_quant = None
@@ -3802,7 +3799,7 @@ class DeepseekV4Model(nn.Module):
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
         prev_pre = None
-        # the fused boundary leaves the FFN hc_post unapplied; readers of the residual stream materialize it
+        # the fused boundary leaves the FFN hc_post pending; residual-stream readers apply it first
         pending_post = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:

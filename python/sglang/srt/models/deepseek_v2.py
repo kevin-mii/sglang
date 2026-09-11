@@ -961,8 +961,8 @@ class DeepseekV2MoE(nn.Module):
             forward_batch.num_token_non_padded if forward_batch is not None else None
         )
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
-        # TODO: propose for dev as its own PR
-        # image tokens exist only in extend batches with images; every other batch routes on the fused top-k
+        # TODO: not ROCm-specific; propose for dev as its own PR
+        # image tokens exist only in extend batches with images; other batches take the fused top-k
         if use_vision_topk and _is_hip and forward_batch is not None:
             use_vision_topk = (
                 forward_batch.forward_mode.is_extend()
@@ -1235,9 +1235,7 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
-        # ROCm aiter: the shared expert runs first so the experts' top-k reduction can add it
-        # in the same launch (aiter_fused_reduce_shared_add); the routed-scale/shared-add
-        # step below then has nothing left to do.
+        # aiter: the shared expert runs first so the experts' top-k reduction can add it in one launch
         fuse_shared_into_reduce = (
             _use_aiter
             and envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()

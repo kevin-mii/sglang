@@ -355,7 +355,7 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
-    # gfx950 native MXFP8: fp8 weight in scaled-MFMA lane order + ue8m0 scale bytes; untiled shapes keep bf16
+    # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
     UNSUPPORTED = "unsupported"
 
@@ -670,7 +670,7 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     On gfx950 the Triton dot_scaled kernel takes the route by default.
     """
     backend = get_fp8_gemm_runner_backend()
-    # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 always takes an MXFP8 route
+    # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
     if _is_hip and _is_gfx95_supported:
         if backend.is_triton():
             return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED

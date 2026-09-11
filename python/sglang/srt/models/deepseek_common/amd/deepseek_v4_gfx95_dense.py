@@ -44,7 +44,7 @@ if _is_hip and _is_gfx95_supported:
         rmsnorm_fake_quant_fp8,
     )
 
-# gfx950 fork of the aiter batched GEMM with wo_b's fp8-grid rounding in its epilogue; None keeps the aiter kernel
+# aiter batched GEMM fork with wo_b's fp8-grid rounding in its epilogue; None keeps the aiter kernel
 _wo_a_fp8_grid_gemm = None
 if _use_aiter and _is_gfx95_supported and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get():
     try:

@@ -59,7 +59,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     if target_size == curr_size:
-        # F.pad would still clone (a fill and a copy launch); an aligned buffer is returned as is
+        # F.pad would clone even at the aligned size
         return x
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
@@ -941,11 +941,8 @@ class LowRatioBackendMixin:
 
             q, _ = indexer.wq_b(q_lora)
             q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
-            # One launch for the query's RoPE tail, both fp4 stages and the pack,
-            # plus the head weights `head_weights(x).float()` as its epilogue
-            # (bitwise: same fp32 multiply, same bf16 rounding). The kernel
-            # indexes `freqs_cis` by position itself; the real/imag view of the
-            # complex table is a free view, as at the c1/c2 write.
+            # The fused query pack also computes head_weights(x).float(), preserving
+            # the fp32 multiply and bf16 rounding. freqs_cis stays a real/imag view.
             q_fp4, q_sf, weights = index_q_rope_pack_weights(
                 q,
                 torch.view_as_real(layer.freqs_cis).flatten(-2),

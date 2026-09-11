@@ -258,9 +258,7 @@ def _map_compact_selection_kernel(
     )
     slot = page * PAGE_SIZE + real % PAGE_SIZE
     if SORT:
-        # BLOCK == TOPK here (a power of two): every lane is a row entry. The
-        # position is the key when the row has raw indices, else the slot (as
-        # sort_selection_rows(page, None) orders).
+        # BLOCK == TOPK (power of two): the sort key is the position with raw indices, else the slot
         if WRITE_RAW:
             hi = real
         else:
@@ -300,7 +298,7 @@ class CandidateBlocks(NamedTuple):
     ids: torch.Tensor
     # int32 [rows]: kept blocks * block_size, the width of the compact row.
     compact_lens: torch.Tensor
-    # int32 [rows, 1] zeros: with page_size = compact_page_size the paged top-k maps a position to itself
+    # int32 [rows, 1] zeros; with page_size = compact_page_size a position maps to itself
     compact_page_table: torch.Tensor
     compact_page_size: int
     block_size: int
@@ -503,8 +501,7 @@ def _indexer_inputs(layer, x, q_lora, pos):
         and indexer.index_head_dim == 128
         and layer.freqs_cis.dtype == torch.complex64
     ):
-        # decode / verify rows: wq_b, the head-weight GEMV, then one launch for the RoPE,
-        # the two-stage fp4 pack in the FlyDSL layout and the head-weight reduce
+        # decode rows: wq_b, split-K head-weight GEMV, then one launch for RoPE, fp4 pack and reduce
         from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
         q, _ = indexer.wq_b(q_lora)
@@ -552,9 +549,6 @@ def refresh_low_ratio_prefill_workspaces(
         )
         for ratio, meta in metadata_by_ratio.items()
     }
-
-
-# an identity request (visible compressed context <= index_topk) selects every position, so no scoring
 
 
 def low_ratio_identity_skip_enabled(
@@ -622,9 +616,6 @@ def low_ratio_decode_rows_are_identity(backend, forward_batch, ratio: int) -> bo
     return max_len is not None and max_len // ratio <= backend.index_topk
 
 
-# a request fitting the candidate span has every block among its candidates, so both top-k levels are skipped
-
-
 def low_ratio_candidate_skip_span(hf_text_config) -> Optional[int]:
     """The span (in positions) within which every block of a request is a
     candidate, when the model has a candidate source; None otherwise."""
@@ -680,7 +671,7 @@ def low_ratio_index_topk_hip_decode(
     raw_indices = core.sparse_raw_indices(ratio)
 
     if low_ratio_decode_rows_are_identity(backend, forward_batch, ratio):
-        # the transform takes its sequential branch for every row (seq_len <= topk) and never reads the scores
+        # every row takes the transform's sequential branch (len <= topk), which reads no scores
         scores = torch.empty(
             (page_indices.shape[0], 1), dtype=torch.float32, device=pos.device
         )
@@ -696,7 +687,7 @@ def low_ratio_index_topk_hip_decode(
 
     two_level = indexer.is_candidate_source or indexer.uses_candidates
     if two_level and low_ratio_decode_rows_fit_candidate_span(backend, forward_batch):
-        # every block is a candidate: the source publishes nothing and every layer runs the plain paged top-k
+        # every block is a candidate: the source publishes nothing, every layer runs the plain top-k
         if indexer.is_candidate_source:
             backend.candidate_masks = None
         two_level = False
@@ -715,7 +706,7 @@ def low_ratio_index_topk_hip_decode(
         is_decode=True,
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
     )
-    # level one bounded on the device by the real compressed lengths: a captured step cannot read them back
+    # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         candidates = backend.candidate_masks
         assert (
@@ -789,7 +780,7 @@ def low_ratio_index_topk_hip_extend(
     consume = backend.candidate_masks if indexer.uses_candidates else None
     published = [] if indexer.is_candidate_source else None
     if any(identity):
-        # only the score-free fill resolves slots itself; scored rows resolve inside the top-k transform
+        # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
         slot_chunks, starts = backend._low_ratio_extend_k_slots(
             ratio=ratio,
             lc_per_req=lc_per_req,
@@ -869,7 +860,7 @@ def low_ratio_index_topk_hip_extend(
             publish=publish,
         )
 
-    # request groups that fit the pooled logits block; rows are independent, so grouping equals one pass
+    # group requests to fit the pooled logits block; rows are independent, so grouping is exact
     rows_per_chunk = logits_rows_per_chunk(
         indexer_metadata.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
     )
@@ -889,8 +880,7 @@ def low_ratio_index_topk_hip_extend(
                 published,
             )
             continue
-        # one request wider than the pooled logits block: scored in row chunks, its level-one mask
-        # published in one piece and a consumed mask read by the same rows
+        # a request wider than the logits block: scored in row chunks, its mask published in one piece
         assert req_hi == req_lo + 1, (req_lo, req_hi)
         pieces = []
         for lo in range(tok_lo, tok_hi, rows_per_chunk):

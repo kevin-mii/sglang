@@ -1467,8 +1467,8 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        # HIP graph capture: torch.distributed.broadcast aborts every rank (hipErrorCapturedEvent)
         if is_hip():
-            # a torch.distributed broadcast captured into a HIP graph aborts every rank (hipErrorCapturedEvent)
             pynccl_comm = self.pynccl_comm
             if pynccl_comm is not None and not pynccl_comm.disabled:
                 pynccl_comm.broadcast(input_, src=src)

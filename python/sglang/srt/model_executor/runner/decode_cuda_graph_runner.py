@@ -331,10 +331,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.candidate_filter_span = None
         self.candidate_graph_limits = []
         text_config = model_runner.model_config.hf_text_config
+        # the ROCm low-ratio indexer (low_ratio_backend_hip) reads the same capture variants
         if (
             self.capture_forward_mode == ForwardMode.DECODE
             and model_runner.device == "cuda"
-            # the ROCm indexer (low_ratio_backend_hip) reads the same variants
             and (
                 is_hip()
                 or torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10

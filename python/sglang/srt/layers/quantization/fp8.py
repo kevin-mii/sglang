@@ -864,7 +864,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
         elif backend.is_gfx95_dot_scaled():
-            # dot_scaled reads canonical [N, K // 32] e8m0 bytes; the block scales stay for direct readers
+            # dot_scaled reads canonical [N, K // 32] e8m0 bytes; block scales stay for direct readers
             if scale_u8 is not None:
                 copy_or_rebind_param(
                     layer, "weight_scale_inv_mx", scale_u8.contiguous()
@@ -881,7 +881,7 @@ class Fp8LinearMethod(LinearMethodBase):
             n, k = layer.weight.shape
             layer.mxfp8_native_ready = False
             if native_route_supports(n, k):
-                # the same bytes in scaled-MFMA lane order; a bf16 copy stays only where hipBLASLt serves M > 32
+                # same bytes in scaled-MFMA lane order; a bf16 copy only where hipBLASLt serves M > 32
                 shuffled, scale_ue8m0, weight_bf16 = prepare_mxfp8_native_weight(
                     layer.weight.data,
                     layer.weight_scale_inv.data,
@@ -1097,7 +1097,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
             return self._apply_gfx95_dense(layer, x, bias)
-        # off a gfx950 route the wrapper is unwrapped; re-quantizing is safe (per-32 rounding is idempotent)
+        # off a gfx950 route the wrapper is unwrapped; re-quantizing is idempotent per-32 rounding
         if isinstance(x, Mxfp8Activation):
             x = Fp8GridActivation(dequant_mxfp8_to_bf16(x.q, x.scale))
         if isinstance(x, Fp8GridActivation):
@@ -1219,7 +1219,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 return self._apply_gfx95_native(layer, x.q, bias, input_scale=x.scale)
             x = Fp8GridActivation(dequant_mxfp8_to_bf16(x.q, x.scale))
         if isinstance(x, Fp8GridActivation):
-            # the dot_scaled route quantizes the plain tensor itself (the per-32 rounding is idempotent)
+            # the dot_scaled route quantizes the plain tensor itself (per-32 rounding is idempotent)
             if native:
                 return self._apply_gfx95_native(
                     layer, x.x, bias, input_on_fp8_grid=True

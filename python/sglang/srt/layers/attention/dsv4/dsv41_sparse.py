@@ -279,7 +279,7 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """``freqs`` per token, or the whole table with ``positions`` (the gather
         then happens inside the fused RoPE launch)."""
-        # on the gfx950 bf16-dequant route q_lora may be the Fp8GridActivation the fused q_norm produced
+        # on gfx950 q_lora may be the Fp8GridActivation the fused q_norm produced
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)

@@ -810,9 +810,7 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        # The Triton gather serves a device table on CUDA and HIP alike (the same
-        # bf16(fp32(row) * 2**(e - 127)) arithmetic); the torch chain below is ~12
-        # launches per lookup and stays for CPU indices.
+        # the Triton gather serves CUDA and HIP alike; the torch chain stays for CPU indices
         if self.host_table is None and not indices.is_cuda:
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)

@@ -862,10 +862,8 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # ROCm sparse decode attention kernel. "auto" (the default) is resolved by
-    # hip_flash_mla.resolve_hip_flashmla_backend to aiter_sparse on gfx950 and
-    # tilelang elsewhere; set explicitly to force one of tilelang | triton |
-    # aiter_sparse | torch | comparison.
+    # ROCm decode attention kernel; "auto" resolves to aiter_sparse on gfx950, tilelang elsewhere
+    # (resolve_hip_flashmla_backend). Also: triton | torch | comparison | unified_kv_triton.
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
@@ -889,24 +887,15 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    # DSV4.1 mHC on gfx950: the sublayer boundary's reduce + sinkhorn rides in the
-    # layer's next RMSNorm launch (rmsnorm_with_sinkhorn) instead of its own launch.
-    # Set to 0 to launch it alone (A/B; the values are bitwise the same).
+    # gfx950 mHC: the boundary reduce + sinkhorn rides in the layer's next RMSNorm launch (0: alone)
     SGLANG_OPT_HIP_HOSTED_SINKHORN = EnvBool(True)
-    # DSV4 MoE on aiter: the FlyDSL top-k reduction adds the shared expert (and the
-    # routed scale) in the same launch (moe_topk_reduce_add). Set to 0 for aiter's
-    # reduction plus the separate shared-expert add.
+    # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
     SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
-    # DSV4.1 decode glue on HIP in single launches: Engram history commit, core
-    # page table, widened indexer indices, the image-token select inside the Engram
-    # gate. Set to 0 for the torch chains (bitwise the same).
+    # HIP: fused decode glue launches (Engram commit, page table, index widening, image select); 0: torch
     SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
-    # DSV4.1 decode attention on gfx950 (aiter_sparse): pin the split-KV count of the
-    # decode / verify rows. 0 keeps aiter's cost model, which picks 4 up to 64 rows, 2 at
-    # 96-128, 4 at 192 and 1 at 256, so a row's fp32 combine order (and its bits) depends
-    # on the batch size past 64 rows; a pinned value makes decode batch-invariant at
-    # every size. Measured per layer (SWA 128 + top-k 512, 16 heads): 8 is fastest up to
-    # 32 rows (16.3 vs 19.0 us at 1 row), 4 at 64, 2 at 128, 1 at 256 (82 vs 50 us pinned 4).
+    # aiter_sparse decode: pin the split-KV count of the decode / verify rows so the fp32 combine
+    # order, hence the bits, is the same at every batch size. 0 keeps aiter's cost model, which
+    # changes the split count with the batch past 64 rows.
     SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
 
     # ===================================================================

@@ -254,7 +254,7 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
-    # ratio 1 / 2 (V4.1) latents live at raw_out_loc // ratio of the c1 / c2 pool; None for absent ratios
+    # V4.1 ratios 1 / 2: latents live at raw_out_loc // ratio of the c1 / c2 pool; None when absent
     low_ratios: Tuple[int, ...] = ()
     c1_out_loc: Optional[torch.Tensor] = None
     c1_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -410,7 +410,7 @@ class DSV4AttnMetadata:
                 assert dst.shape == src.shape, f"{name=} {dst.shape=} {src.shape=}"
                 dst.copy_(src)
             else:
-                # includes the length-fold cache: a stale entry could match an address a freed list reused
+                # the length-fold cache too: a stale entry could match a reused address
                 setattr(self, name, src)
 
     def init_compression_metadata(self, unified_swa_pages: int = 0):
@@ -558,7 +558,7 @@ class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]
 
-    # per-ratio low-ratio indexer metadata: decode rows per request (clamp-1), prefill rows per token
+    # low-ratio indexer metadata per ratio: decode rows per request (clamp-1), prefill per token
     c1_indexer_metadata: Optional[PagedIndexerMetadata] = None
     c2_indexer_metadata: Optional[PagedIndexerMetadata] = None
 
@@ -575,7 +575,7 @@ class DSV4Metadata:
     candidate_metadata: Optional[CandidateMetadata] = None
     # The CUDA sparse-prefill cache has no HIP counterpart; always None here.
     sparse_prefill_cache: None = None
-    # low-ratio indexer FlyDSL workspaces by ratio; pinned by address like the c4 ones, rebuilt in place
+    # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
     fp4_low_ratio_decode_workspaces: Dict[int, FP4DecodeWorkspace] = field(
         default_factory=dict, repr=False
     )
@@ -626,7 +626,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
-    # allocated inside a captured segment; its storage is the graph pool's, so a refresh must not drop it
+    # allocated inside a captured segment (graph-pool storage), so a refresh must keep it
     BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = ("q_pad_buffer",)
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
@@ -701,8 +701,7 @@ class DeepseekV4HipRadixBackend(
     # TboAttnBackend reads this to skip children in the *_graph paths only.
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
-    # the captured segments read the SWA store target by address, so each bucket keeps one
-    # metadata object that refresh_for_breakable_cuda_graph_replay_ rebinds before a replay
+    # each bucket keeps one metadata object; the captured segments read the SWA store target by address
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     def __init__(
@@ -757,11 +756,11 @@ class DeepseekV4HipRadixBackend(
             candidate_topk_blocks=getattr(hf_text_config, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(hf_text_config, "candidate_block_size", 1),
         )
-        # decode batches whose longest context fits this many positions skip the candidate-block filter
+        # a decode batch whose longest context fits this span skips the candidate-block filter
         self.low_ratio_candidate_span: Optional[int] = (
             low_ratio_candidate_skip_span(hf_text_config) if self.low_ratios else None
         )
-        # candidate-block mask published by the candidate-source layer for the later index-source layers
+        # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
@@ -1266,7 +1265,7 @@ class DeepseekV4HipRadixBackend(
 
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
-            # a bucket object outlives the step, so a warmup's length-fold cache would be replayed forever
+            # the bucket object outlives the step; a warmup's length-fold cache must not be replayed
             metadata.core_attn_metadata._aiter_sparse_masked_indices = None
 
         # Compute the SWA KV-store write target once per forward and cache it on
@@ -1312,7 +1311,7 @@ class DeepseekV4HipRadixBackend(
                 torch.int64
             )
 
-        # target-verify rows are one token each, so they take the decode indexer's inputs and workspaces
+        # target-verify rows are one token each, so they take the decode indexer's inputs
         one_token_rows = (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -1746,7 +1745,7 @@ class DeepseekV4HipRadixBackend(
         assert isinstance(capture_metadata, DSV4Metadata), type(capture_metadata)
         if static_forward_batch is None:
             static_forward_batch = forward_batch
-        # break-time consumers get the eager build for the live batch; the padded loc feeds only the target
+        # break-time consumers read the live batch's eager build; the padded loc feeds only the target
         live = self._prefill_metadata_for_batch(forward_batch)
         self.forward_metadata = live
         self.init_forward_metadata_in_graph(static_forward_batch)

@@ -83,9 +83,9 @@ class AiterRunnerInput(RunnerInput):
     # Mori-only fused_moe kwargs.
     num_local_tokens: Optional[torch.Tensor] = None
     output_dtype: Optional[torch.dtype] = None
-    # rows at and past this count are padding that select_experts left for the fused sorting launch to mask
+    # rows from this count on are padding that select_experts left for the fused sort to mask
     num_token_non_padded: Optional[torch.Tensor] = None
-    # standard dispatch only: sglang's one-launch sort when the row count allows (see _FusedSortingRequest)
+    # standard dispatch only: the one-launch sort when the row count allows (_FusedSortingRequest)
     fused_sorting: bool = False
 
     @property
@@ -134,7 +134,7 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
-# aiter has no hook for a caller's sort: moe_sorting is wrapped once and answers only inside a scoped request
+# aiter has no hook for a caller's sort: moe_sorting is wrapped once and answers only inside a scope
 
 
 @dataclass
@@ -632,7 +632,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 fused_moe, runner_input, quant_info, a1_scale, extra
             )
         if request is not None and not request.fired:
-            # fused_moe took a route that never sorts (grouped GEMM), so the padded rows were not masked
+            # fused_moe took a route that never sorts (grouped GEMM); the padded rows stayed unmasked
             _warn_fused_sorting_unused()
         return AiterRunnerOutput(hidden_states=output)
 
