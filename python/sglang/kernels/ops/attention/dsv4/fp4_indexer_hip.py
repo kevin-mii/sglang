@@ -705,23 +705,6 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_fp4, q_scale
 
 
-def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The three-launch form of ``pack_fp4_query_flydsl`` (shared quantizer, then
-    zeros and a permuted copy into the scale layout); kept as its reference."""
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        quantize_fp4_indexer_tensor,
-    )
-
-    num_tokens, heads = q.shape[0], q.shape[1]
-    assert heads % 16 == 0 and heads <= 64, heads
-    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-    q_fp4 = q_fp4.view(num_tokens, heads, 64)
-    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
-    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
-    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
-    return q_fp4, q_scale
-
-
 def rocm_indexer_head_weights_max_tokens(
     n_heads: int, hidden_size: int, weight_dtype: torch.dtype
 ) -> int:

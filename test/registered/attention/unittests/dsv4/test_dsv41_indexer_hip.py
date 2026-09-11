@@ -92,11 +92,16 @@ def reference_position_mask(logits, lens, topk_blocks, block_size):
     )
 
 
-def ids_to_position_mask(ids, block_size, width):
-    from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-        candidate_block_ids_to_mask,
-    )
+def candidate_block_ids_to_mask(ids, num_blocks):
+    """bool [rows, num_blocks] block mask of `CandidateBlocks.ids`."""
+    rows = ids.shape[0]
+    # column num_blocks is the sink for the -1 padding; the mask is the view before it
+    keep = torch.zeros((rows, num_blocks + 1), dtype=torch.bool, device=ids.device)
+    keep.scatter_(1, ids.masked_fill(ids < 0, num_blocks).to(torch.int64), True)
+    return keep[:, :num_blocks]
 
+
+def ids_to_position_mask(ids, block_size, width):
     num_blocks = (width + block_size - 1) // block_size
     keep = candidate_block_ids_to_mask(ids, num_blocks)
     return keep.repeat_interleave(block_size, dim=-1)[:, :width]
@@ -664,10 +669,6 @@ class _LowRatioBackendCase(CustomTestCase):
     def _dense_masks(self, st, masks, seq_lens, extend_lens):
         """The HIP publication (one Optional[CandidateBlocks] per request) as the torch
         oracle's dense bool [t_len, lc] masks: None keeps every reachable block."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            candidate_block_ids_to_mask,
-        )
-
         out, row = [], 0
         for cb, s, e in zip(masks, seq_lens, extend_lens):
             lc = s // st.ratio

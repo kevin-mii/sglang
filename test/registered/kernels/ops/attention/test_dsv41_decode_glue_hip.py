@@ -18,9 +18,9 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     mask_indices_by_length,
     sparse_buffers,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
-    pack_fp4_query_flydsl_torch,
     sort_selection_rows,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -381,6 +381,19 @@ def test_init_compression_metadata_grid(max_pages: int, page_size: int):
         assert outs[-1] is None
         for got, ref in zip(outs[:-1], refs[:-1]):
             assert torch.equal(got, ref)
+
+
+def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then zeros
+    and a permuted copy into the scale layout."""
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+    q_fp4 = q_fp4.view(num_tokens, heads, 64)
+    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
+    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
+    return q_fp4, q_scale
 
 
 @pytest.mark.parametrize("heads", [64, 32, 16])

@@ -374,15 +374,6 @@ def select_candidate_blocks_hip(
     )
 
 
-def candidate_block_ids_to_mask(ids: torch.Tensor, num_blocks: int) -> torch.Tensor:
-    """bool [rows, num_blocks] block mask of `CandidateBlocks.ids`."""
-    rows = ids.shape[0]
-    # Column num_blocks is the sink for the -1 padding; the mask is the view before it.
-    keep = torch.zeros((rows, num_blocks + 1), dtype=torch.bool, device=ids.device)
-    keep.scatter_(1, ids.masked_fill(ids < 0, num_blocks).to(torch.int64), True)
-    return keep[:, :num_blocks]
-
-
 def gather_candidate_blocks(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
