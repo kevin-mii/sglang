@@ -7,6 +7,8 @@ top-k runs bounded by the real compressed lengths (`select_candidate_blocks_hip`
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -36,8 +38,50 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+logger = logging.getLogger(__name__)
+
 # the k the AOT fast_topk op (topk_hip.hip) is instantiated for; any other k takes torch.topk
 _AOT_FAST_TOPK_K = 2048
+
+
+@functools.lru_cache(maxsize=1)
+def _aot_topk_sorts_output() -> bool:
+    """Whether the installed AOT top-k transform takes ``sort_output`` (orders each
+    row in its epilogue). An older sgl_kernel build falls back to the sort launch."""
+    import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
+
+    schema = torch.ops.sgl_kernel.deepseek_v4_topk_transform_512.default._schema
+    supported = any(arg.name == "sort_output" for arg in schema.arguments)
+    if not supported:
+        logger.warning(
+            "sgl_kernel's deepseek_v4_topk_transform_512 predates sort_output; the "
+            "low-ratio indexer keeps a separate sort launch per layer"
+        )
+    return supported
+
+
+def topk_transform_paged_sorted(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_indices: torch.Tensor,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor],
+) -> None:
+    """``topk_transform_paged`` followed by ``sort_selection_rows``: the -1 padded
+    paged top-k of every row, ascending by position. One launch when the AOT
+    kernel sorts in its epilogue (bitwise the same rows)."""
+    if _aot_topk_sorts_output():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_table, page_indices, page_size, raw_indices, True
+        )
+        return
+    topk_transform_paged(
+        scores, seq_lens, page_table, page_indices, page_size, raw_indices
+    )
+    sort_selection_rows(page_indices, raw_indices)
+
+
 # Candidate blocks one Triton program reduces; times block_size positions of logits.
 _LEVEL_ONE_BLOCKS_PER_PROGRAM = 256
 
@@ -188,11 +232,15 @@ def _map_compact_selection_kernel(
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
     WRITE_RAW: tl.constexpr,
+    SORT: tl.constexpr,
+    PAD_KEY: tl.constexpr,
 ):
     """Compact position c -> real position ids[c // BLOCK_SIZE] * BLOCK_SIZE +
     c % BLOCK_SIZE -> slot through the row's page table, with the reachable
     selections packed to the front of the row and -1 after them (the sparse
-    kernels take a -1 padded list with the valid prefix first)."""
+    kernels take a -1 padded list with the valid prefix first). With SORT the
+    valid prefix is ascending: the key and padding rule of
+    ``_sort_selection_rows_kernel``, so the row equals pack-then-sort."""
     row = tl.program_id(0)
     length = tl.load(seq_lens_ptr + row)
     j = tl.arange(0, BLOCK)
@@ -209,15 +257,40 @@ def _map_compact_selection_kernel(
         other=0,
     )
     slot = page * PAGE_SIZE + real % PAGE_SIZE
-    v = valid.to(tl.int32)
-    count = tl.sum(v, axis=0)
-    wpos = tl.cumsum(v, axis=0) - 1
-    # The packed entries and the padding never share an address.
-    tl.store(page_indices_ptr + row * out_stride + j, -1, mask=in_k & (j >= count))
-    tl.store(page_indices_ptr + row * out_stride + wpos, slot, mask=valid)
-    if WRITE_RAW:
-        tl.store(raw_indices_ptr + row * out_stride + j, -1, mask=in_k & (j >= count))
-        tl.store(raw_indices_ptr + row * out_stride + wpos, real, mask=valid)
+    if SORT:
+        # BLOCK == TOPK here (a power of two): every lane is a row entry. The
+        # position is the key when the row has raw indices, else the slot (as
+        # sort_selection_rows(page, None) orders).
+        if WRITE_RAW:
+            hi = real
+        else:
+            hi = slot
+        key = tl.where(valid, hi, PAD_KEY).to(tl.int64) << 32
+        key = tl.sort(
+            key | (tl.where(valid, slot, -1).to(tl.int64) & 0xFFFFFFFF), dim=0
+        )
+        pad = (key >> 32) == PAD_KEY
+        tl.store(
+            page_indices_ptr + row * out_stride + j,
+            tl.where(pad, -1, (key & 0xFFFFFFFF).to(tl.int32)),
+        )
+        if WRITE_RAW:
+            tl.store(
+                raw_indices_ptr + row * out_stride + j,
+                tl.where(pad, -1, (key >> 32).to(tl.int32)),
+            )
+    else:
+        v = valid.to(tl.int32)
+        count = tl.sum(v, axis=0)
+        wpos = tl.cumsum(v, axis=0) - 1
+        # The packed entries and the padding never share an address.
+        tl.store(page_indices_ptr + row * out_stride + j, -1, mask=in_k & (j >= count))
+        tl.store(page_indices_ptr + row * out_stride + wpos, slot, mask=valid)
+        if WRITE_RAW:
+            tl.store(
+                raw_indices_ptr + row * out_stride + j, -1, mask=in_k & (j >= count)
+            )
+            tl.store(raw_indices_ptr + row * out_stride + wpos, real, mask=valid)
 
 
 class CandidateBlocks(NamedTuple):
@@ -352,10 +425,12 @@ def topk_within_candidate_blocks_hip(
     page_size: int,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor],
+    sort: bool = False,
 ) -> None:
     """Level two for a consumer layer: the top-k of `logits` restricted to the published candidate
     blocks, written as the paged transform writes it (-1 padded, valid prefix first); the caller
-    orders the rows.
+    orders the rows, or asks for it with ``sort`` (the same rows as ``sort_selection_rows`` after,
+    inside the mapping launch; k must be a power of two).
     The top-k runs on the compact candidate row, at most topk_blocks * block_size wide, so the
     consumer's cost stops growing with the context; a row's valid prefix is min(k, reachable
     candidates) long.
@@ -383,6 +458,7 @@ def topk_within_candidate_blocks_hip(
     if write_raw:
         assert raw_indices.shape == (rows, topk) and raw_indices.stride(1) == 1
         assert raw_indices.stride(0) == page_indices.stride(0)
+    assert not sort or topk & (topk - 1) == 0, topk
     _map_compact_selection_kernel[(rows,)](
         compact_pos,
         candidates.ids,
@@ -399,6 +475,8 @@ def topk_within_candidate_blocks_hip(
         TOPK=topk,
         BLOCK=triton.next_power_of_2(topk),
         WRITE_RAW=write_raw,
+        SORT=sort,
+        PAD_KEY=torch.iinfo(torch.int32).max,
     )
 
 
@@ -661,8 +739,8 @@ def low_ratio_index_topk_hip_decode(
             page_size=indexer_metadata.c4_page_size,
             page_indices=core.sparse_page_indices(ratio),
             raw_indices=core.sparse_raw_indices(ratio),
+            sort=True,
         )
-        sort_selection_rows(page_indices, raw_indices)
         return
     if two_level and indexer.is_candidate_source:
         backend.candidate_masks = select_candidate_blocks_hip(
@@ -671,7 +749,7 @@ def low_ratio_index_topk_hip_decode(
             topk_blocks=indexer.candidate_topk_blocks,
             block_size=indexer.candidate_block_size,
         )
-    topk_transform_paged(
+    topk_transform_paged_sorted(
         logits,
         indexer_metadata.c4_seq_lens,
         indexer_metadata.page_table,
@@ -679,7 +757,6 @@ def low_ratio_index_topk_hip_decode(
         indexer_metadata.c4_page_size,
         raw_indices,
     )
-    sort_selection_rows(page_indices, raw_indices)
 
 
 def low_ratio_index_topk_hip_extend(
@@ -903,7 +980,7 @@ def _select_topk_extend_hip(
             rows_page = page_indices[rows]
             rows_raw = raw_indices[rows] if raw_indices is not None else None
             if consume[b] is None:
-                topk_transform_paged(
+                topk_transform_paged_sorted(
                     logits[rows],
                     compress_lens[rows].contiguous(),
                     page_table[rows],
@@ -920,10 +997,10 @@ def _select_topk_extend_hip(
                     page_size=page_size,
                     page_indices=rows_page,
                     raw_indices=rows_raw,
+                    sort=True,
                 )
-            sort_selection_rows(rows_page, rows_raw)
         return
-    topk_transform_paged(
+    topk_transform_paged_sorted(
         logits,
         compress_lens.contiguous(),
         page_table,
@@ -931,7 +1008,6 @@ def _select_topk_extend_hip(
         page_size,
         raw_indices,
     )
-    sort_selection_rows(page_indices, raw_indices)
 
 
 def _request_groups(

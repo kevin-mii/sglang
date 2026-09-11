@@ -9,7 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_row
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _ceil_ue8m0_exp,
+    _fp4_e2m1_code_rne,
+    _select_group_value,
+    quantize_fp4_indexer_row,
+)
 from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
@@ -610,11 +615,103 @@ def read_fp4_index_k_split(
     return rows, packed
 
 
+@triton.jit
+def _quantize_fp4_query_flydsl_kernel(
+    x,
+    x_fp4,
+    q_scale,
+    HEADS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+):
+    """One program per (token, head slot of 64): the per-32 ue8m0 fp4 quantizer of
+    ``_quantize_fp4_indexer_kernel`` (RNE codes) with the e8m0 byte of chunk c
+    stored straight into the FlyDSL scale layout [t, 0, c, h % 16, h // 16];
+    head slots past HEADS write the zero bytes the torch pack left there."""
+    token_id = tl.program_id(0)
+    h = tl.program_id(1)
+    scale_base = q_scale + token_id * (4 * 16 * 4) + (h % 16) * 4 + h // 16
+    chunks = tl.arange(0, 4)
+    if h >= HEADS:
+        tl.store(scale_base + chunks * (16 * 4), tl.zeros([4], dtype=tl.uint8))
+        return
+    row = token_id * HEADS + h
+    offs = tl.arange(0, BLOCK_N)
+    values = tl.load(x + row * BLOCK_N + offs).to(tl.float32)
+    abs_values = tl.abs(values)
+
+    amax0 = tl.max(tl.where(offs < GROUP_N, abs_values, 0.0), axis=0)
+    amax1 = tl.max(
+        tl.where((GROUP_N <= offs) & (offs < 2 * GROUP_N), abs_values, 0.0),
+        axis=0,
+    )
+    amax2 = tl.max(
+        tl.where((2 * GROUP_N <= offs) & (offs < 3 * GROUP_N), abs_values, 0.0),
+        axis=0,
+    )
+    amax3 = tl.max(tl.where(3 * GROUP_N <= offs, abs_values, 0.0), axis=0)
+
+    sf0 = tl.maximum(amax0 / 6.0, 1.0e-4)
+    sf1 = tl.maximum(amax1 / 6.0, 1.0e-4)
+    sf2 = tl.maximum(amax2 / 6.0, 1.0e-4)
+    sf3 = tl.maximum(amax3 / 6.0, 1.0e-4)
+
+    exp0 = _ceil_ue8m0_exp(sf0)
+    exp1 = _ceil_ue8m0_exp(sf1)
+    exp2 = _ceil_ue8m0_exp(sf2)
+    exp3 = _ceil_ue8m0_exp(sf3)
+
+    exps = _select_group_value(chunks, exp0, exp1, exp2, exp3)
+    tl.store(scale_base + chunks * (16 * 4), exps.to(tl.uint8))
+
+    pair_offsets = tl.arange(0, BLOCK_N // 2)
+    offs0 = pair_offsets * 2
+    offs1 = offs0 + 1
+    group0 = offs0 // GROUP_N
+    group1 = offs1 // GROUP_N
+    scale_exp0 = _select_group_value(group0, exp0, exp1, exp2, exp3)
+    scale_exp1 = _select_group_value(group1, exp0, exp1, exp2, exp3)
+    scale0 = (scale_exp0 << 23).to(tl.float32, bitcast=True)
+    scale1 = (scale_exp1 << 23).to(tl.float32, bitcast=True)
+
+    v0 = tl.load(x + row * BLOCK_N + offs0).to(tl.float32) / scale0
+    v1 = tl.load(x + row * BLOCK_N + offs1).to(tl.float32) / scale1
+    code0 = _fp4_e2m1_code_rne(v0)
+    code1 = _fp4_e2m1_code_rne(v1)
+    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    tl.store(x_fp4 + row * (BLOCK_N // 2) + pair_offsets, packed)
+
+
 def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp4-grid query [T, H, 128] -> (payload int8 [T, H, 64], scale uint8
     [T, 1, 4, 16, 4]) in the FlyDSL MQA-logits layout: the e8m0 byte of head h,
     chunk c sits at [t, 0, c, h % 16, h // 16] (H <= 64). Ties round to even
-    (`rne=True`), the same quantizer and convention as the CUDA low-ratio path."""
+    (`rne=True`), the same quantizer and convention as the CUDA low-ratio path.
+    One launch: the quantizer writes the scale layout itself (bitwise the
+    quantize / zeros / permute-copy chain of ``pack_fp4_query_flydsl_torch``)."""
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    assert q.shape[-1] == _HEAD_DIM
+    x = q.contiguous().view(-1, _HEAD_DIM)
+    q_fp4 = torch.empty(
+        (num_tokens, heads, _HEAD_DIM // 2), dtype=torch.int8, device=q.device
+    )
+    q_scale = torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    if num_tokens > 0:
+        _quantize_fp4_query_flydsl_kernel[(num_tokens, 64)](
+            x,
+            q_fp4,
+            q_scale,
+            HEADS=heads,
+            BLOCK_N=_HEAD_DIM,
+            GROUP_N=_GROUP_SIZE,
+        )
+    return q_fp4, q_scale
+
+
+def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The three-launch form of ``pack_fp4_query_flydsl`` (shared quantizer, then
+    zeros and a permuted copy into the scale layout); kept as its reference."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         quantize_fp4_indexer_tensor,
     )

@@ -17,6 +17,12 @@ from typing import (
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+    expand_index_page_table,
+    low_ratio_compression_metadata,
+    mask_indices_by_length,
+    sparse_buffers,
+)
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
@@ -37,9 +43,6 @@ from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
     LowRatioBackendMixin,
-    _expand_index_page_table,
-    _low_ratio_compression_metadata,
-    _low_ratio_sparse_buffers,
     _pad_last_dim,
 )
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
@@ -83,15 +86,33 @@ C4_TOPK = 512
 
 
 def _mask_indices_by_length(
-    indices: torch.Tensor, lengths: Optional[torch.Tensor]
-) -> torch.Tensor:
+    indices: torch.Tensor,
+    lengths: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lengths: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Set the entries of ``indices`` ([b, s, w]) at position >= ``lengths`` ([b])
-    to -1, the sentinel the aiter sparse decode kernel skips."""
+    to -1, the sentinel the aiter sparse decode kernel skips; likewise the
+    optional second list. One Triton launch in place of the arange / compare /
+    fill / where chain per list (bitwise the same tensors)."""
     if lengths is None:
-        return indices
-    w = indices.shape[-1]
-    pos = torch.arange(w, device=indices.device, dtype=lengths.dtype)
-    return torch.where(pos < lengths.view(-1, 1, 1), indices, indices.new_full((), -1))
+        indices, lengths = None, None
+    if extra_indices is not None and extra_lengths is None:
+        extra_indices = None
+    if indices is None and extra_indices is None:
+        return indices, extra_indices
+    first, first_len = (
+        (indices, lengths) if indices is not None else (extra_indices, extra_lengths)
+    )
+    second, second_len = (
+        (extra_indices, extra_lengths) if indices is not None else (None, None)
+    )
+    out, out2 = mask_indices_by_length(
+        first.contiguous(), first_len.contiguous(), second, second_len
+    )
+    if indices is None:
+        return None, out
+    return out, out2 if second is not None else extra_indices
 
 
 def _fold_lengths_for_aiter_sparse(
@@ -116,13 +137,12 @@ def _fold_lengths_for_aiter_sparse(
     )
     hit = cache.get(key)
     if hit is None:
+        masked, masked_extra = _mask_indices_by_length(
+            swa_page_indices, swa_topk_lengths, extra_indices, extra_topk_lengths
+        )
         hit = (
-            _mask_indices_by_length(swa_page_indices, swa_topk_lengths),
-            (
-                None
-                if extra_indices is None
-                else _mask_indices_by_length(extra_indices, extra_topk_lengths)
-            ),
+            swa_page_indices if masked is None else masked,
+            masked_extra,
         )
         cache[key] = hit
     return hit
@@ -425,18 +445,11 @@ class DSV4AttnMetadata:
             self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
             self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
-        if 1 in self.low_ratios:
-            self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
-                _low_ratio_compression_metadata(
-                    1, self.seq_lens_casual, self.raw_out_loc
-                )
-            )
-        if 2 in self.low_ratios:
-            self.c2_out_loc, self.c2_topk_lengths_clamp1 = (
-                _low_ratio_compression_metadata(
-                    2, self.seq_lens_casual, self.raw_out_loc
-                )
-            )
+        # ratio 1/2 counterparts of the c4/c128 metadata, one launch for both
+        for name, value in low_ratio_compression_metadata(
+            self.seq_lens_casual, self.raw_out_loc, self.low_ratios
+        ).items():
+            setattr(self, name, value)
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -506,41 +519,34 @@ class DSV4AttnMetadata:
             "supported: 512 (small) or 1024 (large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
-        self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.index_topk
-        )
         assert self.c4_topk_lengths_raw is not None
-        self.c4_sparse_topk_lengths_raw = torch.clamp(
-            self.c4_topk_lengths_raw, max=self.index_topk
-        )
-        self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
-            -1,
-            dtype=torch.int32,
-            device=self.c4_topk_lengths_clamp1.device,
-        )
-        self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
+        # the clamped lengths and the -1 filled top-k buffers of every ratio in one launch
+        for name, value in sparse_buffers(
+            c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1,
+            c4_topk_lengths_raw=self.c4_topk_lengths_raw,
+            c1_topk_lengths_clamp1=(
+                self.c1_topk_lengths_clamp1 if 1 in self.low_ratios else None
+            ),
+            c2_topk_lengths_clamp1=(
+                self.c2_topk_lengths_clamp1 if 2 in self.low_ratios else None
+            ),
+            index_topk=self.index_topk,
+            page_index_align=PAGE_INDEX_ALIGNED_SIZE,
+        ).items():
+            setattr(self, name, value)
         if is_prefill:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
         if 1 in self.low_ratios:
-            (
-                self.c1_sparse_topk_lengths,
-                self.c1_sparse_page_indices,
-                self.c1_sparse_raw_indices,
-            ) = _low_ratio_sparse_buffers(
-                self.c1_topk_lengths_clamp1, self.index_topk, is_prefill
+            self.c1_sparse_raw_indices = (
+                torch.empty_like(self.c1_sparse_page_indices) if is_prefill else None
             )
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            (
-                self.c2_sparse_topk_lengths,
-                self.c2_sparse_page_indices,
-                self.c2_sparse_raw_indices,
-            ) = _low_ratio_sparse_buffers(
-                self.c2_topk_lengths_clamp1, self.index_topk, is_prefill
+            self.c2_sparse_raw_indices = (
+                torch.empty_like(self.c2_sparse_page_indices) if is_prefill else None
             )
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
@@ -813,11 +819,13 @@ class DeepseekV4HipRadixBackend(
             index_page_size = self.token_to_kv_pool.get_index_k_page_size(
                 compress_ratio
             )
-            page_table = _expand_index_page_table(
-                page_table,
-                full_page_size=self.page_size,
-                compress_ratio=compress_ratio,
-                index_page_size=index_page_size,
+            slots_per_page = self.page_size // compress_ratio
+            assert slots_per_page % index_page_size == 0, (
+                f"{self.page_size = } / {compress_ratio = } must be a multiple of "
+                f"{index_page_size = }"
+            )
+            page_table = expand_index_page_table(
+                page_table, slots_per_page // index_page_size
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")

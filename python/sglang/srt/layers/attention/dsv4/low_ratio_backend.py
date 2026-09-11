@@ -58,6 +58,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
         return None
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
+    if target_size == curr_size:
+        # F.pad would still clone (a fill and a copy launch); an aligned buffer is returned as is
+        return x
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
