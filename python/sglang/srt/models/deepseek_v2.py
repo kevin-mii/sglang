@@ -1018,9 +1018,9 @@ class DeepseekV2MoE(nn.Module):
         ``self.topk`` sums into them. ``fused_gate=False`` when anything but
         ``self.topk`` reads the logits: they are then computed here in full."""
         if fused_gate and _use_aiter and not getattr(self, "is_hash", False):
-            split = aiter_dsv3_router_split_k(self.gate, hidden_states)
-            if split is not None:
-                return split
+            logits_and_partials = aiter_dsv3_router_split_k(self.gate, hidden_states)
+            if logits_and_partials is not None:
+                return logits_and_partials
         return self.gate(hidden_states, gemm_output_zero_allocator), None
 
     def forward_normal_dual_stream(

@@ -222,22 +222,22 @@ def _install_fused_reduce_override() -> bool:
             return original(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        a = bound.arguments
-        target, out, shared = a["target"], a["out"], request.shared_output
+        arg = bound.arguments
+        target, out, shared = arg["target"], arg["out"], request.shared_output
         token_num, topk, model_dim = (
-            int(a["token_num"]),
-            int(a["topk"]),
-            int(a["model_dim"]),
+            int(arg["token_num"]),
+            int(arg["topk"]),
+            int(arg["model_dim"]),
         )
         eligible = (
-            not a["is_fp8"]
-            and a["topk_weights"] is None
-            and a["stream"] is None
+            not arg["is_fp8"]
+            and arg["topk_weights"] is None
+            and arg["stream"] is None
             and out.dtype in (torch.bfloat16, torch.float16)
             and target.dtype == out.dtype == shared.dtype
             and tuple(out.shape) == (token_num, model_dim) == tuple(shared.shape)
             and target.numel() == token_num * topk * model_dim
-            and (a["expert_mask"] is None or a["topk_ids"] is not None)
+            and (arg["expert_mask"] is None or arg["topk_ids"] is not None)
         )
         if not eligible:
             return original(*args, **kwargs)
@@ -246,8 +246,8 @@ def _install_fused_reduce_override() -> bool:
             shared,
             out,
             topk,
-            a["topk_ids"],
-            a["expert_mask"],
+            arg["topk_ids"],
+            arg["expert_mask"],
             alpha=request.alpha,
         )
         request.fired = True
@@ -354,19 +354,19 @@ def _install_fused_sorting_override() -> bool:
             return original(*args, **kwargs)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        a = bound.arguments
-        topk_ids, topk_weights = a["topk_ids"], a["topk_weights"]
-        expert_mask = a["expert_mask"]
-        num_experts = int(a["num_experts"])
-        block_size = int(a["block_size"])
+        arg = bound.arguments
+        topk_ids, topk_weights = arg["topk_ids"], arg["topk_weights"]
+        expert_mask = arg["expert_mask"]
+        num_experts = int(arg["num_experts"])
+        block_size = int(arg["block_size"])
         request.fired = True
         eligible = (
             topk_ids.shape[0] <= AITER_FUSED_SORT_MAX_TOKENS
-            and a["num_local_tokens"] is None
-            and a["dispatch_policy"] == 0
-            and not a["return_local_topk_ids"]
-            and not a["flat"]
-            and not a["output_aux"]
+            and arg["num_local_tokens"] is None
+            and arg["dispatch_policy"] == 0
+            and not arg["return_local_topk_ids"]
+            and not arg["flat"]
+            and not arg["output_aux"]
             and topk_ids.dtype == torch.int32
             and topk_ids.is_contiguous()
             and topk_weights.dtype == torch.float32
@@ -378,28 +378,28 @@ def _install_fused_sorting_override() -> bool:
                 or (expert_mask.dim() == 1 and expert_mask.numel() == num_experts)
             )
         )
-        local = (
+        local_experts = (
             _local_expert_ids(
                 expert_mask, num_experts, topk_ids.device, local_expert_ids_by_mask
             )
             if eligible
             else None
         )
-        if local is None:
+        if local_experts is None:
             disable_pending_sort(topk_ids)
             if request.num_token_non_padded is not None:
                 _fill_padded_rows_pair(
                     topk_ids, topk_weights, request.num_token_non_padded
                 )
             return original(*args, **kwargs)
-        local_ids, num_local = local
+        local_ids, num_local = local_experts
         config = SortConfig(
             local_expert_ids=local_ids,
             num_experts=num_experts,
-            model_dim=int(a["model_dim"]),
-            moe_buf_dtype=a["moebuf_dtype"],
+            model_dim=int(arg["model_dim"]),
+            moe_buf_dtype=arg["moebuf_dtype"],
             block_size=block_size,
-            zero_moe_buf=(expert_mask is not None) or bool(a["accumulate"]),
+            zero_moe_buf=(expert_mask is not None) or bool(arg["accumulate"]),
         )
         # the gate launch of this batch may have sorted already (rocm_fused_front)
         sorted_outputs = take_pending_sort(
@@ -624,7 +624,7 @@ class AiterRunnerCore(MoeRunnerCore):
             else contextlib.nullcontext()
         )
         with scope as request:
-            output = self._fused_moe(
+            output = self._call_fused_moe(
                 fused_moe, runner_input, quant_info, a1_scale, extra
             )
         if request is not None and not request.fired:
@@ -632,7 +632,7 @@ class AiterRunnerCore(MoeRunnerCore):
             _warn_fused_sorting_unused()
         return AiterRunnerOutput(hidden_states=output)
 
-    def _fused_moe(self, fused_moe, runner_input, quant_info, a1_scale, extra):
+    def _call_fused_moe(self, fused_moe, runner_input, quant_info, a1_scale, extra):
         return fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,

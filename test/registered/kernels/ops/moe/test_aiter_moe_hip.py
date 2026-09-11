@@ -805,13 +805,13 @@ class TestRocmRouterGateSort(CustomTestCase):
             )
             self.assertTrue(torch.equal(second.topk_ids, ref.topk_ids))
             self.assertTrue(torch.equal(second.topk_weights, ref.topk_weights))
-            pending = glue._pending[second.topk_ids.data_ptr()]
+            pending = glue._pending_sorts[second.topk_ids.data_ptr()]
             self.assertIsNotNone(pending.outputs)
             with runner._fused_sorting_scope(None):
                 out = wrapped(second.topk_ids, second.topk_weights, *sort_args)
             self.assertIs(out[0], pending.outputs[0])
             _assert_same_sort(self, ref_sort, out, 32, num_tokens, num_tokens)
-            self.assertNotIn(second.topk_ids.data_ptr(), glue._pending)
+            self.assertNotIn(second.topk_ids.data_ptr(), glue._pending_sorts)
             # a different block size: the pending outputs are refused, the ids sorted again
             third = select_experts(
                 x, torch.empty_like(logits), config, router_logits_partials=partials

@@ -45,7 +45,7 @@ class SortConfig:
 
 
 @dataclass
-class _Pending:
+class _PendingSort:
     key: tuple
     config: Optional[SortConfig]  # None: the gate ran alone
     num_token_non_padded: Optional[torch.Tensor]
@@ -54,9 +54,9 @@ class _Pending:
 
 
 # router key -> sorting arguments seen for it (None: the sorting is not fusable for this key)
-_configs: dict[tuple, Optional[SortConfig]] = {}
+_sort_configs: dict[tuple, Optional[SortConfig]] = {}
 # ids storage -> what the gate launch of that batch produced
-_pending: dict[int, _Pending] = {}
+_pending_sorts: dict[int, _PendingSort] = {}
 _PENDING_LIMIT = 256
 
 
@@ -91,7 +91,7 @@ def gate_partials(
     known and the batch is small enough."""
     num_tokens, num_experts = gating_output.shape
     key = _router_key(correction_bias, num_tokens, topk, num_experts)
-    config = _configs.get(key) if num_tokens <= ROCM_GATE_SORT_MAX_TOKENS else None
+    config = _sort_configs.get(key) if num_tokens <= ROCM_GATE_SORT_MAX_TOKENS else None
     if config is None:
         weights, ids = rocm_router_gate(
             gating_output,
@@ -103,7 +103,7 @@ def gate_partials(
         )
         outputs = None
     else:
-        out = rocm_router_gate_sort(
+        gate_and_sort = rocm_router_gate_sort(
             gating_output,
             correction_bias,
             topk,
@@ -118,19 +118,19 @@ def gate_partials(
             config.zero_moe_buf,
             num_token_non_padded=num_token_non_padded,
         )
-        weights, ids = out[0], out[1]
-        outputs = out[2:]
+        weights, ids = gate_and_sort[0], gate_and_sort[1]
+        outputs = gate_and_sort[2:]
     if num_tokens <= ROCM_GATE_SORT_MAX_TOKENS:
-        if len(_pending) >= _PENDING_LIMIT:
-            _pending.clear()
-        _pending[ids.data_ptr()] = _Pending(
+        if len(_pending_sorts) >= _PENDING_LIMIT:
+            _pending_sorts.clear()
+        _pending_sorts[ids.data_ptr()] = _PendingSort(
             key, config, num_token_non_padded, ids, outputs
         )
     return weights, ids
 
 
-def _pop_pending(topk_ids: torch.Tensor) -> Optional[_Pending]:
-    pending = _pending.pop(topk_ids.data_ptr(), None)
+def _pop_pending(topk_ids: torch.Tensor) -> Optional[_PendingSort]:
+    pending = _pending_sorts.pop(topk_ids.data_ptr(), None)
     if pending is None:
         return None
     if (
@@ -160,7 +160,7 @@ def take_pending_sort(
         and _same_count(pending.num_token_non_padded, num_token_non_padded)
     ):
         return pending.outputs
-    _configs[pending.key] = config
+    _sort_configs[pending.key] = config
     return None
 
 
@@ -169,9 +169,9 @@ def disable_pending_sort(topk_ids: torch.Tensor) -> None:
     sorting for this router."""
     pending = _pop_pending(topk_ids)
     if pending is not None:
-        _configs[pending.key] = None
+        _sort_configs[pending.key] = None
 
 
 def reset_for_tests() -> None:
-    _configs.clear()
-    _pending.clear()
+    _sort_configs.clear()
+    _pending_sorts.clear()
