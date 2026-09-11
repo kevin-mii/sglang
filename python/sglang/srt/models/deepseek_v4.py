@@ -525,11 +525,11 @@ def _apply_wo_a_bf16_matmul(
         and _wo_a_aiter_batched_gemm_enabled
         and not _wo_a_aiter_batched_gemm_disabled
     ):
+        if _gfx95_dense is not None:
+            y = _gfx95_dense.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
+            if y is not None:
+                return y
         try:
-            if _gfx95_dense is not None:
-                y = _gfx95_dense.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
-                if y is not None:
-                    return y
             # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
             # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
             # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
@@ -3856,7 +3856,7 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if getattr(self.layers[i], "hc_boundary_fused", False):
+                if self.layers[i].hc_boundary_fused:
                     hidden_states, prev_pre, pending_post = (
                         forward_hc_pre_from_prev_fused_boundary(
                             self.layers[i],

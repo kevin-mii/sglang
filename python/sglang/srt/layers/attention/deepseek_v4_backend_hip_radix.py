@@ -393,12 +393,9 @@ class DSV4AttnMetadata:
         assert self.page_size == other.page_size
         assert self.index_topk == other.index_topk
         assert self.low_ratios == other.low_ratios
-        missing = object()
         for f in fields(self):
             name = f.name
-            src = getattr(other, name, missing)
-            if src is missing:
-                continue
+            src = getattr(other, name)
             if name in self.BREAKABLE_CUDA_GRAPH_IN_GRAPH_FIELDS:
                 dst = getattr(self, name)
                 assert dst is not None and src is not None, f"{name=} {dst=} {src=}"
@@ -2405,10 +2402,8 @@ class DeepseekV4HipRadixBackend(
             assert self._uses_dspark_draft_window() and (
                 dspark_block_size == self.target_verify_num_draft_tokens
             ), (
-                f"dspark_block_size={dspark_block_size} must equal the draft's "
-                f"target_verify_num_draft_tokens={self.target_verify_num_draft_tokens} "
-                f"and is only valid on the DSpark draft backend "
-                f"(is_dspark_draft={self.is_dspark_draft})."
+                f"{dspark_block_size=} must equal target_verify_num_draft_tokens="
+                f"{self.target_verify_num_draft_tokens} on the DSpark draft backend"
             )
             # Already padded to PAGE_INDEX_ALIGNED_SIZE by the builder.
             swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
