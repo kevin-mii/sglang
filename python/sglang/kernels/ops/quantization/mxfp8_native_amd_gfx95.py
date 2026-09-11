@@ -193,7 +193,9 @@ def mxfp8_gemv(
         out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     cfg = config or select_config(m, n, k)
     assert cfg.valid_for(m, n, k), (cfg, m, n, k)
-    _jit_mxfp8_gemv_module(cfg, x_bf16).run(weight_shuffled, weight_scale_ue8m0, x, x_scale, out)
+    _jit_mxfp8_gemv_module(cfg, x_bf16).run(
+        weight_shuffled, weight_scale_ue8m0, x, x_scale, out
+    )
     return out
 
 

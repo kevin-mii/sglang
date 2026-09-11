@@ -409,9 +409,9 @@ def rmsnorm_with_sinkhorn(
     x = _row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
-    assert (
-        coefficients.num_rows == M
-    ), f"coefficients hold {coefficients.num_rows} rows, the norm input {M}"
+    assert coefficients.num_rows == M, (
+        f"coefficients hold {coefficients.num_rows} rows, the norm input {M}"
+    )
     dev = x.device
     out_fq = (
         torch.empty(
