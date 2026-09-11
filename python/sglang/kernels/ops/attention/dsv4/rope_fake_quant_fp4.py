@@ -6,6 +6,8 @@ round-half-to-even behavior of torch.round.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -123,7 +125,7 @@ def rope_tail_fake_quant_fp4(
     block_size: int = 32,
     *,
     compressed_kv: bool = False,
-    positions: torch.Tensor = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """RoPE and FP4 round-trip: per-16 E4M3 for compressed KV, per-32 UE8M0 otherwise.
 

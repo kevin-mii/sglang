@@ -11,6 +11,7 @@ once read.
 
 from __future__ import annotations
 
+import threading
 from typing import Optional, Tuple
 
 import torch
@@ -297,7 +298,9 @@ def _router_gate_sort_kernel(
         )
 
 
+# one hand-off buffer per device: a launch leaves it zeroed for the next
 _handoff_state: dict = {}
+_handoff_lock = threading.Lock()
 
 
 def _handoff_buffer(device: torch.device) -> torch.Tensor:
@@ -306,10 +309,13 @@ def _handoff_buffer(device: torch.device) -> torch.Tensor:
     key = (device.type, device.index)
     buf = _handoff_state.get(key)
     if buf is None:
-        buf = torch.zeros(
-            _HANDOFF_ROWS * _HANDOFF_SLOTS, dtype=torch.int64, device=device
-        )
-        _handoff_state[key] = buf
+        with _handoff_lock:
+            buf = _handoff_state.get(key)
+            if buf is None:
+                buf = torch.zeros(
+                    _HANDOFF_ROWS * _HANDOFF_SLOTS, dtype=torch.int64, device=device
+                )
+                _handoff_state[key] = buf
     return buf
 
 

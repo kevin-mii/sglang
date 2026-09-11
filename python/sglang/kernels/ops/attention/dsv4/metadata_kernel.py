@@ -94,6 +94,7 @@ def _init_compressed_attn_metadata_kernel(
         return
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
+    c128_seq_lens_raw = seq_len // 128
     # the row is split over program_id(1); only its first program writes the per-row scalars
     if tl.program_id(1) == 0:
         position = tl.load(positions_ptr + batch_id)
@@ -114,16 +115,14 @@ def _init_compressed_attn_metadata_kernel(
         c128_should_compress = (seq_len % 128) == 0
         c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
         c128_positions = position & (~127)
-        c128_seq_lens_raw_0 = seq_len // 128
-        c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw_0, 1)
+        c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
 
         tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
         tl.store(c128_positions_ptr + batch_id, c128_positions)
-        tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw_0)
+        tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
         tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
 
     if COMPUTE_PAGE_INDICES:
-        c128_seq_lens_raw = seq_len // 128
         page_indices_base = batch_id * c128_cur_max_seq_len
         chunk_start = tl.program_id(1) * (ITERS_PER_PROGRAM * BLOCK_SIZE)
         for block_start in tl.range(

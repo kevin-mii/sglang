@@ -338,6 +338,9 @@ class HcCoefficients:
         self.scratch = torch.empty((m, 32), dtype=torch.float32, device=dev)
         self.materialized = m == 0
 
+    def mark_hosted(self) -> None:
+        self.materialized = True
+
     def materialize(self) -> None:
         """Run the reduce + sinkhorn alone unless a norm launch already hosted it."""
         if self.materialized:
@@ -434,7 +437,7 @@ def rmsnorm_with_sinkhorn(
     if M == 0:
         return quant, out_norm
     m = 0 if coefficients.materialized else M
-    coefficients.materialized = True
+    coefficients.mark_hosted()
     CHUNK = rmsnorm_row_chunk(K)
     _rmsnorm_sinkhorn_kernel[(M + m,)](
         x,

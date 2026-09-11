@@ -358,6 +358,7 @@ def fp8_grid_quant(xg, eps):
     ue8m0 exponent per group (the same rule as ``fp8_grid_round``)."""
     amax = tl.max(tl.abs(xg), axis=1)
     amax = tl.maximum(amax, eps)
+    # Smallest power of two >= amax / 448, on the IEEE bits (exact at powers of two).
     raw = amax * (1.0 / 448.0)
     bits = raw.to(tl.int32, bitcast=True)
     exp = (bits >> 23) & 0xFF
@@ -372,17 +373,8 @@ def fp8_grid_quant(xg, eps):
 def fp8_grid_round(xg, eps):
     """``xg`` is fp32 ``[G, 32]``, one ue8m0 group per row; returns it rounded to the
     fp8 e4m3 grid of its group scale (smallest power of two >= amax / 448)."""
-    amax = tl.max(tl.abs(xg), axis=1)
-    amax = tl.maximum(amax, eps)
-    # Smallest power of two >= amax / 448, on the IEEE bits (exact at powers of two).
-    raw = amax * (1.0 / 448.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exp = (bits >> 23) & 0xFF
-    exp = exp + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    exp = tl.minimum(tl.maximum(exp, 1), 254)
-    scale = (exp << 23).to(tl.float32, bitcast=True)
-    scaled = tl.clamp(xg / scale[:, None], -448.0, 448.0)
-    return scaled.to(tl.float8e4nv).to(tl.float32) * scale[:, None]
+    q, exp = fp8_grid_quant(xg, eps)
+    return q.to(tl.float32) * (exp << 23).to(tl.float32, bitcast=True)[:, None]
 
 
 @triton.jit

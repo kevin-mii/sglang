@@ -9,12 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    _ceil_ue8m0_exp,
-    _fp4_e2m1_code_rne,
-    _select_group_value,
-    quantize_fp4_indexer_row,
-)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_row
 from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
@@ -623,10 +618,9 @@ def _quantize_fp4_query_flydsl_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
 ):
-    """One program per (token, head slot of 64): the per-32 ue8m0 fp4 quantizer of
-    ``_quantize_fp4_indexer_kernel`` (RNE codes) with the e8m0 byte of chunk c
-    stored straight into the FlyDSL scale layout [t, 0, c, h % 16, h // 16];
-    head slots past HEADS write the zero bytes the torch pack left there."""
+    """One program per (token, head slot of 64): ``quantize_fp4_indexer_row`` (RNE codes) with
+    the e8m0 byte of chunk c stored straight into the FlyDSL scale layout
+    [t, 0, c, h % 16, h // 16]; head slots past HEADS write zero bytes."""
     token_id = tl.program_id(0)
     h = tl.program_id(1)
     scale_base = q_scale + token_id * (4 * 16 * 4) + (h % 16) * 4 + h // 16
@@ -635,50 +629,14 @@ def _quantize_fp4_query_flydsl_kernel(
         tl.store(scale_base + chunks * (16 * 4), tl.zeros([4], dtype=tl.uint8))
         return
     row = token_id * HEADS + h
-    offs = tl.arange(0, BLOCK_N)
-    values = tl.load(x + row * BLOCK_N + offs).to(tl.float32)
-    abs_values = tl.abs(values)
-
-    amax0 = tl.max(tl.where(offs < GROUP_N, abs_values, 0.0), axis=0)
-    amax1 = tl.max(
-        tl.where((GROUP_N <= offs) & (offs < 2 * GROUP_N), abs_values, 0.0),
-        axis=0,
+    values = tl.load(x + row * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.float32)
+    v0, v1 = tl.split(tl.reshape(values, (BLOCK_N // 2, 2)))
+    packed, packed_sf = quantize_fp4_indexer_row(
+        values, v0, v1, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N, RNE=True
     )
-    amax2 = tl.max(
-        tl.where((2 * GROUP_N <= offs) & (offs < 3 * GROUP_N), abs_values, 0.0),
-        axis=0,
-    )
-    amax3 = tl.max(tl.where(3 * GROUP_N <= offs, abs_values, 0.0), axis=0)
-
-    sf0 = tl.maximum(amax0 / 6.0, 1.0e-4)
-    sf1 = tl.maximum(amax1 / 6.0, 1.0e-4)
-    sf2 = tl.maximum(amax2 / 6.0, 1.0e-4)
-    sf3 = tl.maximum(amax3 / 6.0, 1.0e-4)
-
-    exp0 = _ceil_ue8m0_exp(sf0)
-    exp1 = _ceil_ue8m0_exp(sf1)
-    exp2 = _ceil_ue8m0_exp(sf2)
-    exp3 = _ceil_ue8m0_exp(sf3)
-
-    exps = _select_group_value(chunks, exp0, exp1, exp2, exp3)
-    tl.store(scale_base + chunks * (16 * 4), exps.to(tl.uint8))
-
-    pair_offsets = tl.arange(0, BLOCK_N // 2)
-    offs0 = pair_offsets * 2
-    offs1 = offs0 + 1
-    group0 = offs0 // GROUP_N
-    group1 = offs1 // GROUP_N
-    scale_exp0 = _select_group_value(group0, exp0, exp1, exp2, exp3)
-    scale_exp1 = _select_group_value(group1, exp0, exp1, exp2, exp3)
-    scale0 = (scale_exp0 << 23).to(tl.float32, bitcast=True)
-    scale1 = (scale_exp1 << 23).to(tl.float32, bitcast=True)
-
-    v0 = tl.load(x + row * BLOCK_N + offs0).to(tl.float32) / scale0
-    v1 = tl.load(x + row * BLOCK_N + offs1).to(tl.float32) / scale1
-    code0 = _fp4_e2m1_code_rne(v0)
-    code1 = _fp4_e2m1_code_rne(v1)
-    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
-    tl.store(x_fp4 + row * (BLOCK_N // 2) + pair_offsets, packed)
+    sf_bytes = ((packed_sf >> (8 * chunks)) & 0xFF).to(tl.uint8)
+    tl.store(scale_base + chunks * (16 * 4), sf_bytes)
+    tl.store(x_fp4 + row * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2), packed)
 
 
 def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
