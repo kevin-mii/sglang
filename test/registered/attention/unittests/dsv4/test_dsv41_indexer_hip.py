@@ -504,6 +504,8 @@ class _LowRatioBackendCase(CustomTestCase):
             core = SimpleNamespace(
                 sparse_page_indices=lambda r: page_indices,
                 sparse_raw_indices=lambda r: raw_indices,
+                # the indexer drops the ratio's length folds before it writes; none here
+                drop_folded_sparse_indices=lambda r: None,
             )
             indexer_metadata = PagedIndexerMetadata(
                 page_size=FULL_PAGE_SIZE,
