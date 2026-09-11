@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
+    index_q_pack_weights_hip,
     logits_rows_per_chunk,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
@@ -422,7 +423,32 @@ def _indexer_inputs(layer, x, q_lora, pos):
     indexer = layer.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    # TODO: wire index_q_rope_pack_weights into low_ratio_index_topk_hip_decode (FlyDSL q layout)
+    num_tokens = x.shape[0]
+    if (
+        0 < num_tokens <= indexer.weights_proj_hip_max_tokens
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.stride(1) == 1
+        and indexer.n_heads % 16 == 0
+        and indexer.n_heads <= 64
+        and indexer.index_head_dim == 128
+        and layer.freqs_cis.dtype == torch.complex64
+    ):
+        # decode / verify rows: wq_b, the head-weight GEMV, then one launch for the RoPE,
+        # the two-stage fp4 pack in the FlyDSL layout and the head-weight reduce
+        from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+
+        q, _ = indexer.wq_b(q_lora)
+        partials = rocm_router_gemv_split_k(x, indexer.weights_proj.weight)
+        return index_q_pack_weights_hip(
+            q,
+            layer.freqs_cis,
+            pos,
+            indexer.rope_head_dim,
+            partials,
+            indexer.head_weight_scale,
+            num_heads=indexer.n_heads,
+        )
     q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled

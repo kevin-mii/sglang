@@ -283,6 +283,65 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
+@pytest.mark.parametrize("num_tokens", [1, 6, 16])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_index_q_pack_weights_matches_standalone(
+    num_tokens: int, num_heads: int
+) -> None:
+    """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
+    weights) is bitwise the three standalone launches it replaces."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        index_q_pack_weights_hip,
+        pack_fp4_query_flydsl,
+        rocm_indexer_head_weights,
+    )
+    from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+        rope_tail_fake_quant_fp4,
+    )
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
+
+    torch.manual_seed(num_tokens * 7 + num_heads)
+    rope_dim, hidden, max_pos = 64, 5120, 4096
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    assert freqs.dtype == torch.complex64
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    x = torch.randn(num_tokens, hidden, device="cuda").bfloat16()
+    w = (torch.randn(num_heads, hidden, device="cuda") * 0.02).bfloat16()
+    scale = 128**-0.5 * num_heads**-0.5
+
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(num_tokens, num_heads, 128), freqs[pos], rope_dim
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    ref_w = rocm_indexer_head_weights(x, w, scale)
+
+    partials = rocm_router_gemv_split_k(x, w)
+    q_fp4, q_scale, weights = index_q_pack_weights_hip(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    assert q_fp4.shape == (num_tokens, num_heads, 64) and q_fp4.dtype == torch.int8
+    assert q_scale.shape == (num_tokens, 1, 4, 16, 4) and q_scale.dtype == torch.uint8
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+    assert torch.equal(weights, ref_w)
+    # repeatable, and a row alone equals the row inside the batch
+    again = index_q_pack_weights_hip(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    assert all(torch.equal(a, b) for a, b in zip(again, (q_fp4, q_scale, weights)))
+    one_fp4, one_scale, _ = index_q_pack_weights_hip(
+        q[:1],
+        freqs,
+        pos[:1],
+        rope_dim,
+        partials[:, :1].contiguous(),
+        scale,
+        num_heads=num_heads,
+    )
+    assert torch.equal(one_fp4, q_fp4[:1]) and torch.equal(one_scale, q_scale[:1])
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     """Scattered slots land in the paged layout and touch nothing else."""

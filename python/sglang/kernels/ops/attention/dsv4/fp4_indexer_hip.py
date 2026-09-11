@@ -9,6 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_row
+from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+    FP4_AMAX_FLOOR,
+    rope_tail_fake_quant_fp4_row,
+)
+
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
         CompressorDecodePlan,
@@ -637,6 +643,35 @@ def rocm_indexer_head_weights_max_tokens(
 
 
 @triton.jit
+def _reduce_scale_bf16_block(
+    block,
+    part_ptr,
+    out_ptr,
+    M,
+    stride_ps,
+    stride_pm,
+    stride_om,
+    scale,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One ``BLOCK`` of ``_reduce_scale_bf16_kernel`` (shared with the fused index-Q launch)."""
+    offs = block * BLOCK + tl.arange(0, BLOCK)
+    m = offs // N
+    n = offs % N
+    mask = m < M
+    acc = tl.load(part_ptr + m * stride_pm + n, mask=mask, other=0.0)
+    for s in tl.static_range(1, SPLIT_K):
+        acc += tl.load(
+            part_ptr + s * stride_ps + m * stride_pm + n, mask=mask, other=0.0
+        )
+    # bf16(bf16(sum) * scale): the linear's bf16 output, then the aten multiply rounded to bf16
+    w = acc.to(tl.bfloat16).to(tl.float32) * scale
+    tl.store(out_ptr + m * stride_om + n, w.to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
 def _reduce_scale_bf16_kernel(
     part_ptr,
     out_ptr,
@@ -649,18 +684,155 @@ def _reduce_scale_bf16_kernel(
     SPLIT_K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    m = offs // N
-    n = offs % N
-    mask = m < M
-    acc = tl.load(part_ptr + m * stride_pm + n, mask=mask, other=0.0)
-    for s in tl.static_range(1, SPLIT_K):
-        acc += tl.load(
-            part_ptr + s * stride_ps + m * stride_pm + n, mask=mask, other=0.0
+    _reduce_scale_bf16_block(
+        tl.program_id(0),
+        part_ptr,
+        out_ptr,
+        M,
+        stride_ps,
+        stride_pm,
+        stride_om,
+        scale,
+        N=N,
+        SPLIT_K=SPLIT_K,
+        BLOCK=BLOCK,
+    )
+
+
+@triton.jit
+def _index_q_pack_weights_kernel(
+    q_ptr,  # [T, H * 128] bf16 (wq_b output)
+    f_ptr,  # [max_pos, RD // 2, 2] fp32: the real view of the complex freqs table
+    pos_ptr,  # [T] int64
+    q_fp4_ptr,  # [T, H, 64] int8
+    q_scale_ptr,  # [T, 1, 4, 16, 4] uint8
+    part_ptr,  # [SPLIT_K, T, H] fp32 head-weight partials
+    weights_ptr,  # [T, H] bf16
+    stride_qt,
+    stride_ps,
+    stride_pm,
+    weight_scale,
+    T,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    W_BLOCK: tl.constexpr,
+):
+    """Grid (T * H + 1,). Programs [0, T * H): the (token, head) query row through
+    ``rope_tail_fake_quant_fp4_row`` (rounded to bf16 as the standalone kernel stores it),
+    then ``quantize_fp4_indexer_row`` (RNE), stored in the FlyDSL MQA-logits layout: payload
+    row ``t * H + h``, the four e8m0 bytes at ``[t, 0, c, h % 16, h // 16]``; heads of group 0
+    also zero the unused group slots. Program T * H: the head weights'
+    ``_reduce_scale_bf16_block``. Bitwise the three standalone launches."""
+    pid = tl.program_id(0)
+    if pid < T * H:
+        t = pid // H
+        h = pid % H
+        pos = tl.load(pos_ptr + t)
+        fq = rope_tail_fake_quant_fp4_row(
+            q_ptr + t.to(tl.int64) * stride_qt + h * D,
+            f_ptr + pos * RD,
+            D=D,
+            RD=RD,
+            BLK=32,
+            AMAX_FLOOR=AMAX_FLOOR,
+            INVERSE=False,
+            COMPRESSED_KV=False,
         )
-    # bf16(bf16(sum) * scale): the linear's bf16 output, then the aten multiply rounded to bf16
-    w = acc.to(tl.bfloat16).to(tl.float32) * scale
-    tl.store(out_ptr + m * stride_om + n, w.to(tl.bfloat16), mask=mask)
+        # the standalone path stores the fake-quant as bf16 and the packer reloads it
+        values = fq.to(tl.bfloat16).to(tl.float32)
+        v0, v1 = tl.split(tl.reshape(values, (D // 2, 2)))
+        packed, packed_sf = quantize_fp4_indexer_row(
+            values, v0, v1, BLOCK_N=D, GROUP_N=32, RNE=True
+        )
+        tl.store(q_fp4_ptr + pid.to(tl.int64) * (D // 2) + tl.arange(0, D // 2), packed)
+        # scale bytes: chunk c of head h at [t, 0, c, h % 16, h // 16]
+        c = tl.arange(0, 4)
+        sf_bytes = ((packed_sf >> (8 * c)) & 0xFF).to(tl.uint8)
+        base = q_scale_ptr + t.to(tl.int64) * 256 + c * 64 + (h % 16) * 4
+        tl.store(base + h // 16, sf_bytes)
+        if h < 16:
+            # groups this head count does not have stay zero
+            for g in tl.static_range(H // 16, 4):
+                tl.store(base + g, tl.zeros((4,), dtype=tl.uint8))
+    else:
+        _reduce_scale_bf16_block(
+            0,
+            part_ptr,
+            weights_ptr,
+            T,
+            stride_ps,
+            stride_pm,
+            H,
+            weight_scale,
+            N=H,
+            SPLIT_K=SPLIT_K,
+            BLOCK=W_BLOCK,
+        )
+
+
+def index_q_pack_weights_hip(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    head_weight_partials: torch.Tensor,
+    weight_scale: float,
+    *,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The HIP index-Q inputs in one launch: ``(q_fp4 [T, H, 64] int8, q_scale
+    [T, 1, 4, 16, 4] uint8, weights [T, H] bf16)``, bitwise ``pack_fp4_query_flydsl(
+    _rope_fq4(q.view(T, H, 128), freqs_cis[positions], rope_dim))`` and
+    ``rocm_indexer_head_weights``'s reduce of ``head_weight_partials``.
+
+    ``q`` is the ``[T, H * 128]`` bf16 ``wq_b`` output, ``freqs_cis`` the complex64
+    ``[max_pos, rope_dim // 2]`` table (gathered by ``positions`` in the kernel),
+    ``head_weight_partials`` the ``[split_k, T, H]`` fp32 partials of
+    ``rocm_router_gemv_split_k``. ``H % 16 == 0 and H <= 64``.
+    """
+    T = q.shape[0]
+    H = num_heads
+    assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
+    assert q.stride(1) == 1
+    assert H % 16 == 0 and 0 < H <= 64, H
+    assert freqs_cis.dtype == torch.complex64 and freqs_cis.shape[1] == rope_dim // 2
+    assert positions.shape == (T,)
+    split_k, pt, ph = head_weight_partials.shape
+    assert (pt, ph) == (T, H) and head_weight_partials.dtype == torch.float32
+    f_real = torch.view_as_real(freqs_cis)
+    assert f_real.is_contiguous()
+    q_fp4 = torch.empty((T, H, 64), dtype=torch.int8, device=q.device)
+    q_scale = torch.empty((T, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    weights = torch.empty((T, H), dtype=torch.bfloat16, device=q.device)
+    if T == 0:
+        return q_fp4, q_scale, weights
+    w_block = triton.next_power_of_2(T * H)
+    assert w_block <= 4096, T
+    _index_q_pack_weights_kernel[(T * H + 1,)](
+        q,
+        f_real,
+        positions,
+        q_fp4,
+        q_scale,
+        head_weight_partials,
+        weights,
+        q.stride(0),
+        head_weight_partials.stride(0),
+        head_weight_partials.stride(1),
+        float(weight_scale),
+        T,
+        H=H,
+        D=128,
+        RD=rope_dim,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        SPLIT_K=split_k,
+        W_BLOCK=w_block,
+        num_warps=4,
+    )
+    return q_fp4, q_scale, weights
 
 
 def rocm_indexer_head_weights(
