@@ -9,6 +9,7 @@
 #endif
 
 #include "main_norm_rope.cuh"
+#include <type_traits>
 
 namespace sglang {
 
@@ -97,6 +98,7 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
   // Query rope, pair j of head h at q[h * stride + 448 + 2j]: the cross product is rounded, then
   // one fma with the cosine, so the bf16 result is bitwise the Triton flat rope kernel's on gfx950.
   {
+    static_assert(std::is_same_v<DType, bf16_t>, "the in-place query rope reads q as bf16 pairs");
     constexpr uint32_t kPairsPerHead = kRopeDim / 2;
     const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);
     const auto n_pairs = params.num_q_heads * kPairsPerHead;
