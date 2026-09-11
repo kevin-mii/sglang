@@ -177,20 +177,17 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
         put("w", indexer.head_weights(x[:real]))
 
 
-def _bcg_low_ratio_source_projections(*args):
+@functools.cache
+def _bcg_low_ratio_source_projections_fn():
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
         eager_on_graph,
     )
 
-    global _bcg_low_ratio_source_projections_fn
-    if _bcg_low_ratio_source_projections_fn is None:
-        _bcg_low_ratio_source_projections_fn = eager_on_graph(True)(
-            _low_ratio_source_projections
-        )
-    return _bcg_low_ratio_source_projections_fn(*args)
+    return eager_on_graph(True)(_low_ratio_source_projections)
 
 
-_bcg_low_ratio_source_projections_fn = None
+def _bcg_low_ratio_source_projections(*args):
+    return _bcg_low_ratio_source_projections_fn()(*args)
 
 
 def _as_int_list(values) -> Optional[List[int]]:

@@ -53,10 +53,12 @@ class _PendingSort:
     outputs: Optional[SortOutputs]
 
 
+# process-wide by design: aiter's moe_sorting call has no per-layer hook; forward runs on one thread, no lock
 # router key -> sorting arguments seen for it (None: the sorting is not fusable for this key)
 _sort_configs: dict[tuple, Optional[SortConfig]] = {}
 # ids storage -> what the gate launch of that batch produced
 _pending_sorts: dict[int, _PendingSort] = {}
+# on overflow the pending sorts are dropped and the override re-sorts the ids (correct, one launch slower)
 _PENDING_LIMIT = 256
 
 
