@@ -347,6 +347,12 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
             "decode"
         )
         backend._low_ratio_index_topk_torch = lambda *a, **k: calls.append("torch")
+        # every body rewrites the ratio's page indices, so the dispatcher drops their folds first
+        dropped = []
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(drop_folded_sparse_indices=dropped.append)
+        )
+        layer = SimpleNamespace(compress_ratio=2)
         try:
             for mode in (
                 ForwardMode.TARGET_VERIFY,
@@ -357,10 +363,11 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                     forward_mode=mode, seq_lens_cpu=None, extend_seq_lens_cpu=None
                 )
                 backend._low_ratio_index_topk(
-                    None, None, None, None, None, forward_batch
+                    layer, None, None, None, None, forward_batch
                 )
         finally:
             self.module.low_ratio_index_topk_hip_decode = saved
+        self.assertEqual(dropped, [2, 2, 2])
         # Extend without CPU lengths still falls back to the torch oracle.
         self.assertEqual(calls, ["decode", "decode", "torch"])
 
