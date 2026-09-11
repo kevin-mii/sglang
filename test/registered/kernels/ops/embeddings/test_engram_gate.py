@@ -54,8 +54,8 @@ class TestEngramGate(CustomTestCase):
                 for value, original in zip((x, kv, qw, kw), originals):
                     self.assertTrue(torch.equal(value, original))
 
-    def test_image_rows_keep_the_input(self):
-        """``image_rows`` folds the model's ``where(input_ids == image_id, x, gated)`` into
+    def test_image_select_keeps_the_input(self):
+        """``image_select`` folds the model's ``where(input_ids == image_id, x, gated)`` into
         the launch, bitwise."""
         torch.manual_seed(31)
         for batch, dim in ((1, 128), (8, 5120), (64, 4096)):
@@ -68,11 +68,11 @@ class TestEngramGate(CustomTestCase):
                 ids[0] = 2
                 gated = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6)
                 ref = torch.where((ids == 2)[:, None, None], x, gated)
-                got = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6, image_rows=(ids, 2))
+                got = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6, image_select=(ids, 2))
                 self.assertTrue(torch.equal(got, ref))
                 self.assertTrue(torch.equal(got[0], x[0]))
                 # no image token in the batch: the plain gate
-                got = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6, image_rows=(ids, 99))
+                got = fused_engram_gate(x, kv, qw, kw, 1e-6, 1e-6, image_select=(ids, 99))
                 self.assertTrue(torch.equal(got, gated))
 
 

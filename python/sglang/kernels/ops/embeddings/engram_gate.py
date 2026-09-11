@@ -55,9 +55,9 @@ def fused_engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
-    image_rows: Optional[Tuple[torch.Tensor, int]] = None,
+    image_select: Optional[Tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
-    """``image_rows = (input_ids [T], image_token_id)`` keeps ``x`` on the rows whose input id is
+    """``image_select = (input_ids [T], image_token_id)`` keeps ``x`` on the rows whose input id is
     the image token, as the model's ``torch.where`` after the gate does (bitwise: the kept bf16
     rows round-trip through fp32 exactly)."""
     assert x.ndim == 3 and kv.ndim == 2
@@ -72,8 +72,8 @@ def fused_engram_gate(
         a.dtype in (torch.bfloat16, torch.float32) for a in (x, kv, q_weight, k_weight)
     )
     out = torch.empty_like(x)
-    if image_rows is not None:
-        input_ids, image_token_id = image_rows
+    if image_select is not None:
+        input_ids, image_token_id = image_select
         assert input_ids.shape == (t,) and input_ids.stride(0) == 1, input_ids.shape
     if t:
         _engram_gate_kernel[(t * hc,)](
@@ -82,14 +82,14 @@ def fused_engram_gate(
             q_weight,
             k_weight,
             out,
-            input_ids if image_rows is not None else out,
-            image_token_id if image_rows is not None else 0,
+            input_ids if image_select is not None else out,
+            image_token_id if image_select is not None else 0,
             d,
             hc,
             eps,
             clamp_value,
             triton.next_power_of_2(d),
-            KEEP_IMAGE_ROWS=image_rows is not None,
+            KEEP_IMAGE_ROWS=image_select is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )
