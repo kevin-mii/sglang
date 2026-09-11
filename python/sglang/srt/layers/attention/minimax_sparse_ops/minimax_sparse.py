@@ -200,6 +200,8 @@ def minimax_sparse_prefill(
                     seq_lens_cpu=seq_lens_cpu,
                     block_size_k=block_size_k,
                     sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
             else:
                 _warn_gluon_fallback("unsupported batch/cache layout or dtype")
