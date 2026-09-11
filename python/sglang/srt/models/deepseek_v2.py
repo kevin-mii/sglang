@@ -1215,6 +1215,22 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _fuse_shared_into_reduce(
+        self, skip_shared_experts: bool, num_tokens: int
+    ) -> bool:
+        """aiter: the shared expert runs first so the experts' top-k reduction can add
+        it in one launch. ``shared_experts`` exists only when the checkpoint has one
+        that is not fused into the routed kernel."""
+        return bool(
+            _use_aiter
+            and envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()
+            and getattr(self, "shared_experts", None) is not None
+            and not self._shared_expert_tp1
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+            and num_tokens > 0
+        )
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1235,15 +1251,8 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
-        # aiter: the shared expert runs first so the experts' top-k reduction can add it in one launch
-        fuse_shared_into_reduce = (
-            _use_aiter
-            and envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()
-            and self.shared_experts is not None
-            and not self._shared_expert_tp1
-            and not self._fuse_shared_experts_inside_sbo
-            and not skip_shared_experts
-            and hidden_states.shape[0] > 0
+        fuse_shared_into_reduce = self._fuse_shared_into_reduce(
+            skip_shared_experts, hidden_states.shape[0]
         )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
