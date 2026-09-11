@@ -156,7 +156,8 @@ def _batched_gemm_bf16_split_k_partial_kernel(
     waves_per_eu: tl.constexpr,
 ):
     """Grid (G, row tiles x N tiles, SPLIT_K): the fp32 partial of one K slice, stored as
-    ``part[g, split, row_tile, m, n]``. ``K % (SPLIT_K * BLOCK_SIZE_K) == 0``."""
+    ``part[g, split, row_tile, m, n]``. ``K % (SPLIT_K * BLOCK_SIZE_K) == 0`` and
+    ``N % BLOCK_SIZE_N == 0`` (unmasked N tiles)."""
     batch_id = tl.cast(tl.program_id(axis=0), tl.int64)
     pid = tl.program_id(axis=1)
     pid_k = tl.program_id(axis=2)
@@ -241,8 +242,13 @@ def _batched_gemm_split_k_reduce_kernel(
     tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
-def _split_k_applies(T: int, D: int) -> bool:
-    return 0 < T <= _SPLIT_K_MAX_M and D % (_SPLIT_K * _SPLIT_K_BLOCK_K) == 0
+def _split_k_applies(T: int, D: int, R: int) -> bool:
+    # the partial kernel stores whole N tiles with pitch R, so R must be a tile multiple
+    return (
+        0 < T <= _SPLIT_K_MAX_M
+        and D % (_SPLIT_K * _SPLIT_K_BLOCK_K) == 0
+        and R % _BLOCK_N == 0
+    )
 
 
 def _batched_gemm_split_k(
@@ -315,9 +321,9 @@ def batched_gemm_bf16_fp8_grid(
     if T == 0:
         return out
     if split_k is None:
-        split_k = _split_k_applies(T, D)
+        split_k = _split_k_applies(T, D, R)
     if split_k:
-        assert _split_k_applies(T, D), (T, D)
+        assert _split_k_applies(T, D, R), (T, D, R)
         _batched_gemm_split_k(x, w, out, fp8_grid, eps)
         return out
     grid = (G, triton.cdiv(T, _BLOCK_M) * triton.cdiv(R, _BLOCK_N))

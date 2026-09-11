@@ -323,7 +323,7 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         )
 
         for g, r, d in GEMM_SHAPES:
-            if not _split_k_applies(1, d):
+            if not _split_k_applies(1, d, r):
                 continue
             torch.manual_seed(5)
             w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
@@ -345,6 +345,27 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
                 )
             for _ in range(5):
                 self.assertTrue(torch.equal(self.gemm(x, w), full_grid))
+
+    def test_odd_r_takes_the_single_launch(self):
+        """R that is not a 32 multiple never takes split-K (its partial kernel stores
+        whole N tiles): the default regime is the single launch and matches the reference."""
+        from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+            _split_k_applies,
+        )
+
+        g, r, d = 2, 1000, 4096
+        self.assertFalse(_split_k_applies(8, d, r))
+        torch.manual_seed(7)
+        w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
+        x = torch.randn(8, g, d, device="cuda").bfloat16()
+        out = self.gemm(x, w, fp8_grid=False)
+        self.assertEqual(out.shape, (8, g * r))
+        self.assertTrue(
+            torch.equal(out, self.gemm(x, w, fp8_grid=False, split_k=False))
+        )
+        self.assertTrue(torch.equal(out, _aiter_reference(x, w)))
+        with self.assertRaises(AssertionError):
+            self.gemm(x, w, fp8_grid=False, split_k=True)
 
     def test_strided_input_view(self):
         # the model hands over a [T, G, D] view of a [T, H, head_dim] tensor; the kernel reads it through strides
