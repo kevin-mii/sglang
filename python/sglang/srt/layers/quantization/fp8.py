@@ -1211,25 +1211,25 @@ class Fp8LinearMethod(LinearMethodBase):
         (`block_fp8_as_mxfp8`). `x` is a bf16 tensor, an `(fp8, scale)` tuple from a
         fused quant kernel, or one of the wrappers the fused gfx950 producers emit."""
         backend = self.mxfp8_dense_backend
-        ready = layer.block_fp8_mxfp8_ready
-        native = ready and backend.is_gfx95_mxfp8_native()
+        mxfp8_ready = layer.block_fp8_mxfp8_ready
+        native_route = mxfp8_ready and backend.is_gfx95_mxfp8_native()
         if isinstance(x, Mxfp8Activation):
             # quantized by a fused producer for the native route; other routes dequantize it (exact)
-            if native:
+            if native_route:
                 return self._apply_gfx95_native(layer, x.q, bias, input_scale=x.scale)
             x = Fp8GridActivation(dequant_mxfp8_to_bf16(x.q, x.scale))
         if isinstance(x, Fp8GridActivation):
             # the dot_scaled route quantizes the plain tensor itself (per-32 rounding is idempotent)
-            if native:
+            if native_route:
                 return self._apply_gfx95_native(
                     layer, x.x, bias, input_on_fp8_grid=True
                 )
             x = x.x
-        if native:
+        if native_route:
             if isinstance(x, tuple):
                 return self._apply_gfx95_native(layer, x[0], bias, input_scale=x[1])
             return self._apply_gfx95_native(layer, x, bias)
-        if ready and not isinstance(x, tuple):
+        if mxfp8_ready and not isinstance(x, tuple):
             return self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,

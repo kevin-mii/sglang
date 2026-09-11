@@ -15,26 +15,26 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
     """Fix ``mlp``'s activation route from ``down_proj``'s loaded weight (once per layer)."""
-    qm = getattr(mlp.down_proj, "quant_method", None)
+    quant_method = getattr(mlp.down_proj, "quant_method", None)
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
     mlp.use_fused_clamp_act_mul = half_width % 128 == 0
     mlp._fused_clamp_use_fp8 = (
-        isinstance(qm, Fp8LinearMethod)
-        and qm.block_quant
-        and qm.weight_block_size == [128, 128]
+        isinstance(quant_method, Fp8LinearMethod)
+        and quant_method.block_quant
+        and quant_method.weight_block_size == [128, 128]
     )
     # gfx950 32-block route: the activation lands on the fp8 grid, so down_proj skips its fake-quant
     mlp._hip_act_fp8_grid = bool(
-        isinstance(qm, Fp8LinearMethod)
-        and qm.block_fp8_as_mxfp8
+        isinstance(quant_method, Fp8LinearMethod)
+        and quant_method.block_fp8_as_mxfp8
         and mlp.down_proj.block_fp8_mxfp8_ready
-        and qm.mxfp8_dense_backend.takes_fp8_grid_activation()
+        and quant_method.mxfp8_dense_backend.takes_fp8_grid_activation()
         and silu_and_mul_clamp_fp8_grid_supported(half_width)
     )
     # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue at decode token counts
     mlp._hip_act_native_consumer = bool(
         mlp._hip_act_fp8_grid
-        and qm.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and mlp.down_proj.mxfp8_native_ready
     )
     mlp._fused_clamp_fp8_checked = True

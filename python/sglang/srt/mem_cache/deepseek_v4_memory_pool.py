@@ -518,16 +518,22 @@ class DeepSeekV4IndexerPool(KVCache):
             if slots is None:
                 slots = torch.arange(self.size, device=self.device)
             payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
-            u = payload.view(torch.uint8)  # [n, 64]
-            exps = torch.stack(
+            payload_u8 = payload.view(torch.uint8)  # [n, 64]
+            scale_exps = torch.stack(
                 [(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1
             )  # [n, 4]
-            codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-            vals = DSV4_DEQUANT_FP4_TABLE.to(u.device)[codes.long()].flatten(
+            fp4_codes = torch.stack(
+                [payload_u8 & 0x0F, (payload_u8 >> 4) & 0x0F], dim=-1
+            )  # [n, 64, 2]
+            dequant = DSV4_DEQUANT_FP4_TABLE.to(payload_u8.device)[
+                fp4_codes.long()
+            ].flatten(
                 1
             )  # [n, 128]
-            scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
-            return (vals * scales).to(torch.bfloat16)
+            scales = torch.exp2(scale_exps.float() - 127).repeat_interleave(
+                32, dim=-1
+            )
+            return (dequant * scales).to(torch.bfloat16)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)

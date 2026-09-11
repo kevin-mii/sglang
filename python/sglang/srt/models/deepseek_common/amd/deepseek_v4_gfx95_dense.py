@@ -90,12 +90,12 @@ def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> Optional[Tuple[int, i
     native kernels tile (it then consumes fp8 + ue8m0 scales directly), else None."""
     from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
-    qm = getattr(linear, "quant_method", None)
+    quant_method = getattr(linear, "quant_method", None)
     if not (
-        isinstance(qm, Fp8LinearMethod)
-        and qm.block_fp8_as_mxfp8
+        isinstance(quant_method, Fp8LinearMethod)
+        and quant_method.block_fp8_as_mxfp8
         and linear.block_fp8_mxfp8_ready
-        and qm.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and linear.mxfp8_native_ready
     ):
         return None
@@ -214,13 +214,13 @@ def wo_b_takes_fp8_grid(attn) -> bool:
     if not attn._wo_b_fp8_grid_checked:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
-        qm = getattr(attn.wo_b, "quant_method", None)
+        quant_method = getattr(attn.wo_b, "quant_method", None)
         attn._wo_b_fp8_grid_operand = bool(
             _wo_a_fp8_grid_gemm is not None
-            and isinstance(qm, Fp8LinearMethod)
-            and qm.block_fp8_as_mxfp8
+            and isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.block_fp8_as_mxfp8
             and attn.wo_b.block_fp8_mxfp8_ready
-            and qm.mxfp8_dense_backend.takes_fp8_grid_activation()
+            and quant_method.mxfp8_dense_backend.takes_fp8_grid_activation()
         )
         attn._wo_b_fp8_grid_checked = True
     return attn._wo_b_fp8_grid_operand
