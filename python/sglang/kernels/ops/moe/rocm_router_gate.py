@@ -1,7 +1,9 @@
 """The DeepSeek-V4 MoE router at decode row counts on ROCm: a split-K bf16 GEMV
 (:func:`rocm_router_gemv_split_k`, fp32 partials) and a sqrtsoftplus top-k gate
 (:func:`rocm_router_gate`) that sums the partials in a fixed order and reproduces aiter's
-``topk_gating_kernel_opt`` bit for bit, ties included. Serves ``M <= ROCM_ROUTER_MAX_TOKENS``.
+``topk_gating_kernel_opt`` bit for bit, ties included. Serves ``M <= ROCM_ROUTER_MAX_TOKENS``
+(decode batches and DSpark target-verify rows); :mod:`rocm_router_gate_sort` runs the gate
+together with aiter's MoE sorting in one launch.
 """
 
 from __future__ import annotations
@@ -14,10 +16,11 @@ import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
-# doubles as the GEMV's compile-time row tile, so every M <= 16 runs the same tile (batch invariance)
-ROCM_ROUTER_MAX_TOKENS = 16
+# the GEMV walks 16-row tiles inside one program, so every M runs the same tile (batch invariance)
+ROCM_ROUTER_MAX_TOKENS = 64
 
 _BLOCK_M = 16
+_MAX_M_TILES = ROCM_ROUTER_MAX_TOKENS // _BLOCK_M
 _BLOCK_N = 16
 _BLOCK_K = 512
 _MAX_SPLIT_K = 32
@@ -31,7 +34,8 @@ _FLT_MAX = tl.constexpr(3.4028234663852886e38)
 
 def rocm_gemv_split_k_max_tokens(*, n: int, k: int, weight_dtype: torch.dtype) -> int:
     """Rows up to which :func:`rocm_router_gemv_split_k` serves an ``[M, k] @ [n, k].T`` bf16
-    GEMV (one 16-wide N tile per 512 of K), -1 when the device or the shape rules it out."""
+    GEMV (one 16-wide N tile per 512 of K, 16-row tiles), -1 when the device or the shape
+    rules it out."""
     if not (is_hip() and is_gfx95_supported()):
         return -1
     if weight_dtype != torch.bfloat16:
@@ -72,25 +76,31 @@ def _router_gemv_split_k_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    M_TILES: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    offs_m = tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    row_mask = offs_m < M
-    x = tl.load(
-        x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
-        mask=row_mask[:, None],
-        other=0.0,
-    )
     w = tl.load(w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None])
-    acc = tl.dot(x, w)
-    tl.store(
-        part_ptr + pid_k * stride_ps + offs_m[:, None] * stride_pm + offs_n[None, :],
-        acc,
-        mask=row_mask[:, None],
-    )
+    # the weight tile is read once; every row tile is the same BLOCK_M x BLOCK_K dot
+    for t in tl.static_range(M_TILES):
+        offs_m = t * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask = offs_m < M
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+        acc = tl.dot(x, w)
+        tl.store(
+            part_ptr
+            + pid_k * stride_ps
+            + offs_m[:, None] * stride_pm
+            + offs_n[None, :],
+            acc,
+            mask=row_mask[:, None],
+        )
 
 
 def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -119,6 +129,7 @@ def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
         BLOCK_K=_BLOCK_K,
+        M_TILES=triton.cdiv(M, _BLOCK_M),
         num_warps=4,
     )
     return partials
@@ -216,16 +227,14 @@ def _load_logits(
 
 
 @triton.jit
-def _router_gate_kernel(
-    logits_ptr,  # [M, 384] read when SPLIT_K == 0, written when WRITE_LOGITS
-    part_ptr,  # [SPLIT_K, M, 384] fp32 (SPLIT_K > 0)
-    bias_ptr,  # [384] fp32 or bf16 (HAS_BIAS)
-    weights_ptr,  # [M, TOPK] fp32
-    ids_ptr,  # [M, TOPK] int32
+def _gate_row(
+    logits_ptr,
+    part_ptr,
+    bias_ptr,
+    row,
     stride_lm,
     stride_ps,
     stride_pm,
-    stride_om,
     routed_scaling_factor,
     SPLIT_K: tl.constexpr,
     WRITE_LOGITS: tl.constexpr,
@@ -233,7 +242,8 @@ def _router_gate_kernel(
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    """aiter's ``topk_gating_kernel_opt`` for one row on one 64-lane wave: returns the
+    scaled weights and the ids as ``[64]`` lane tensors (lane k < TOPK holds slot k)."""
     lane = tl.arange(0, 64)
     # Slot i of a lane holds expert lane + 64 * i, as in aiter's register kernel.
     i0 = lane
@@ -341,9 +351,47 @@ def _router_gate_kernel(
         scale = routed_scaling_factor / tl.maximum(total, 1e-20)
     else:
         scale = routed_scaling_factor * 1.0
+    return sel_val * scale, sel_idx
+
+
+@triton.jit
+def _router_gate_kernel(
+    logits_ptr,  # [M, 384] read when SPLIT_K == 0, written when WRITE_LOGITS
+    part_ptr,  # [SPLIT_K, M, 384] fp32 (SPLIT_K > 0)
+    bias_ptr,  # [384] fp32 or bf16 (HAS_BIAS)
+    weights_ptr,  # [M, TOPK] fp32
+    ids_ptr,  # [M, TOPK] int32
+    stride_lm,
+    stride_ps,
+    stride_pm,
+    stride_om,
+    routed_scaling_factor,
+    SPLIT_K: tl.constexpr,
+    WRITE_LOGITS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    RENORM: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    weights, ids = _gate_row(
+        logits_ptr,
+        part_ptr,
+        bias_ptr,
+        row,
+        stride_lm,
+        stride_ps,
+        stride_pm,
+        routed_scaling_factor,
+        SPLIT_K,
+        WRITE_LOGITS,
+        HAS_BIAS,
+        RENORM,
+        TOPK,
+    )
+    lane = tl.arange(0, 64)
     out_mask = lane < TOPK
-    tl.store(weights_ptr + row * stride_om + lane, sel_val * scale, mask=out_mask)
-    tl.store(ids_ptr + row * stride_om + lane, sel_idx, mask=out_mask)
+    tl.store(weights_ptr + row * stride_om + lane, weights, mask=out_mask)
+    tl.store(ids_ptr + row * stride_om + lane, ids, mask=out_mask)
 
 
 def rocm_router_gate(
