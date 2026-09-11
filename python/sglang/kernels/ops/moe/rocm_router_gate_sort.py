@@ -327,9 +327,6 @@ def rocm_router_gate_sort(
     block_size: int,
     zero_moe_buf: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
-    *,
-    num_warps: Optional[int] = None,
-    jc: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """:func:`rocm_router_gate` followed by :func:`fused_aiter_moe_sorting`, one launch.
 
@@ -374,11 +371,8 @@ def rocm_router_gate_sort(
         moe_buf = torch.empty((0, 0), dtype=moe_buf_dtype, device=device)
     m_pad = max(2, triton.next_power_of_2(M))
     topk_pad = triton.next_power_of_2(topk)
-    if num_warps is None:
-        num_warps = 1
-    if jc is None:
-        n = m_pad * topk_pad
-        jc = n if n <= 32 else 16
+    n = m_pad * topk_pad
+    jc = n if n <= 32 else 16
     _router_gate_sort_kernel[(M,)](
         gating_output,
         partials,
@@ -416,7 +410,7 @@ def rocm_router_gate_sort(
         BLOCK_D=1024,
         MAX_SPINS=1 << 20,
         JC=jc,
-        num_warps=num_warps,
+        num_warps=1,
     )
     return (
         weights,

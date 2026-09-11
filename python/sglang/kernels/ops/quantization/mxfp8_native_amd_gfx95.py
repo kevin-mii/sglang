@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -24,7 +25,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    Fp8GridActivation,
     dequant_block_fp8_weight_to_bf16,
     fake_quant_fp8_activation,
     mxfp8_e4m3_quantize,
@@ -54,8 +54,6 @@ class GemvConfig:
 
     @staticmethod
     def parse(key: str) -> GemvConfig:
-        import re
-
         m = re.fullmatch(r"w(\d+)s(\d+)r(\d+)t(\d+)([kn])", key)
         assert m, key
         return GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]), m[5] == "k")
@@ -71,6 +69,7 @@ class GemvConfig:
         )
 
 
+# candidate set of the offline sweep that produced mxfp8_gemv_gfx95_configs.json
 ALL_CONFIGS = tuple(
     GemvConfig(w, s, r, t, ks)
     for w in (4, 8, 16)
@@ -478,7 +477,6 @@ def mxfp8_native_blockscaled_linear(
 __all__ = [
     "ALL_CONFIGS",
     "CONFIG_FILE",
-    "Fp8GridActivation",
     "GemvConfig",
     "MXFP8_GEMV_MAX_TOKENS",
     "M_BUCKETS",

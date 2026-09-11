@@ -31,7 +31,6 @@ typedef float v4f __attribute__((ext_vector_type(4)));
 
 constexpr int kTileN = 16;
 constexpr int kStepK = 128;
-constexpr int kMaxTokens = 32;
 constexpr int kLaneBytes = 32;
 constexpr int kStepBytes = 64 * kLaneBytes;  // one 16 x 128 fp8 tile
 constexpr int kScaleRows = 32;               // rows sharing one checkpoint block scale

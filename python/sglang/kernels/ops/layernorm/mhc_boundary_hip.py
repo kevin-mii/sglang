@@ -4,13 +4,13 @@ mixing statistics in one launch, then the reduce + sinkhorn kernel shared with
 as `HcCoefficients`, which the layer's next RMSNorm launch hosts
 (`rmsnorm_with_sinkhorn`) so decode pays no separate launch for it."""
 
-import functools
 from typing import Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _is_hip
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
@@ -608,7 +608,7 @@ def _hc_boundary_prefill_available() -> bool:
     return _is_hip and torch.cuda.is_available() and is_gfx95_supported()
 
 
-@functools.lru_cache(maxsize=None)
+@cache_once
 def _hc_boundary_prefill_module():
     from sglang.kernels.jit.utils import load_jit
 
