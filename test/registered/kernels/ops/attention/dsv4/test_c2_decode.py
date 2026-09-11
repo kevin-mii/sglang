@@ -302,16 +302,18 @@ def test_saturated_and_tied_scores(dim):
     n = 6
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(n, dim, seed=6000 + dim)
     positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
-    # Row 0 ties with its partner; the rest sit far enough apart that
-    # `exp(-|delta|)` underflows in fp32.
+    ring = RING_SIZES[-1]
+    # Row 0 ties with its partner; the odd rows sit 200 above theirs and rows
+    # 2 and 4 sit 200 below, so `exp(-|delta|)` underflows in fp32 from either
+    # side. The partner is the state row the kernel reads, not row `req`.
+    read, _ = _state_rows(req, positions, ring)
     kv_input[:, dim:] = 0.0
     kv_state[:, dim:] = 0.0
     kv_input[1::2, dim:] = 200.0
-    kv_state[req[2::2], dim:] = 200.0
+    kv_state[read[2::2], dim:] = 200.0
     norm = _norm(dim, 6001 + dim)
     ref_state, got_state = kv_state.clone(), kv_state.clone()
 
-    ring = RING_SIZES[-1]
     expected, odd = _torch_reference(
         kv_input, ref_state, norm, positions, req, raw_out_loc, ring
     )
@@ -327,6 +329,18 @@ def test_saturated_and_tied_scores(dim):
     )
     assert odd.all() and torch.isfinite(got.float()).all()
     _compare(got, expected, odd, f"saturated {dim=}")
+    # The saturated rows are one-sided picks: the odd rows keep their own kv,
+    # rows 2 and 4 take their partner's.
+    own = _torch_rmsnorm(kv_input[:, :dim].to(torch.bfloat16), norm.weight.data, EPS)
+    partner = _torch_rmsnorm(
+        kv_state[read, :dim].to(torch.bfloat16), norm.weight.data, EPS
+    )
+    rows = torch.zeros(n, dtype=torch.bool, device="cuda")
+    rows[1::2] = True
+    _compare(got, own, rows, f"saturated own {dim=}")
+    rows = torch.zeros(n, dtype=torch.bool, device="cuda")
+    rows[2::2] = True
+    _compare(got, partner, rows, f"saturated partner {dim=}")
 
 
 def test_empty_batch():
