@@ -24,7 +24,7 @@ _MAX_M_TILES = ROCM_ROUTER_MAX_TOKENS // _BLOCK_M
 _BLOCK_N = 16
 _BLOCK_K = 512
 _MAX_SPLIT_K = 32
-# aiter's wave64 kernel holds EPT = 384 / 64 = 6 slots per lane; the sorting network below is the N == 6 one
+# aiter's wave64 kernel: EPT = 384 / 64 = 6 slots per lane; the sorting network below is N == 6
 _WARP = 64
 _GATE_NUM_EXPERTS = _WARP * 6
 _MAX_TOPK = 16
@@ -181,7 +181,7 @@ def rocm_router_reduce_partials(partials: torch.Tensor, out: torch.Tensor) -> No
 
 @triton.jit
 def _score(x):
-    # aiter compute_score<SCORE_SQRTSOFTPLUS>: +inf clamps to FLT_MAX, NaN falls through, sqrt correctly rounded
+    # aiter compute_score<SQRTSOFTPLUS>: +inf clamps to FLT_MAX, NaN passes, sqrt correctly rounded
     x = tl.where(x > _FLT_MAX, _FLT_MAX, x)
     t = tl.exp2(x * 1.4426950408889634)
     sp = tl.where(x > 20.0, x, tl.log2(1.0 + t) * 0.6931471805599453)
@@ -324,7 +324,7 @@ def _gate_row(
     v1, o1, i1, v2, o2, i2 = _cas(v1, o1, i1, v2, o2, i2)
     v3, o3, i3, v4, o4, i4 = _cas(v3, o3, i3, v4, o4, i4)
     v2, o2, i2, v3, o3, i3 = _cas(v2, o2, i2, v3, o3, i3)
-    # k-way merge: every lane offers its head, the max wins, ties go to the lowest lane (aiter's ballot + ctz)
+    # k-way merge: lanes offer their heads, the max wins, ties to the lowest lane (aiter ballot + ctz)
     cursor = tl.zeros([64], dtype=tl.int32)
     sel_val = tl.zeros([64], dtype=tl.float32)
     sel_idx = tl.zeros([64], dtype=tl.int32)

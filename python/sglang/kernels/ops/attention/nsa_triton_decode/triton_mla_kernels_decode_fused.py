@@ -840,7 +840,7 @@ def _prune_dual_scope_configs(configs, named_args, **kwargs):
     if h_q <= 64:
         pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= 16]
         if _is_hip:
-            # the autotuner's pick varies per launch and fixes the fp32 accumulation order, so pin one tile
+            # the autotuner's pick sets the fp32 accumulation order and varies per launch: pin one tile
             pinned = [
                 c
                 for c in pruned

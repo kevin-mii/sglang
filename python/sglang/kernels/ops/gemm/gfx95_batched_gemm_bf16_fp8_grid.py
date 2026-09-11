@@ -25,7 +25,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_round
 
-# 16 x 32 x 512 with 2 warps: the fastest N tile that holds whole 32-groups; nonkdim 16 is aiter's MFMA
+# 16 x 32 x 512, 2 warps: the fastest N tile holding whole 32-groups; nonkdim 16 is aiter's MFMA
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 16, 32, 512
 _NUM_WARPS, _NUM_STAGES, _WAVES_PER_EU, _MFMA_NONKDIM = 2, 2, 2, 16
 _CACHE_MODIFIER = ".cg"
@@ -120,7 +120,7 @@ def _batched_gemm_bf16_fp8_grid_kernel(
 
     c = accumulator.to(c_ptr.type.element_ty)
     if FP8_GRID:
-        # the consumer's fake-quant rule on the bf16-rounded output: one ue8m0 group per 32 N elements
+        # the consumer's fake-quant on the bf16-rounded output: one ue8m0 group per 32 N elements
         xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
         c = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_SIZE_M, BLOCK_SIZE_N))
         c = c.to(c_ptr.type.element_ty)

@@ -190,9 +190,8 @@ def mxfp8_gemv(
             x_scale.shape
         )
         x_scale = x_scale.contiguous()
-        x = x.view(
-            torch.uint8
-        )  # tvm-ffi has no fp8 dtype on ROCm; the kernel takes the bytes
+        # the kernel takes the fp8 bytes
+        x = x.view(torch.uint8)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     cfg = config or select_config(m, n, k)
@@ -201,7 +200,7 @@ def mxfp8_gemv(
     return out
 
 
-# M > 32: hipBLASLt bf16 on a bf16 copy or the Triton dot_scaled tile, per the table's "large_m" section
+# M > 32: hipBLASLt bf16 on the bf16 copy or the Triton dot_scaled tile, per the table's "large_m"
 LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
 HIPBLASLT_BF16 = "hipblaslt_bf16"
 
@@ -305,9 +304,8 @@ def _mxfp8_shuffled_gemm_kernel(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    pid_k = tl.program_id(
-        2
-    )  # split-K partition; partials are summed in fixed order outside
+    # split-K partition; partials are summed in fixed order outside
+    pid_k = tl.program_id(2)
     k0 = pid_k * k_per_split
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -408,7 +406,6 @@ def mxfp8_shuffled_gemm(
     return out
 
 
-# The route
 def native_route_plan(
     m: int, n: int, k: int, has_bf16_copy: bool, fp8_in: bool = False
 ) -> str:
@@ -466,7 +463,7 @@ def mxfp8_native_blockscaled_linear(
             fp8_in = xq is not None
             if xq is None:
                 xq, xs = mxfp8_e4m3_quantize(input_2d)
-            # a weight without a bf16 copy has a table row for every bucket, so the plan is never None here
+            # a weight without a bf16 copy has a row for every bucket, so the plan is never None here
             tile = large_m_plan(m, n, k, fp8_in)
             assert tile is not None, (m, n, k, fp8_in)
             out = mxfp8_shuffled_gemm(

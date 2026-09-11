@@ -71,7 +71,7 @@ def _sort_entries(
     loc2 = tl.reshape(loc, (NC, JC))
     t2 = tl.reshape(t, (NC, JC))
     k2 = tl.reshape(k, (NC, JC))
-    # Opus keeps one entry per (token, expert): a later slot overwrites an earlier one with the same expert
+    # Opus keeps one entry per (token, expert): a later slot with the same expert wins
     dup = tl.zeros([N], dtype=tl.int32)
     for c in tl.static_range(NC):
         loc_j = _chunk(loc2, cid, c)

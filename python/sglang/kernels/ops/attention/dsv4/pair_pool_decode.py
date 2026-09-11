@@ -94,8 +94,7 @@ def _pair_pool_decode_kernel(
             mask=mask,
         )
 
-    # Match torch's pair-axis softmax operation order. libdevice.exp is required;
-    # tl.exp uses an approximate exponential and can change the pooled latent.
+    # torch's pair-axis softmax order with an exact exp: libdevice on CUDA, tl.exp on gfx950
     m = tl.maximum(p_score, score)
     if LIBDEVICE:
         e0 = libdevice.exp(p_score - m)
@@ -105,7 +104,7 @@ def _pair_pool_decode_kernel(
         e1 = tl.exp(score - m)
     denom = e0 + e1
     # The + 0.0 prevents FMA contraction: torch rounds both products before summing.
-    # Use libdevice.div_rn to match torch division; Triton's / uses an approximate reciprocal.
+    # torch's correctly rounded division: div_rn on CUDA, / on gfx950
     if LIBDEVICE:
         t0 = p_kv * libdevice.div_rn(e0, denom)
         t1 = kv * libdevice.div_rn(e1, denom)

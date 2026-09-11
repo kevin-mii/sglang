@@ -100,8 +100,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     r = tl.program_id(0)
     t = r // rows_per_token
     if HAS_POS:
-        # freqs is the whole table; row t reads the entry of its position (the
-        # freqs[positions] gather folded into this launch)
+        # freqs is the whole table: row t reads its position's entry (the freqs[positions] gather folded in)
         t = tl.load(pos_ptr + t).to(tl.int64)
     out = rope_tail_fake_quant_fp4_row(
         x_ptr + r * x_stride_r,

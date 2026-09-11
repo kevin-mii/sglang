@@ -253,21 +253,11 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32
   }
 }
 
-// In-kernel ordering of a row's picks, in place of the separate sort launch the
-// sparse kernels otherwise need: they accumulate the selected slots in the order
-// given, so an atomic-counter order is a different floating-point sum on every
-// launch. Bitonic sort of n (a power of two, 64 <= n <= kMaxTopK) 32-bit keys,
-// one per thread: the stages with a stride below the wavefront width exchange
-// through lane shuffles, the wider ones through LDS. The keys carry no payload:
-// a row ordered by position outputs the positions themselves (and their slots),
-// a row ordered by slot outputs only the slots.
-// An O(n^2) rank sort was measured first and rejected: every thread reads the
-// whole key array, 2 MB of LDS traffic for 512 picks, ~8 us on gfx950.
-// The value of lane (lane ^ J) within the wavefront. ds_bpermute (__shfl_xor)
-// is an LDS round trip, ~100+ cycles on the dependent chain of every sort stage;
-// DPP (quad_perm for J = 1, 2; row_shl / row_shr for J = 4, 8) is a VALU operand
-// modifier and the gfx950 permlane swaps cover J = 16 and 32 in registers.
-// Verified lane by lane against lane ^ J on gfx950.
+// Bitonic sort of n (a power of two, 64 <= n <= kMaxTopK) 32-bit keys, one per thread: strides
+// below the wavefront width exchange through lane shuffles, the wider ones through LDS.
+
+// lane ^ J's value in registers: DPP for J <= 8, gfx950 permlane swaps for J = 16, 32; __shfl_xor
+// is an LDS round trip on every stage's dependent chain.
 template <uint32_t J>
 __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
 #if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
@@ -278,7 +268,7 @@ __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
     return static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0x4E, 0xF, 0xF, true));
   }
   if constexpr (J == 4 || J == 8) {
-    // within a 16-lane row: lanes with the bit clear read J lanes up (row_shl), the rest J down (row_shr)
+    // within a 16-lane row: bit clear reads J lanes up (row_shl), bit set J lanes down (row_shr)
     const uint32_t shl =
         static_cast<uint32_t>(__builtin_amdgcn_update_dpp(0, static_cast<int>(v), 0x100 | J, 0xF, 0xF, true));
     const uint32_t shr =
@@ -300,10 +290,7 @@ __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
   return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), static_cast<int>(J), 64));
 }
 
-// One compare-exchange stage of the bitonic network (merge size K, stride J):
-// strides below the wavefront width exchange through lane_xor, the rest through
-// LDS. Fully unrolled through the templates below: the stride switch and loop
-// bookkeeping of a runtime network cost more issue slots than the exchanges.
+// One bitonic stage (merge size K, stride J); templated so the network unrolls with no stride switch.
 template <uint32_t K, uint32_t J>
 __device__ __forceinline__ uint32_t bitonic_stage(uint32_t v, uint32_t* __restrict__ s_vals, uint32_t tx, uint32_t n) {
   const bool up = (tx & K) == 0;
@@ -408,8 +395,7 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
   __shared__ int32_t s_topk_indices[kMaxTopK];
   __shared__ uint32_t s_sort_vals[kMaxTopK];
 
-  // sort_selection_rows orders a row by position when it has raw indices and by
-  // slot otherwise; sort_output reproduces that here.
+  // key: the position when the row has raw indices, else the slot (sort_selection_rows' order)
   const bool key_is_position = raw_indices_ptr != nullptr;
   uint32_t count = topk;
   if (seq_len <= static_cast<int32_t>(topk)) {

@@ -59,7 +59,7 @@ def _silu_and_mul_clamp_kernel(
         )
     else:
         if FP8_GRID:
-            # output-dtype rounding first, then the fp8 grid (the unfused order); padding never shares a group
+            # output dtype first, then the fp8 grid (the unfused order); padding never shares a group
             y = y.to(out_ptr.dtype.element_ty).to(tl.float32)
             y = tl.reshape(
                 fp8_grid_round(tl.reshape(y, (BLOCK_I // 32, 32)), eps), (BLOCK_I,)

@@ -21,12 +21,12 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
 )
 from sglang.srt.utils.common import is_gfx95_supported
 
-# a CTA owns every HC copy of its tile, so a row's fp32 operation sequence depends on (H, HC), never on M
+# a CTA owns every HC copy of its tile: a row's fp32 operation order depends on (H, HC), not on M
 _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
-# the reduce + sinkhorn row runs with the norm kernel's warps whether it is hosted there or launched alone
+# the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
 
 
@@ -274,7 +274,7 @@ def hc_mix_reduce_sinkhorn_vec(
 ) -> None:
     """Reduce the [num_slices, m, mix] partials and run the sinkhorn into pre/post/comb."""
     m = part_sq.shape[1]
-    # Layout round trip for the vector-reduce kernel (see its docstring).
+    # layout round trip for the reduce + sinkhorn row (see its docstring)
     scratch = torch.empty((m, 32), dtype=torch.float32, device=part_mix.device)
     _hc_mix_reduce_sinkhorn_vec_kernel[(m,)](
         part_mix,
@@ -533,7 +533,7 @@ def _hc_boundary_partial_kernel(
         r1 = tl.load(res_ptr + r_off + 1 * H, mask=m2, other=0.0).to(tl.float32)
         r2 = tl.load(res_ptr + r_off + 2 * H, mask=m2, other=0.0).to(tl.float32)
         r3 = tl.load(res_ptr + r_off + 3 * H, mask=m2, other=0.0).to(tl.float32)
-        # one tile load per coefficient tensor; a one-hot sum extracts a column exactly (one nonzero term)
+        # one tile load per coefficient tensor; a one-hot sum extracts a column exactly
         cj = tl.arange(0, HC)
         post_tile = tl.load(
             post_in_ptr + offs_m[:, None] * HC + cj[None, :], mask=m2, other=0.0
@@ -602,7 +602,7 @@ def _hc_boundary_partial_kernel(
         )
 
 
-# the gfx950 prefill kernel is bitwise the Triton kernel per row, so the switch below is a pure speed choice
+# the gfx950 prefill kernel is bitwise the Triton kernel per row: the switch below is a speed choice
 _HC_BOUNDARY_PREFILL_MIN_M = 1024
 
 

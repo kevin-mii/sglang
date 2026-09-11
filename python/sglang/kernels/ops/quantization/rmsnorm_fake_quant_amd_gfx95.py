@@ -68,7 +68,7 @@ def rmsnorm_fake_quant_row(
     var = tl.sum(acc, axis=0) / K
     rstd = 1.0 / tl.sqrt_rn(var + eps)
 
-    # pass 2 recomputes the fp32 sum: its bf16 rounding is the new residual, the norm reads the fp32 value
+    # pass 2 recomputes the fp32 sum: its bf16 rounding is the new residual, the norm reads fp32
     for c in tl.static_range(NUM_CHUNKS):
         offs = c * CHUNK + base
         mask = offs < K
@@ -85,7 +85,7 @@ def rmsnorm_fake_quant_row(
         if FAKE_QUANT:
             yg = tl.reshape(y.to(tl.float32), (CHUNK // 32, 32))
             if EMIT_FP8:
-                # fp8 codes plus ue8m0 exponent: the native MXFP8 operand, dequantizing exactly to the fake-quant below
+                # native MXFP8 operand (fp8 codes + ue8m0); dequantizes to the fake-quant below
                 q8, e8 = fp8_grid_quant(yg, quant_eps)
                 tl.store(
                     out_fq_ptr + row * stride_fm + offs,

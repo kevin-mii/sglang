@@ -475,11 +475,11 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
         return False
+    # gfx950 routes ue8m0 block-fp8 through the MXFP8 linear and leaves w8a8_block_fp8_linear unset
     if _is_hip and (
         quant_method.w8a8_block_fp8_linear is None
         or getattr(quant_method, "block_fp8_as_mxfp8", False)
     ):
-        # gfx950 routes ue8m0 block-fp8 through the MXFP8 linear, leaving w8a8_block_fp8_linear unset
         return False
     block_out = quant_method.quant_config.weight_block_size[0]
     return all(
@@ -494,8 +494,8 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
     weight = linear.weight
     if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return True
+    # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
     if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2:
-        # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
         return False
     block = 128
     out_dim, in_dim = weight.shape

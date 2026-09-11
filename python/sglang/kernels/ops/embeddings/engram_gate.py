@@ -42,8 +42,7 @@ def _engram_gate_kernel(
     value = tl.load(KV + token * (HC + 1) * D + HC * D + col, mask, 0).to(tl.float32)
     out = x + gate * value
     if KEEP_IMAGE_ROWS:
-        # the model keeps the pre-Engram activation on image tokens:
-        # where(input_ids == image_token_id, x, gated)
+        # image tokens keep x: the model's where(input_ids == image_token_id, x, gated)
         is_image = tl.load(IDS + token) == image_token_id
         out = tl.where(is_image, x, out)
     tl.store(O + row * D + col, out, mask)

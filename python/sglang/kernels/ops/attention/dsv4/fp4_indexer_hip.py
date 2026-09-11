@@ -142,8 +142,7 @@ def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
     return min(available_ctas, target_ctas)
 
 
-# FlyDSL compiles one kernel per page-table width; the V4.1 low-ratio indexers bucket
-# the width so a new context length does not pay a JIT
+# FlyDSL compiles one kernel per page-table width: bucket it so a new context length pays no JIT
 LOW_RATIO_PAGE_TABLE_BUCKET = 64
 
 
@@ -526,7 +525,7 @@ def aiter_k_indexer_fp4_cache_write(
     )
 
 
-# Indexer K in the FlyDSL split payload / scale layout; bytes equal AITER's fp4 writer up to the sign of zero
+# FlyDSL split payload / scale layout; bytes equal AITER's fp4 writer up to the sign of zero
 @triton.jit
 def _store_fp4_index_k_split_kernel(
     k_fp4,
@@ -555,7 +554,7 @@ def _store_fp4_index_k_split_kernel(
         + byte,
         k,
     )
-    # scale [page, 1, 4, page_size]: the slot axis is the transpose of a 16 x 4 tile (the FlyDSL K ABI)
+    # scale [page, 1, 4, page_size]: the slot axis is a 16 x 4 tile transposed (the FlyDSL K ABI)
     shuffled = (page_offset % 16) * 4 + page_offset // 16
     sf = tl.load(k_sf + token_id)
     sf_offsets = tl.arange(0, 4)
@@ -726,12 +725,12 @@ def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
     return q_fp4, q_scale
 
 
-# the router module is ROCm-only and this is consulted at indexer init on every platform, so import lazily
 def rocm_indexer_head_weights_max_tokens(
     n_heads: int, hidden_size: int, weight_dtype: torch.dtype
 ) -> int:
     """Rows up to which :func:`rocm_indexer_head_weights` serves ``weights_proj``,
     -1 when the device (non-gfx95) or the shape rules it out."""
+    # lazy: the router module is ROCm-only and indexer init consults this on every platform
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_gemv_split_k_max_tokens
 
     return rocm_gemv_split_k_max_tokens(

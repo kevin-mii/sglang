@@ -49,9 +49,7 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void fla
   // Warp-uniform, so the reductions below still see a full warp.
   if (row >= params.num_tokens) return;
 
-  // Both come from the step's metadata rather than the predecessor, so
-  // prefetching them ahead of the PDL gate overlaps with the `wk` GEMM's tail.
-  // A row that publishes nothing is dropped at the store, not here.
+  // step metadata, not the predecessor's output: loaded ahead of the PDL gate; slot 0 rows drop at the store
   const auto slot_id = params.loc[row];
   const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row]);
   PDLWaitPrimary<kUsePDL>();
@@ -80,14 +78,12 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void fla
 
   const auto packed = index_rope_quant_pack(head, tail, fp32x2_t{freq[0], freq[1]});
 
-  // A padded graph row, and at ratio > 1 a row completing no group, carry the
-  // reserved slot 0 and must publish nothing.
+  // slot 0 is reserved: padded graph rows and, at ratio > 1, rows completing no group publish nothing
   if (slot_id <= 0) return;
   const auto page = slot_id / kPageSize;
   const auto slot = slot_id % kPageSize;
 
-  // Payload byte `j` of the slot sits in chunk `j / 16` at byte `j % 16`; a
-  // lane's head pair is byte `lane` and its tail pair byte `lane + 32`.
+  // byte j of the slot is chunk j / 16, byte j % 16: the head pair at byte lane, the tail pair at lane + 32
   const auto payload_ptr = params.payload + page * (4 * kPageSize * 16) + slot * 16;
   payload_ptr[(lane / 16) * (kPageSize * 16) + lane % 16] = static_cast<uint8_t>(packed.payload[0]);
   payload_ptr[(2 + lane / 16) * (kPageSize * 16) + lane % 16] = static_cast<uint8_t>(packed.payload[1]);

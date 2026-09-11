@@ -126,9 +126,8 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   return std::bit_cast<fp8x2_e4m3_t>(static_cast<uint16_t>(x8 | (y8 << 8)));
 }
 
-// `pack_fp8` rounding to nearest even as CUDA's `__nv_fp8x2_e4m3` does (gfx942/gfx950's
-// `v_cvt_pk_fp8_f32`, checked bitwise against torch's float8_e4m3fn cast); the software
-// encoder above rounds ties away from zero.
+// `pack_fp8` rounding to nearest even as CUDA's `__nv_fp8x2_e4m3` does (gfx942/gfx950
+// `v_cvt_pk_fp8_f32`); the software encoder above rounds ties away from zero.
 namespace rn {
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx950__) || defined(__gfx942__))

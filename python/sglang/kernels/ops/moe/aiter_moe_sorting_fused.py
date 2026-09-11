@@ -87,7 +87,7 @@ def _fused_aiter_moe_sorting_kernel(
     loc = tl.load(local_expert_ids_ptr + e, mask=in_range, other=-1)
     loc = tl.where(in_range, loc, -1)  # [M_PAD, TOPK_PAD], -1 = not local
 
-    # Opus keeps one entry per (token, expert): a later slot overwrites an earlier one with the same expert
+    # Opus keeps one entry per (token, expert): a later slot with the same expert wins
     later_same = (
         (loc[:, :, None] == loc[:, None, :])
         & (k[None, None, :] > k[None, :, None])

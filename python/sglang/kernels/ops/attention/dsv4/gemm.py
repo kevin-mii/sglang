@@ -145,7 +145,7 @@ def linear_bf16_fp32(
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
     if _use_aiter and y.dtype == torch.bfloat16:
-        # aiter's tuned GEMM rounds otype=float32 output to bf16; torch.mm (hipBLASLt) keeps the fp32-out contract
+        # aiter's tgemm rounds an otype=float32 result to bf16; torch.mm keeps the fp32 output
         return _linear_bf16_fp32_cublas(x, y)
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)

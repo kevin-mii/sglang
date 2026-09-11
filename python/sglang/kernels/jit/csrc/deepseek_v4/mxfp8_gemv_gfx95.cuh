@@ -1,17 +1,17 @@
-// MXFP8 skinny GEMM for gfx950: out[M, N] bf16 = X[M, K] . W[N, K]^T, M <= 16, fp8 e4m3 operands with one
-// ue8m0 scale per 32 K on both sides, fp32 accumulation on v_mfma_scale_f32_16x16x128_f8f6f4. The summation
-// order is fixed by (tile, wave, step): repeated calls are bitwise identical and a row is batch-invariant.
+// MXFP8 skinny GEMM for gfx950: out[M, N] bf16 = X[M, K] . W[N, K]^T, M <= 32, fp8 e4m3 operands,
+// one ue8m0 scale per 32 K on both sides, fp32 accumulation on v_mfma_scale_f32_16x16x128_f8f6f4.
+// The sum order is fixed by (tile, wave, step): repeated calls are bitwise equal, rows batch-invariant.
 //
-// Operand layout of the 16x16x128 scaled MFMA (measured with a lane probe; not documented):
-//   data:  lane l holds 32 bytes of row (l % 16), g = l / 16: bytes 0..15 are K [32*(g/2) + 16*(g%2), +16),
-//          bytes 16..31 are K [64 + 32*(g/2) + 16*(g%2), +16).
-//   scale: lane l = 16*s + row supplies the ue8m0 scale of 32-block s (0..3) of its row (byte op_sel 0).
-//   acc:   acc[r] of lane l is D[row = 4*g + r][col = l % 16].
-// The weight is stored in this lane order at load (`shuffle_mxfp8_weight`), [N/16][K/128][64 lanes][32 B].
+// Operand layout of the 16x16x128 scaled MFMA (undocumented):
+//   data:  lane l holds 32 bytes of row l % 16, g = l / 16: bytes 0..15 are K [32(g/2) + 16(g%2), +16),
+//          bytes 16..31 the same 16 K positions 64 later.
+//   scale: lane 16s + row supplies the ue8m0 scale of its row's 32-block s (byte op_sel 0).
+//   acc:   acc[r] of lane l is D[row 4g + r][col l % 16].
+// The weight is stored in this lane order at load (`shuffle_mxfp8_weight`): [N/16][K/128][64][32 B].
 //
 // X_BF16 = false: X is fp8 e4m3 [M, K] with ue8m0 scales XS [M, K/32].
-// X_BF16 = true:  X is bf16 [M, K], quantized per 32 values in registers (scale = smallest power of two
-//                 >= amax / 448, RNE e4m3); a bf16 activation already on the fp8 grid re-encodes exactly.
+// X_BF16 = true:  X is bf16 [M, K], quantized per 32 values in registers (scale = smallest power of
+//                 two >= amax / 448, RNE e4m3); a bf16 activation on the fp8 grid re-encodes exactly.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -55,7 +55,7 @@ __device__ __forceinline__ float bf16_hi(uint32_t w) {
   return __uint_as_float(w & 0xFFFF0000u);
 }
 
-// 16 bf16 (x0, x1) -> 16 fp8 e4m3 (out) scaled by inv_scale (a power of two, so the product is exact), RNE.
+// 16 bf16 (x0, x1) -> 16 fp8 e4m3 (out) scaled by inv_scale, a power of two (exact product), RNE
 __device__ __forceinline__ void quant_half(const v4i& x0, const v4i& x1, float inv_scale, v4i& out) {
   const uint32_t words[8] = {
       static_cast<uint32_t>(x0[0]),
@@ -70,7 +70,7 @@ __device__ __forceinline__ void quant_half(const v4i& x0, const v4i& x1, float i
   for (int q = 0; q < 4; ++q) {
     const float a = bf16_lo(words[2 * q]) * inv_scale, b = bf16_hi(words[2 * q]) * inv_scale;
     const float c = bf16_lo(words[2 * q + 1]) * inv_scale, d = bf16_hi(words[2 * q + 1]) * inv_scale;
-    // v_cvt_pk_fp8_f32: RNE conversion of two floats into the low / high 16 bits of the destination word.
+    // v_cvt_pk_fp8_f32: RNE of two floats into the low / high 16 bits of the destination word
     int packed = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
     packed = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, packed, true);
     out[q] = packed;
@@ -87,7 +87,7 @@ __device__ __forceinline__ float half_amax(const v4i& x0, const v4i& x1) {
   return m;
 }
 
-// Smallest power of two >= amax / 448, from the IEEE bits; amax is floored at 1e-10 like the CUDA quant.
+// smallest power of two >= amax / 448 via the IEEE bits; amax floored at 1e-10 (the CUDA quant's floor)
 __device__ __forceinline__ int ue8m0_of_amax(float amax) {
   amax = fmaxf(amax, 1e-10f);
   const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
@@ -97,8 +97,8 @@ __device__ __forceinline__ int ue8m0_of_amax(float amax) {
 
 #endif  // __gfx950__
 
-// Compile-time knobs, swept offline into mxfp8_gemv_gfx95_configs.json: WAVES per workgroup, STEPS 128-K steps in
-// flight, ROWS / TOKENS per wave tile (16 or 32), KSPLIT (waves split K and reduce through LDS, else one tile each).
+// Knobs swept offline into mxfp8_gemv_gfx95_configs.json: WAVES per workgroup, STEPS 128-K steps
+// in flight, ROWS / TOKENS per wave tile (16 or 32), KSPLIT (waves split K and reduce through LDS).
 template <int WAVES, int STEPS, int ROWS, int TOKENS, bool KSPLIT, bool X_BF16>
 __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
     const uint8_t* __restrict__ W,   // [N/16, K/128, 2048] fp8 e4m3 in MFMA lane order
@@ -198,7 +198,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
       for (int b = 0; b < BT; ++b) {
         int sb;
         if constexpr (X_BF16) {
-          // A 32-block is split over lanes l and l ^ 16 (16 values each): share the amax, then quantize.
+          // a 32-block spans lanes l and l ^ 16 (16 values each): share the amax, then quantize
           float m_lo = half_amax(xb[s][b][0], xb[s][b][1]);
           float m_hi = half_amax(xb[s][b][2], xb[s][b][3]);
           m_lo = fmaxf(m_lo, __shfl_xor(m_lo, 16));
@@ -292,7 +292,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
 
 }  // namespace mxfp8_gemv
 
-// WAVES {4, 8, 16}, STEPS {1, 2, 4}, ROWS / TOKENS {16, 32}; KSPLIT and X_BF16 as in the comments above.
+// WAVES {4, 8, 16}, STEPS {1, 2, 4}, ROWS / TOKENS {16, 32}; KSPLIT and X_BF16 as above.
 template <int WAVES, int STEPS, int ROWS, int TOKENS, bool KSPLIT, bool X_BF16>
 struct Mxfp8GemvGfx950Kernel {
   static void
@@ -319,7 +319,7 @@ struct Mxfp8GemvGfx950Kernel {
     if constexpr (X_BF16) {
       TensorMatcher({MSize, KSize}).with_dtype<bf16_t>().with_device(device).verify(x);
     } else {
-      // fp8 e4m3 passed as its uint8 view (tvm-ffi has no fp8 dtype trait on ROCm).
+      // fp8 e4m3 arrives as its uint8 view: the kernel reads bytes
       TensorMatcher({MSize, KSize}).with_dtype<uint8_t>().with_device(device).verify(x);
       TensorMatcher({MSize, CSize}).with_dtype<uint8_t>().with_device(device).verify(x_scale);
     }

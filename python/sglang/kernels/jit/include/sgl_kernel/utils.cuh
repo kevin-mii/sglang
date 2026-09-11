@@ -29,8 +29,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #else
-// load_jit's -DHIP_FP8_TYPE_FNUZ=1 (gfx942, jit/utils/arch.py), read before hip_fp8.h
-// redefines the macro per compilation pass.
+// read before hip_fp8.h redefines HIP_FP8_TYPE_FNUZ per pass; load_jit sets it for gfx942 (arch.py)
 #if defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ
 #define SGL_HIP_FP8_FNUZ 1
 #else

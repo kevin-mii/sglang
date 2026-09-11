@@ -334,7 +334,7 @@ def dot_scaled_mxfp8_blockscaled_linear(
     return out.to(output_dtype).view(*output_shape)
 
 
-# bf16-dequant route: both operands are exact in bf16, so only the fp32 summation order differs from MXFP8
+# bf16-dequant route: both operands are exact in bf16, so only the fp32 sum order differs from MXFP8
 class Fp8GridActivation(NamedTuple):
     """A bf16 activation already on the fp8 e4m3 grid with a per-32 ue8m0 scale; the bf16-dequant
     linear skips ``fake_quant_fp8_activation`` for it, every other consumer unwraps ``.x``."""

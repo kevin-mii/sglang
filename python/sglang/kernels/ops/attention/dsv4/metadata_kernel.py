@@ -94,8 +94,7 @@ def _init_compressed_attn_metadata_kernel(
         return
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
-    # The page-index row is split over program_id(1); only the first chunk's
-    # program writes the per-row scalars.
+    # the row is split over program_id(1); only its first program writes the per-row scalars
     if tl.program_id(1) == 0:
         position = tl.load(positions_ptr + batch_id)
         is_write_token = batch_id < num_write_tokens
@@ -126,9 +125,6 @@ def _init_compressed_attn_metadata_kernel(
     if COMPUTE_PAGE_INDICES:
         c128_seq_lens_raw = seq_len // 128
         page_indices_base = batch_id * c128_cur_max_seq_len
-        # Each program handles ITERS_PER_PROGRAM consecutive blocks of the row, so
-        # a wide row (long capture context) is spread over the grid instead of
-        # one program looping over it.
         chunk_start = tl.program_id(1) * (ITERS_PER_PROGRAM * BLOCK_SIZE)
         for block_start in tl.range(
             chunk_start, chunk_start + ITERS_PER_PROGRAM * BLOCK_SIZE, BLOCK_SIZE
@@ -219,8 +215,7 @@ def _init_compressed_attn_metadata_triton(
         if page_table is None:
             page_table = torch.empty(0, dtype=torch.int32, device=device)
 
-    # Blocks of the page-index row per program; the row is split across
-    # program_id(1) so a long capture context is not one serial loop.
+    # blocks of the page-index row per program: a long capture context is not one serial loop
     ITERS_PER_PROGRAM = 4
     grid = (
         bs,

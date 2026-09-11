@@ -35,6 +35,7 @@ struct FusedKNormRopeQFlashMLAParams {
   uint32_t num_q_heads;
 };
 
+// copied from main_norm_rope.cuh fused_k_norm_rope_flashmla; the query-rope block is the addition
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
 K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRopeQFlashMLAParams params) {
   using namespace device;
@@ -95,11 +96,8 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
     }
   }
 
-  // Query rope: (real, imag) pair j of head h is at q[h * stride + 448 + 2j];
-  // the block's threads stride over the num_q_heads * kRopeDim / 2 pairs. The
-  // arithmetic is the Triton flat rope kernel's (`apply_rotary_emb_flat_kernel`
-  // as compiled for gfx950): the cross product is rounded, then one fma with
-  // the cosine, so the bf16 result is bitwise that kernel's.
+  // Query rope, pair j of head h at q[h * stride + 448 + 2j]: the cross product is rounded, then
+  // one fma with the cosine, so the bf16 result is bitwise the Triton flat rope kernel's on gfx950.
   {
     constexpr uint32_t kPairsPerHead = kRopeDim / 2;
     const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);

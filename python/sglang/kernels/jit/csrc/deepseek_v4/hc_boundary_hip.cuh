@@ -105,7 +105,7 @@ __device__ __forceinline__ void transpose4x4(float& a0, float& a1, float& a2, fl
   a3 = __uint_as_float(u3);
 }
 
-// After the swap one register is the lane's own value and the other its partner's; the add commutes.
+// after the swap one register is the lane's value, the other its partner's; the add commutes
 __device__ __forceinline__ float add_xor32(float a) {
   auto p = __builtin_amdgcn_permlane32_swap(__float_as_uint(a), __float_as_uint(a), false, false);
   return __uint_as_float(p[0]) + __uint_as_float(p[1]);
@@ -115,24 +115,24 @@ __device__ __forceinline__ float add_xor16(float a) {
   return __uint_as_float(p[0]) + __uint_as_float(p[1]);
 }
 
-// Triton's per-thread reduce: (u0^2 + u1^2) + (u2^2 + u3^2) with the second square of each pair fused.
+// Triton's per-thread reduce: (u0^2 + u1^2) + (u2^2 + u3^2), the second square of each pair fused
 __device__ __forceinline__ float quad_sq(float u0, float u1, float u2, float u3) {
   float a = __builtin_fmaf(u1, u1, u0 * u0);
   float b = __builtin_fmaf(u3, u3, u2 * u2);
   return a + b;
 }
 
-// Tile t: 16 rows x 128 B via two 1 KB global_load_lds; lane l fetches row (l & 15), chunk 4*a + (l >> 4).
+// tile: 16 rows x 128 B via two 1 KB global_load_lds; lane l: row l & 15, chunk 4a + (l >> 4)
 constexpr int kStageTileBytes = kBlockM * kBlockK * 2;
 constexpr int kStageTilesBytes = kMaxTiles * kStageTileBytes;
-// Coefficient reads precede the staging refill: an LDS read after the DMA issue waits for the whole DMA.
+// coefficient reads precede the staging refill: an LDS read issued after the DMA waits for all of it
 constexpr int kCoefRowBytes = 96;
 constexpr int kStageCoefBytes = kBlockM * kCoefRowBytes;
 constexpr int kStageBytes = kStageTilesBytes + kStageCoefBytes;
 
 template <bool kHasPost, bool kHasCombine>
 __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, int lane, lds_u8* coef_stage) {
-  // Chunk c (0..95): row c / 6, part c % 6 (post, comb x4, pre); rows past M fetch row M-1, never stored.
+  // chunk c: row c / 6, part c % 6 (post, comb x4, pre); rows past M read row M - 1, never stored
 #pragma unroll
   for (int a = 0; a < 2; ++a) {
     if (a == 0 || lane < 32) {
@@ -180,7 +180,7 @@ __device__ __forceinline__ void read_coefs(const lds_u8* coef_stage, int r, floa
 template <bool kHasPost>
 __device__ __forceinline__ void
 issue_prefetch(const Params& p, int slice, int row_of_lane, int chunk_of_lane, lds_u8* stage_wave) {
-  // row_of_lane: this lane's clamped global row; chunk_of_lane: its chunk in the second half (+4 when a == 1).
+  // row_of_lane: the lane's clamped global row; chunk_of_lane: its chunk (+4 for the second 1 KB)
   const int col0 = slice * kBlockK;
   constexpr int tile0 = kHasPost ? 0 : 1;
 #pragma unroll
@@ -243,7 +243,7 @@ __device__ __forceinline__ void store_row16_post(uint16_t* base_row, int g, bool
   }
 }
 
-// One 16-row block of one slice; the next block's copy-0 coefficients are returned so their load overlaps.
+// one 16-row block of one slice; the next block's loads issue once this block's LDS reads have landed
 template <bool kHasPost, bool kHasCombine, bool kMasked, bool kWeightsInRegs>
 __device__ __forceinline__ void compute_block(
     const Params& p,
@@ -373,7 +373,7 @@ __device__ __forceinline__ void compute_block(
         xa_op[4 * m + 3] = a3;
       }
     } else {
-      // Column 16g+4c+j = MFMA 4g+c slot j; after the transpose of block c, register j' holds MFMA 4j'+c.
+      // column 16g + 4c + j is MFMA 4g + c, slot j; after transposing block c, register j' is MFMA 4j' + c
 #pragma unroll
       for (int c = 0; c < 4; ++c) {
         float a0 = xt[2 * c][0], a1 = xt[2 * c][1], a2 = xt[2 * c + 1][0], a3 = xt[2 * c + 1][1];
@@ -478,7 +478,7 @@ __global__ void __launch_bounds__(kThreads) hc_boundary_prefill_kernel(const Par
   }
   __syncthreads();
 
-  // The stats-only form has the VGPRs to hold the whole weight slice instead of re-reading LDS per block.
+  // the stats-only form has the VGPRs to hold the weight slice instead of re-reading LDS per block
   constexpr bool kWeightsInRegs = !kHasPost;
   f32x4 w_reg[kHc][kNTiles][4];
   if constexpr (kWeightsInRegs) {
@@ -513,7 +513,7 @@ __global__ void __launch_bounds__(kThreads) hc_boundary_prefill_kernel(const Par
   for (; rb < p.num_row_blocks; rb += block_stride) {
     const int rb_next = rb + block_stride;
     const bool has_next = rb_next < p.num_row_blocks;
-    // vmcnt drains the previous block's stores too: loads and stores retire out of order with each other.
+    // vmcnt(0) also drains the previous block's stores: loads and stores retire out of order
     wait_vmcnt0();
     const int row = rb * kBlockM + r;
     const int prefetch_row = has_next ? prefetch_row_of(rb_next) : 0;
