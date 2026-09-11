@@ -433,10 +433,10 @@ class TestFusedLowRatioCompress(CustomTestCase):
             )
 
     def test_padded_rows_publish_nothing(self):
-        """A padded CUDA-graph suffix carries `raw_out_loc == 0`, and at ratio 2
-        `c2_out_loc == -1` for a row completing no group. Neither may reach
-        either cache -- both kernels derive that from the arrays themselves, so
-        the caller passes no mask."""
+        """A padded CUDA-graph suffix carries `raw_out_loc == 0` and `out_loc == 0`.
+        Neither may reach either cache -- both kernels derive that from the arrays
+        themselves, so the caller passes no mask. (The other suppressed sentinel,
+        the ratio-2 `c2_out_loc == -1`, is `test_open_group_rows_publish_nothing`.)"""
         n, pad = 8, 3
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
@@ -469,6 +469,28 @@ class TestFusedLowRatioCompress(CustomTestCase):
                         t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any(),
                         "a padded row wrote index-K slot 0",
                     )
+
+    def test_open_group_rows_publish_nothing(self):
+        """A live ratio-2 token at an even position completes no group: the
+        metadata gives it `c2_out_loc == -1`, the compressor only parks it in the
+        pair state, and neither cache may see it. The index-K writer takes the -1
+        straight from the array, so a store through it (wrapping to the last
+        slot) is what the byte-for-byte comparison must catch."""
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
+            _low_ratio_compression_metadata,
+        )
+
+        n, pending, ratio = 8, 3, 2
+        t = _build(n, ratio, seed=300)
+        core = t.backend.forward_metadata.core_metadata
+        # One position back: even, so the tail's groups are still open.
+        t.pos[-pending:] -= 1
+        out_loc, _ = _low_ratio_compression_metadata(ratio, t.pos + 1, core.raw_out_loc)
+        self.assertTrue(bool((out_loc[-pending:] == -1).all()), out_loc.tolist())
+        self.assertTrue(bool((out_loc[:-pending] > 0).all()), out_loc.tolist())
+        # `_build` hands the same tensor out as `c2_out_loc` and `t.out_loc`.
+        core.c2_out_loc.copy_(out_loc)
+        self._check_step(t, ratio)
 
     def test_selected_from_the_device(self):
         """The compressor's fused-write choice must follow `fused_low_ratio_compress_supported`."""
