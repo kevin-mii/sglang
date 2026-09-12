@@ -881,8 +881,7 @@ def engram_gate(
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy.
-    ``image_select = (input_ids, image_token_id)`` keeps ``x`` on the image-token rows
-    (the model's ``torch.where`` after the gate, folded into the fused kernel).
+    ``image_select = (input_ids, image_token_id)`` keeps ``x`` on the image-token rows.
 
     The torch path below is the CPU fallback."""
     if (
@@ -954,8 +953,7 @@ class Engram(nn.Module):
         cp_all_tokens: bool = False,
         image_select: Optional[Tuple[torch.Tensor, int]] = None,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer; ``image_select``
-        as in ``apply_gate``."""
+        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
@@ -978,8 +976,6 @@ class Engram(nn.Module):
         kv: torch.Tensor,
         image_select: Optional[Tuple[torch.Tensor, int]] = None,
     ) -> torch.Tensor:
-        """``image_select = (input_ids [T], image_token_id)`` keeps ``x`` on the image-token
-        rows, replacing the model's ``torch.where`` after the gate."""
         return engram_gate(
             x,
             kv,
