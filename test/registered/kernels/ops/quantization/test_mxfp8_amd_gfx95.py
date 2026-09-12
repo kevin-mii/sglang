@@ -86,8 +86,6 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 
 
 ROUTE_SHAPES = [(1856, 5120)]
-
-
 MS = (1, 33, 1025)
 
 

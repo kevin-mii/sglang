@@ -18,14 +18,8 @@ register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 HC, H = 4, 5120
-
-
 MIX = (2 + HC) * HC
-
-
 ITERS, RMS_EPS, HC_EPS = 20, 1e-20, 1e-6
-
-
 _IS_HIP = is_hip()
 
 

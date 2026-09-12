@@ -15,14 +15,8 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 NOPE, ROPE, D = 448, 64, 512
-
-
 PAGE = 256
-
-
 BYTES = 584
-
-
 SCALE = D**-0.5
 
 

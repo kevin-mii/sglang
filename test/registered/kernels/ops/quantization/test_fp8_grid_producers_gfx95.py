@@ -190,8 +190,6 @@ class TestSiluAndMulClampTriton(CustomTestCase):
 
 
 GEMM_SHAPES = [(2, 1024, 4096)]
-
-
 G, R, D = GEMM_SHAPES[0]
 
 
