@@ -26,14 +26,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
-from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
-    rope_tail_fake_quant_fp4,
-)
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
 )
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -484,18 +480,6 @@ def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
     return indexer.head_weights(x).contiguous()
 
 
-def _indexer_queries(indexer, q_lora, freqs_cis, pos):
-    """`indexer.queries(q_lora, freqs_cis[pos])`; for bf16 rows the fused RoPE launch
-    gathers `freqs_cis[pos]` itself."""
-    q, _ = indexer.wq_b(q_lora)
-    q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
-    if q.dtype == torch.bfloat16:
-        return rope_tail_fake_quant_fp4(
-            q, freqs_cis, indexer.rope_head_dim, positions=pos
-        )
-    return _rope_fq4(q, freqs_cis[pos], indexer.rope_head_dim)
-
-
 def _indexer_inputs(layer, x, q_lora, pos):
     """(payload, scale) query in the FlyDSL layout and the pre-scaled head weights."""
     indexer = layer.indexer
@@ -522,7 +506,8 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
-    q = _indexer_queries(indexer, q_lora, layer.freqs_cis, pos)  # [T, H, 128] fp4 grid
+    # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
+    q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
     return q_fp4, q_scale, weights
@@ -761,95 +746,27 @@ def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device
     return slot_chunks, starts
 
 
-def low_ratio_compress_fused_hip(backend, layer, x, req, pos, *, draft_len=1) -> None:
-    """``DeepseekV4AttnBackend._low_ratio_compress_fused`` with the index keys stored in
-    the FlyDSL split payload / scale layout when the pool keeps one. Both write kernels
-    consume metadata dtypes directly and suppress padded stores."""
-    from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
-    from sglang.kernels.ops.attention.dsv4.c2 import (
-        c2_decode_norm_rope_store,
-        c2_verify_norm_rope_store,
-    )
-    from sglang.kernels.ops.attention.dsv4.fp4_rope import index_k_norm_rope_pack_store
+def store_index_k_norm_rope_split(pool, layer, latent, pos, out_loc, freqs_cis) -> None:
+    """The index-K store of ``DeepseekV4AttnBackend._low_ratio_compress_fused`` in the FlyDSL
+    split payload / scale layout (same bytes as ``store_fp4_index_k_cache_split``); ``out_loc``
+    is -1 for an incomplete group and 0 for padding, and the kernel stores neither."""
     from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
         index_k_norm_rope_pack_store_split,
     )
 
-    pool = backend.token_to_kv_pool
-    core = backend.forward_metadata.core_metadata
-    compressor = layer.compressor
-    layer_id = layer.layer_id
-    # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
-    freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
-    kv_cache = pool.get_extra_key_buffer(layer_id)
-    page_size = pool.get_extra_key_page_size(layer_id)
-    assert kv_cache is not None
-
-    if layer.compress_ratio == 1:
-        # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
-        latent = c1_decode_norm_rope_store(
-            compressor.wkv(x),
-            compressor.norm.weight.data,
-            pos,
-            core.raw_out_loc,
-            compressor.norm.eps,
-            freqs_cis,
-            kv_cache,
-            page_size=page_size,
-        )
-        out_loc = core.c1_out_loc
-    else:
-        # pending-pair ring: | kv | score | at req * ring_size + pos % ring_size
-        state = pool.get_attention_compress_states(layer_id)
-        c2_compress = (
-            c2_verify_norm_rope_store if draft_len > 1 else c2_decode_norm_rope_store
-        )
-        verify_args = {"draft_len": draft_len} if draft_len > 1 else {}
-        latent = c2_compress(
-            compressor.project_fused(x),
-            state.kv_score_buffer.kv_score,
-            compressor.norm.weight.data,
-            pos,
-            req,
-            core.raw_out_loc,
-            compressor.norm.eps,
-            freqs_cis,
-            kv_cache,
-            page_size=page_size,
-            ring_size=state.ring_size,
-            **verify_args,
-        )
-        out_loc = core.c2_out_loc
-
     indexer = layer.indexer
-    if indexer is not None and indexer.owns_k:
-        # out_loc is -1 for an incomplete group and 0 for padding; the kernel stores neither
-        assert out_loc is not None
-        k = indexer.forward_wk(latent)
-        if pool.low_ratio_index_k_is_split(layer_id):
-            # FlyDSL split payload / scale layout; same bytes as store_fp4_index_k_cache_split
-            index_k_norm_rope_pack_store_split(
-                k,
-                indexer.k_norm.weight.data,
-                indexer.k_norm.eps,
-                freqs_cis,
-                pos,
-                out_loc,
-                pool.get_index_k_fp4_payload_buffer(layer_id),
-                pool.get_index_k_fp4_scale_buffer(layer_id),
-                ratio=layer.compress_ratio,
-            )
-        else:
-            index_k_norm_rope_pack_store(
-                k,
-                indexer.k_norm.weight.data,
-                indexer.k_norm.eps,
-                freqs_cis,
-                pos,
-                out_loc,
-                pool.get_index_k_with_scale_buffer(layer_id),
-                ratio=layer.compress_ratio,
-            )
+    layer_id = layer.layer_id
+    index_k_norm_rope_pack_store_split(
+        indexer.forward_wk(latent),
+        indexer.k_norm.weight.data,
+        indexer.k_norm.eps,
+        freqs_cis,
+        pos,
+        out_loc,
+        pool.get_index_k_fp4_payload_buffer(layer_id),
+        pool.get_index_k_fp4_scale_buffer(layer_id),
+        ratio=layer.compress_ratio,
+    )
 
 
 def low_ratio_index_topk_hip_extend(

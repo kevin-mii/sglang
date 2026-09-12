@@ -55,7 +55,6 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
     build_low_ratio_decode_workspaces,
     low_ratio_candidate_span,
-    low_ratio_compress_fused_hip,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
     low_ratio_index_topk_hip_decode,
@@ -720,7 +719,7 @@ class DeepseekV4HipRadixBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
-    # unbound; HIP differs only in the index-K store layout and the paged top-k
+    # unbound; HIP differs only in the paged top-k (`_low_ratio_index_topk` below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
@@ -731,7 +730,7 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
     _low_ratio_index_topk_torch = DeepseekV4AttnBackend._low_ratio_index_topk_torch
-    _low_ratio_compress_fused = low_ratio_compress_fused_hip
+    _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
 
     def __init__(
         self,
