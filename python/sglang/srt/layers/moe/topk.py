@@ -2124,6 +2124,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    shared_experts_already_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -2209,7 +2210,12 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    # The gate already wrote the shared slot (select_experts folded it in).
+    _aiter_append = (
+        num_fused_shared_experts > 0
+        and _use_aiter
+        and not shared_experts_already_fused
+    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -2372,6 +2378,34 @@ def select_experts(
         )
         else num_fused_shared_experts
     )
+    # Exception on the aiter path: when the Triton JIT gate serves the request
+    # (sigmoid / sqrtsoftplus, no groups, no custom routing) and the shared
+    # slot would be appended with weight 1.0 anyway, let the gate fill that slot
+    # itself. With RENORMALIZE and APPLY_SCALE the gate writes exactly
+    # [K_routed renormalized x scale, shared = 1.0] (see moe_fused_gate), so the
+    # separate fused_append_shared_experts launch (~4.5us per layer on graph
+    # replay) is skipped in _post_process_topk_ids. Only for the plain
+    # single-marker layout without an expert-location remap, whose id space the
+    # later remap would otherwise have to skip.
+    _shared_folded_into_gate = (
+        _use_aiter
+        and num_fused_shared_experts > 0
+        and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        and not use_grouped_topk
+        and not torch_native
+        and custom_routing_function is None
+        and not _is_cpu
+        and not _is_xpu
+        and scoring_func in ("sqrtsoftplus", "sigmoid")
+        and renormalize
+        and bool(apply_routed_scaling_factor_on_output)
+        and routed_scaling_factor is not None
+        and expert_location_dispatch_info is None
+        and topk_config.fused_shared_experts_scaling_factor in (None, 1.0)
+        and not _eplb_remap_enabled()
+    )
+    if _shared_folded_into_gate:
+        num_fused_shared_experts_for_gate = num_fused_shared_experts
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -2430,7 +2464,11 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=(
+                    num_routed_topk
+                    if (_use_aiter and not _shared_folded_into_gate)
+                    else top_k
+                ),
                 renormalize=renormalize,
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts_for_gate,
@@ -2554,6 +2592,7 @@ def select_experts(
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
+        shared_experts_already_fused=_shared_folded_into_gate,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(
