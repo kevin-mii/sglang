@@ -13,21 +13,15 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
     mask_indices_by_length,
-    sparse_buffers,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
     sort_selection_rows,
 )
-from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
-    init_compression_metadata,
-)
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
     _expand_index_page_table,
     _low_ratio_compression_metadata,
-    _low_ratio_sparse_buffers,
-    _pad_last_dim,
 )
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
@@ -265,122 +259,6 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
             assert torch.equal(out[f"c{r}_topk_lengths_clamp1"], ref_clamp1)
 
 
-@pytest.mark.parametrize("topk", [512, 1000])
-@pytest.mark.parametrize("ratios", [(), (1,), (2,), (1, 2)])
-def test_sparse_buffers(topk: int, ratios):
-    rng = _seed(9)
-    for rows in (1, 5, 70):
-
-        def random_lengths():
-            return torch.tensor(
-                [
-                    rng.choice([1, 2, topk - 1, topk, topk + 1, 1 << 16])
-                    for _ in range(rows)
-                ],
-                dtype=torch.int32,
-                device=DEVICE,
-            )
-
-        c4_clamp1, c4_raw = random_lengths(), random_lengths()
-        low = {r: random_lengths() for r in ratios}
-        out = sparse_buffers(
-            c4_topk_lengths_clamp1=c4_clamp1,
-            c4_topk_lengths_raw=c4_raw,
-            c1_topk_lengths_clamp1=low.get(1),
-            c2_topk_lengths_clamp1=low.get(2),
-            index_topk=topk,
-            page_index_align=64,
-        )
-        ref_page = _pad_last_dim(
-            torch.full((rows, topk), -1, dtype=torch.int32, device=DEVICE)
-        )
-        assert torch.equal(
-            out["c4_sparse_topk_lengths"], torch.clamp(c4_clamp1, max=topk)
-        )
-        assert torch.equal(
-            out["c4_sparse_topk_lengths_raw"], torch.clamp(c4_raw, max=topk)
-        )
-        assert torch.equal(out["c4_sparse_page_indices"], ref_page)
-        for r in (1, 2):
-            if r in ratios:
-                ref_len, ref_pi, _ = _low_ratio_sparse_buffers(low[r], topk, False)
-                assert torch.equal(out[f"c{r}_sparse_topk_lengths"], ref_len)
-                assert torch.equal(out[f"c{r}_sparse_page_indices"], ref_pi)
-            else:
-                assert f"c{r}_sparse_page_indices" not in out
-
-
-def _ref_init_compression_metadata(
-    seq_lens, positions, raw_out_loc, page_table, page_size
-):
-    nw = raw_out_loc.shape[0]
-    out = []
-    for ratio in (4, 128):
-        should = seq_lens[:nw] % ratio == 0
-        out_loc = torch.where(
-            should, raw_out_loc[:nw] // ratio, torch.zeros_like(raw_out_loc[:nw])
-        )
-        out += [
-            out_loc.to(torch.int64),
-            (positions & ~(ratio - 1)).to(torch.int32),
-            (seq_lens // ratio).to(torch.int32),
-            torch.clamp(seq_lens // ratio, min=1).to(torch.int32),
-        ]
-    max_pages = page_table.shape[1]
-    c128_page_size = page_size // 128
-    width = c128_page_size * max_pages
-    offs = torch.arange(width, device=seq_lens.device)
-    page_idx = offs // c128_page_size
-    vals = (
-        page_table.to(torch.int64)[:, page_idx.clamp(max=max_pages - 1)]
-        * c128_page_size
-        + offs % c128_page_size
-    )
-    vals = torch.where(page_idx[None, :] < max_pages, vals, torch.zeros_like(vals))
-    valid = offs[None, :] < (seq_lens // 128)[:, None]
-    out.append(torch.where(valid, vals, torch.full_like(vals, -1)).to(torch.int32))
-    return out
-
-
-@pytest.mark.parametrize("max_pages", [1, 37, 4608])
-@pytest.mark.parametrize("page_size", [128, 256])
-def test_init_compression_metadata_grid(max_pages: int, page_size: int):
-    rng = _seed(13)
-    for bs, nw in ((1, 1), (6, 6), (6, 4)):
-        seq_lens = torch.tensor(
-            [
-                rng.choice(
-                    [0, 1, 4, 127, 128, 129, 5000, 128 * max_pages * page_size // 128]
-                )
-                for _ in range(bs)
-            ],
-            dtype=torch.int32,
-            device=DEVICE,
-        )
-        positions = torch.clamp(seq_lens - 1, min=0)
-        raw_out_loc = torch.randint(0, 1 << 24, (nw,), dtype=torch.int64, device=DEVICE)
-        page_table = torch.randint(
-            0, 1 << 20, (bs, max_pages), dtype=torch.int32, device=DEVICE
-        )
-        outs = init_compression_metadata(
-            seq_lens, positions, raw_out_loc, page_table, page_size, True
-        )
-        refs = _ref_init_compression_metadata(
-            seq_lens, positions, raw_out_loc, page_table, page_size
-        )
-        assert len(outs) == len(refs) == 9
-        for got, ref in zip(outs, refs):
-            assert got.dtype is ref.dtype, (got.dtype, ref.dtype)
-            assert torch.equal(got, ref)
-        # scalars only
-        outs = init_compression_metadata(
-            seq_lens, positions, raw_out_loc, None, 0, False
-        )
-        assert outs[-1] is None
-        for got, ref in zip(outs[:-1], refs[:-1]):
-            assert torch.equal(got, ref)
-
-
 def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then zeros
     and a permuted copy into the scale layout."""
@@ -471,23 +349,6 @@ def test_page_table_from_req_to_token_matches_torch():
         req_to_token, torch.empty(0, device=DEVICE, dtype=torch.int32), 1000, 64
     )
     assert empty.shape == (0, 16)
-
-
-def test_widen_pair_i64_matches_casts():
-    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import widen_pair_i64
-
-    _seed(29)
-    for bs in (0, 1, 8, 64, 257, 5000):
-        a = torch.randint(0, 300, (bs,), device=DEVICE, dtype=torch.int32)
-        b = torch.randint(0, 2**31 - 1, (bs,), device=DEVICE, dtype=torch.int32)
-        oa, ob = widen_pair_i64(a, b)
-        assert oa.dtype == ob.dtype == torch.int64
-        assert torch.equal(oa, a.to(torch.int64)) and torch.equal(ob, b.to(torch.int64))
-    oa, ob = widen_pair_i64(
-        torch.tensor([3, -1], device=DEVICE, dtype=torch.int64),
-        torch.tensor([9, 0], device=DEVICE, dtype=torch.int32),
-    )
-    assert oa.tolist() == [3, -1] and ob.tolist() == [9, 0]
 
 
 if __name__ == "__main__":

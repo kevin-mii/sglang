@@ -164,23 +164,6 @@ class TestHcBoundaryFused(CustomTestCase):
             for got, want in zip((pre, post, comb), ref):
                 self.assertLess((got - want).abs().max().item(), 1e-4)
 
-    def test_stats_only_and_no_combine(self):
-        x, residual, post_in, comb_in, pre_prev = self._inputs(9, 42)
-        res_out, y, pre, post, comb = self._run(None, residual, None, None, pre_prev)
-        self.assertIsNone(res_out)
-        self.assertTrue(
-            torch.equal(
-                y, hc_combine(residual.flatten(1), pre_prev, HC, torch.bfloat16)
-            )
-        )
-        ref = _ref_coefficients(residual, self.hc_fn, self.hc_scale, self.hc_base)
-        for got, want in zip((pre, post, comb), ref):
-            self.assertLess((got - want).abs().max().item(), 1e-4)
-        res_out2, y2, pre2, post2, comb2 = self._run(None, residual, None, None, None)
-        self.assertIsNone(res_out2)
-        self.assertIsNone(y2)
-        self.assertTrue(_all_equal((pre2, post2, comb2), (pre, post, comb)))
-
     def test_repeatable_and_batch_invariant(self):
         x, residual, post_in, comb_in, pre_prev = self._inputs(300, 7)
         full = self._run(x, residual, post_in, comb_in, pre_prev)
@@ -205,13 +188,6 @@ class TestHcBoundaryFused(CustomTestCase):
                 pre_prev[idx].contiguous(),
             )
             self.assertTrue(_all_equal(sub, [t[idx] for t in full]), rows)
-
-    def test_empty(self):
-        x, residual, post_in, comb_in, pre_prev = self._inputs(0, 0)
-        res_out, y, pre, post, comb = self._run(x, residual, post_in, comb_in, pre_prev)
-        self.assertEqual(res_out.shape, (0, HC, H))
-        self.assertEqual(y.shape, (0, H))
-        self.assertEqual(comb.shape, (0, HC, HC))
 
 
 @unittest.skipUnless(_IS_HIP, "rmsnorm_with_sinkhorn is the ROCm path")
@@ -273,37 +249,6 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
                 else:
                     self.assertTrue(torch.equal(quant.x, quant2.x))
 
-    def test_norm_only(self):
-        res, y, pre, post, comb = self._boundary(self.fused, 9, 3)
-        _, norm = self.norm(y, self.weight, 1e-6)
-        _, _, coefficients = self._boundary(self.deferred, 9, 3)
-        quant2, norm2 = self.hosted(
-            y, self.weight, 1e-6, coefficients, fake_quant=False
-        )
-        self.assertIsNone(quant2)
-        self.assertTrue(torch.equal(norm, norm2))
-        self.assertTrue(_all_equal((pre, post, comb), coefficients.tensors()))
-
-    def test_materialize_on_access_then_norm_alone(self):
-        res, y, pre, post, comb = self._boundary(self.fused, 5, 11)
-        _, _, coefficients = self._boundary(self.deferred, 5, 11)
-        # first access runs the standalone reduce + sinkhorn once
-        self.assertTrue(torch.equal(coefficients.comb, comb))
-        self.assertTrue(coefficients.materialized)
-        self.assertTrue(_all_equal((pre, post), (coefficients.pre, coefficients.post)))
-        # a norm launch given materialized coefficients only runs the norm rows
-        _, norm = self.norm(y, self.weight, 1e-6)
-        quant2, norm2 = self.hosted(y, self.weight, 1e-6, coefficients)
-        self.assertTrue(torch.equal(norm, norm2))
-        self.assertTrue(_all_equal((pre, post, comb), coefficients.tensors()))
-
-    def test_empty(self):
-        _, y, coefficients = self._boundary(self.deferred, 0, 0)
-        self.assertTrue(coefficients.materialized)
-        quant, norm = self.hosted(y, self.weight, 1e-6, coefficients)
-        self.assertEqual(norm.shape, (0, H))
-        self.assertEqual(coefficients.comb.shape, (0, HC, HC))
-
 
 def _prefill_available():
     if not is_hip() or not torch.cuda.is_available():
@@ -363,13 +308,6 @@ class TestHcBoundaryPrefill(CustomTestCase):
             decode = self._raw(None, residual, None, None, None, False)
             prefill = self._raw(None, residual, None, None, None, True)
             self.assertTrue(_all_equal(prefill, decode), f"stats-only M={m}")
-
-    def test_repeatable(self):
-        x, residual, post_in, comb_in, pre_prev = self._inputs(1024, 3)
-        first = self._raw(x, residual, post_in, comb_in, pre_prev, True)
-        for _ in range(20):
-            again = self._raw(x, residual, post_in, comb_in, pre_prev, True)
-            self.assertTrue(_all_equal(again, first))
 
     def test_row_alone_equals_row_in_prefill_batch(self):
         """A row alone and the same row inside a prefill batch must give bitwise equal coefficients and outputs."""

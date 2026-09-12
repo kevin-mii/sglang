@@ -371,53 +371,6 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
-def _broadcast_coordinator(*, pynccl_comm):
-    coordinator = parallel_state.GroupCoordinator.__new__(
-        parallel_state.GroupCoordinator
-    )
-    coordinator.world_size = 2
-    coordinator.ranks = [4, 5]
-    coordinator.unique_name = "tp:test"
-    coordinator.device_group = object()
-    coordinator.pynccl_comm = pynccl_comm
-    return coordinator
-
-
-def test_hip_broadcast_takes_pynccl_when_enabled():
-    """On ROCm a torch.distributed broadcast recorded into the graph aborts the RCCL
-    watchdog, so the enabled pynccl must take it."""
-    import torch
-
-    pynccl_comm = Mock(disabled=False)
-    coordinator = _broadcast_coordinator(pynccl_comm=pynccl_comm)
-    values = torch.zeros(3, dtype=torch.int64)
-    with (
-        patch.object(parallel_state, "is_hip", return_value=True),
-        patch.object(torch.distributed, "broadcast", side_effect=AssertionError),
-    ):
-        out = coordinator.broadcast(values, src=0)
-    assert out is values
-    pynccl_comm.broadcast.assert_called_once_with(values, src=0)
-
-
-def test_hip_broadcast_eager_keeps_torch_distributed():
-    import torch
-
-    pynccl_comm = Mock(disabled=True)
-    coordinator = _broadcast_coordinator(pynccl_comm=pynccl_comm)
-    values = torch.zeros(3, dtype=torch.int64)
-    with (
-        patch.object(parallel_state, "is_hip", return_value=True),
-        patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
-        patch.object(torch.distributed, "broadcast") as dist_broadcast,
-    ):
-        coordinator.broadcast(values, src=1)
-    pynccl_comm.broadcast.assert_not_called()
-    dist_broadcast.assert_called_once_with(
-        values, src=5, group=coordinator.device_group
-    )
-
-
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

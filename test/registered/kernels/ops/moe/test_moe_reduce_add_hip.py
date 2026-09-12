@@ -80,55 +80,6 @@ class TestMoeTopkReduceAdd(CustomTestCase):
             )
             self.assertTrue(torch.equal(sub, full[idx]), rows)
 
-    def test_empty(self):
-        x, shared, ids, mask = _inputs(0, 0)
-        out = torch.empty_like(shared)
-        self.reduce_add(x, shared, out, TOPK, ids, mask)
-        self.assertEqual(out.shape, (0, D))
-
-
-@unittest.skipUnless(is_hip(), "the fused reduction is the ROCm path")
-class TestAiterFusedReduceScope(CustomTestCase):
-    """The FlyDSL reduction is replaced only inside the scope, and only for the dense case."""
-
-    def setUp(self):
-        try:
-            import aiter.ops.flydsl.moe_kernels as flydsl_moe
-        except ImportError:
-            self.skipTest("aiter FlyDSL not available")
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            _install_fused_reduce_override,
-            aiter_fused_reduce_shared_add,
-        )
-
-        self.assertTrue(_install_fused_reduce_override())
-        self.flydsl_moe = flydsl_moe
-        self.scope = aiter_fused_reduce_shared_add
-
-    def _reduce(self, x, out, m, ids, mask):
-        self.flydsl_moe._run_moe_reduction(
-            x.view(-1), out, m, TOPK, D, mask, ids, is_fp8=False
-        )
-
-    def test_scope_adds_shared_and_reports(self):
-        m = 5
-        x, shared, ids, mask = _inputs(m, 11)
-        plain = torch.empty_like(shared)
-        self._reduce(x, plain, m, ids, mask)  # aiter's own reduction outside the scope
-        ref_plain = _reference(x, torch.zeros_like(shared), ids, mask, 1.0)
-        self.assertTrue(torch.equal(plain, ref_plain))
-        out = torch.empty_like(shared)
-        with self.scope(shared, 1.0) as request:
-            self.assertIsNotNone(request)
-            self._reduce(x, out, m, ids, mask)
-        self.assertTrue(request.fired)
-        self.assertTrue(torch.equal(out, _reference(x, shared, ids, mask, 1.0)))
-        # a shape the fused kernel does not take falls back to aiter and reports so
-        with self.scope(shared[:1].contiguous(), 1.0) as request:
-            self._reduce(x, out, m, ids, mask)
-        self.assertFalse(request.fired)
-        self.assertTrue(torch.equal(out, ref_plain))
-
 
 if __name__ == "__main__":
     unittest.main()

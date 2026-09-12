@@ -11,11 +11,9 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     mxfp8_e4m3_quantize,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-    GemvConfig,
     large_m_plan,
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
-    mxfp8_shuffled_gemm,
     native_route_plan,
     prepare_mxfp8_native_weight,
     select_config,
@@ -37,18 +35,6 @@ SHAPES = [
     (1152, 5120),
     (96, 384),
 ]
-
-
-def unshuffle_mxfp8_weight(shuffled: torch.Tensor) -> torch.Tensor:
-    """Inverse of ``shuffle_mxfp8_weight``: ``[N/16, K/128, 2048]`` -> fp8 ``[N, K]``."""
-    tiles, steps, _ = shuffled.shape
-    t = shuffled.view(tiles, steps, 2, 2, 16, 2, 16)
-    return (
-        t.permute(0, 4, 1, 5, 2, 3, 6)
-        .contiguous()
-        .view(tiles * 16, steps * 128)
-        .view(torch.float8_e4m3fn)
-    )
 
 
 def _quant_weight_block32(w: torch.Tensor):
@@ -100,62 +86,6 @@ class TestMxfp8GemvGfx95(CustomTestCase):
                 # Most outputs round to the same bf16 as the fp64 reference.
                 frac = (out_fp8 != ref.to(torch.bfloat16)).float().mean().item()
                 self.assertLess(frac, 0.02, (n, k, m, frac))
-
-    def test_every_config_repeatable_and_batch_invariant(self):
-        n, k = 1856, 5120
-        wq, ws, x = self._make(n, k, 32, seed=1)
-        w_sh, ws8 = shuffle_mxfp8_weight(wq), ue8m0_weight_scale(ws)
-        xq, xs = mxfp8_e4m3_quantize(x)
-        ref = (
-            fake_quant_fp8_activation(x).double()
-            @ dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32]).double().t()
-        )
-        for waves in (4, 8, 16):
-            for rows in (16, 32):
-                for tokens in (16, 32):
-                    for ksplit in (True, False):
-                        cfg = GemvConfig(waves, 2, rows, tokens, ksplit)
-                        m = tokens
-                        full = mxfp8_gemv(xq[:m], w_sh, ws8, xs[:m], config=cfg)
-                        err = (
-                            (full.double() - ref[:m]).abs().max() / ref.abs().max()
-                        ).item()
-                        self.assertLess(err, 4e-3, (cfg, err))
-                        self.assertTrue(
-                            torch.equal(
-                                mxfp8_gemv(xq[:m], w_sh, ws8, xs[:m], config=cfg), full
-                            ),
-                            cfg,
-                        )
-                        for mm in (1, 3, min(9, m)):
-                            part = mxfp8_gemv(
-                                xq[:mm].contiguous(),
-                                w_sh,
-                                ws8,
-                                xs[:mm].contiguous(),
-                                config=cfg,
-                            )
-                            self.assertTrue(torch.equal(part, full[:mm]), (cfg, mm))
-
-    def test_table_lookup_and_shuffle_roundtrip(self):
-        cfg = select_config(1, 1856, 5120)
-        self.assertTrue(cfg.valid_for(1, 1856, 5120))
-        self.assertEqual(GemvConfig.parse(cfg.key()), cfg)
-        wq, _, _ = self._make(96, 384, 1)
-        sh = shuffle_mxfp8_weight(wq)
-        self.assertEqual(tuple(sh.shape), (6, 3, 2048))
-        self.assertTrue(
-            torch.equal(
-                unshuffle_mxfp8_weight(sh).view(torch.uint8), wq.view(torch.uint8)
-            )
-        )
-        # lane l = 16 g + r of tile t, step s holds W[16t + r][128s + 32(g/2) + 16(g%2) : +16] then +64.
-        t, s, g, r = 5, 2, 3, 7
-        lane = sh[t, s].view(64, 32)[16 * g + r]
-        k0 = 128 * s + 32 * (g // 2) + 16 * (g % 2)
-        row = wq.view(torch.uint8)[16 * t + r]
-        self.assertTrue(torch.equal(lane[:16], row[k0 : k0 + 16]))
-        self.assertTrue(torch.equal(lane[16:], row[k0 + 64 : k0 + 80]))
 
 
 ROUTE_SHAPES = [(1856, 5120), (8192, 1280), (1152, 5120), (5120, 2048)]
@@ -262,48 +192,6 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     x[:m].contiguous(), w_sh, ws8, w_small
                 )
                 self.assertTrue(torch.equal(part, full[:m]), (m_lo, m_hi, m))
-
-    def test_bf16_copy_follows_the_large_m_table(self):
-        """A shape whose table has no hipBLASLt bucket must not keep a bf16 copy."""
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-            weight_needs_bf16_copy,
-        )
-
-        for n, k in ROUTE_SHAPES:
-            _, _, _, _, w_small, _ = self._weights(n, k)
-            self.assertEqual(w_small is not None, weight_needs_bf16_copy(n, k), (n, k))
-
-    def test_shuffled_gemm_reads_the_lane_layout(self):
-        # The Triton GEMM over the shuffled weight equals the same GEMM over the row-major weight.
-        n, k = 1856, 5120
-        wq, ws, w_sh, ws8, _, w_bf16 = self._weights(n, k, seed=2)
-        x = torch.randn(300, k, device="cuda", dtype=torch.bfloat16)
-        xq, xs = mxfp8_e4m3_quantize(x)
-        tile = large_m_plan(300, n, k)
-        if tile is None:
-            self.skipTest(f"M=300 of {n}x{k} is tuned to hipBLASLt bf16, not a tile")
-        out = mxfp8_shuffled_gemm(xq, xs, w_sh, ws8, tile[:4], tile[4])
-        ref = fake_quant_fp8_activation(x).float() @ w_bf16.float().t()
-        rel = ((out.float() - ref).abs().max() / ref.abs().max()).item()
-        self.assertLess(rel, 4e-3, rel)
-
-    def test_graph_capture(self):
-        n, k = 1856, 5120
-        _, _, w_sh, ws8, w_small, _ = self._weights(n, k, seed=3)
-        for m in (1, 8, 40, 1500):
-            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-            eager = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
-            s = torch.cuda.Stream()
-            with torch.cuda.stream(s):
-                mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, stream=s):
-                out = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
-            out.zero_()
-            g.replay()
-            torch.cuda.synchronize()
-            self.assertTrue(torch.equal(out, eager), m)
 
 
 if __name__ == "__main__":

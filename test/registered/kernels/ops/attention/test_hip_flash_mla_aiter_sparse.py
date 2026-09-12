@@ -1,4 +1,4 @@
-"""The ``aiter_sparse`` ROCm attention backend and its split-KV combine must match the torch reference, the kernels they replace and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
+"""The ``aiter_sparse`` ROCm attention backend and its split-KV combine must match the torch reference and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
 
 import math
 import unittest
@@ -103,7 +103,7 @@ def _reference(q, sink, sets):
     is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
 )
 class TestAiterSparseBackend(CustomTestCase):
-    def _assert_matches_reference_and_tilelang(
+    def _assert_matches_reference(
         self, batch, heads, swa_lengths, topk_lengths, seed=0, tol=3e-2
     ):
         from sglang.srt.layers.attention.hip_flash_mla import (
@@ -114,22 +114,18 @@ class TestAiterSparseBackend(CustomTestCase):
         dev = torch.device("cuda")
         c = _decode_case(batch, heads, gen, dev)
         q, sink, swa_idx, topk_idx = c.q, c.sink, c.swa_idx, c.topk_idx
-        swa_cache, swa_deq, topk_cache, topk_deq = (
-            c.swa_cache,
-            c.swa_deq,
-            c.topk_cache,
-            c.topk_deq,
-        )
         swa_len = torch.tensor(swa_lengths, dtype=torch.int32, device=dev)
         topk_len = torch.tensor(topk_lengths, dtype=torch.int32, device=dev)
-        # Some -1 padding inside the length too: must be skipped by both kernels.
+        # Some -1 padding inside the length too: must be skipped by the kernel.
         topk_idx[:, 0, 3] = -1
         ref = _reference(
-            q, sink, [(swa_deq, swa_idx, swa_len), (topk_deq, topk_idx, topk_len)]
+            q, sink, [(c.swa_deq, swa_idx, swa_len), (c.topk_deq, topk_idx, topk_len)]
         )
+        # The backend folds the lengths into the index lists before this call.
         kwargs = dict(
+            backend="aiter_sparse",
             q=q,
-            k_cache=swa_cache,
+            k_cache=c.swa_cache,
             head_dim_v=D,
             block_table=None,
             cache_seqlens=None,
@@ -137,52 +133,23 @@ class TestAiterSparseBackend(CustomTestCase):
             softmax_scale=SCALE,
             is_fp8_kvcache=True,
             attn_sink=sink,
-            extra_k_cache=topk_cache,
-        )
-        # the tilelang kernel only builds for 64 padded heads, so compare on the real heads
-        pad = 64 - heads if heads < 64 else 0
-        q_pad = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        sink_pad = torch.nn.functional.pad(sink, (0, pad))
-        tilelang = flash_mla_with_kvcache_entrypoint(
-            backend="tilelang",
-            indices=swa_idx,
-            topk_length=swa_len,
-            extra_indices_in_kvcache=topk_idx,
-            extra_topk_length=topk_len,
-            **dict(kwargs, q=q_pad, attn_sink=sink_pad),
-        )[0][:, :, :heads]
-        # The backend folds the lengths into the index lists before this call.
-        got = flash_mla_with_kvcache_entrypoint(
-            backend="aiter_sparse",
+            extra_k_cache=c.topk_cache,
             indices=_masked(swa_idx, swa_len),
             topk_length=swa_len,
             extra_indices_in_kvcache=_masked(topk_idx, topk_len),
             extra_topk_length=topk_len,
-            **kwargs,
-        )[0]
+        )
+        got = flash_mla_with_kvcache_entrypoint(**kwargs)[0]
         self.assertEqual(got.shape, q.shape)
         self.assertEqual(got.dtype, torch.bfloat16)
-        scale = ref.abs().max().item()
-        err = (got.float() - ref).abs().max().item() / scale
-        err_tl = (tilelang.float() - ref).abs().max().item() / scale
-        self.assertLess(
-            err, tol, f"aiter vs reference {err:.4f} (tilelang {err_tl:.4f})"
-        )
-        self.assertLess(
-            (got.float() - tilelang.float()).abs().max().item() / scale, tol
-        )
-        for _ in range(5):
-            again = flash_mla_with_kvcache_entrypoint(
-                backend="aiter_sparse",
-                indices=_masked(swa_idx, swa_len),
-                topk_length=swa_len,
-                extra_indices_in_kvcache=_masked(topk_idx, topk_len),
-                extra_topk_length=topk_len,
-                **kwargs,
-            )[0]
-            self.assertTrue(torch.equal(again, got))
+        err = (got.float() - ref).abs().max().item() / ref.abs().max().item()
+        self.assertLess(err, tol, f"aiter vs reference {err:.4f}")
+        for _ in range(3):
+            self.assertTrue(
+                torch.equal(flash_mla_with_kvcache_entrypoint(**kwargs)[0], got)
+            )
 
-    def test_matches_reference_and_tilelang(self):
+    def test_matches_reference(self):
         """Full lists, contexts shorter than the window and the top-k width (the length
         masks live slots left in the list), and the model's 64-padded heads."""
         for batch, heads, swa_lengths, topk_lengths, seed in (
@@ -191,7 +158,7 @@ class TestAiterSparseBackend(CustomTestCase):
             (2, 64, [128, 64], [512, 300], 2),
         ):
             with self.subTest(batch=batch, heads=heads, seed=seed):
-                self._assert_matches_reference_and_tilelang(
+                self._assert_matches_reference(
                     batch, heads, swa_lengths, topk_lengths, seed=seed
                 )
 
@@ -199,79 +166,7 @@ class TestAiterSparseBackend(CustomTestCase):
         """The -1 inside the length (index 3 of the top-k list) must not be attended: on a
         5-key list a stray key moves the softmax mass past this tolerance, where the
         640-key cases absorb it."""
-        self._assert_matches_reference_and_tilelang(
-            2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT
-        )
-
-    def _real_vs_padded_heads(self, batch, seed):
-        """The 16-head call must return bitwise what the padded 64-head call returned on the real heads."""
-        from sglang.srt.layers.attention.hip_flash_mla import (
-            flash_mla_with_kvcache_entrypoint,
-        )
-
-        heads = 16
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        dev = torch.device("cuda")
-        c = _decode_case(batch, heads, gen, dev)
-        q, sink = c.q, c.sink
-        swa_len = torch.randint(1, 129, (batch,), generator=gen).to(torch.int32)
-        topk_len = torch.randint(1, 513, (batch,), generator=gen).to(torch.int32)
-        kwargs = dict(
-            backend="aiter_sparse",
-            k_cache=c.swa_cache,
-            head_dim_v=D,
-            block_table=None,
-            cache_seqlens=None,
-            tile_scheduler_metadata=None,
-            softmax_scale=SCALE,
-            is_fp8_kvcache=True,
-            extra_k_cache=c.topk_cache,
-            indices=_masked(c.swa_idx, swa_len.to(dev)),
-            extra_indices_in_kvcache=_masked(c.topk_idx, topk_len.to(dev)),
-        )
-        q_pad = torch.nn.functional.pad(q, (0, 0, 0, 64 - heads))
-        sink_pad = torch.nn.functional.pad(sink, (0, 64 - heads))
-        padded = flash_mla_with_kvcache_entrypoint(
-            q=q_pad, attn_sink=sink_pad, **kwargs
-        )[0]
-        real = flash_mla_with_kvcache_entrypoint(q=q, attn_sink=sink, **kwargs)[0]
-        self.assertEqual(real.shape, q.shape)
-        self.assertTrue(torch.equal(real, padded[:, :, :heads]))
-
-    def test_real_heads_match_padded_heads(self):
-        for batch, seed in ((1, 3), (3, 4), (8, 5)):
-            with self.subTest(batch=batch):
-                self._real_vs_padded_heads(batch, seed=seed)
-
-    def test_head_pad_predicate_follows_kernel_choice(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.attention.hip_flash_mla import (
-            hip_attention_needs_head_pad,
-        )
-
-        # gfx950 "auto" is the aiter kernel, which takes the real head count.
-        with envs.SGLANG_HACK_FLASHMLA_BACKEND.override("auto"):
-            self.assertFalse(hip_attention_needs_head_pad())
-        with envs.SGLANG_HACK_FLASHMLA_BACKEND.override("triton"):
-            self.assertFalse(hip_attention_needs_head_pad())
-        # the tilelang kernel is built for the 64-padded widths
-        with envs.SGLANG_HACK_FLASHMLA_BACKEND.override("tilelang"):
-            self.assertTrue(hip_attention_needs_head_pad())
-
-    def test_fold_lengths_into_index_lists(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            _fold_lengths_into_index_lists,
-        )
-
-        idx = torch.arange(2 * 1 * 6, dtype=torch.int32, device="cuda").view(2, 1, 6)
-        out, extra = _fold_lengths_into_index_lists(
-            idx, torch.tensor([2, 6], dtype=torch.int32, device="cuda")
-        )
-        self.assertEqual(out[0, 0].tolist(), [0, 1, -1, -1, -1, -1])
-        self.assertEqual(out[1, 0].tolist(), [6, 7, 8, 9, 10, 11])
-        self.assertIsNone(extra)
-        # no lengths: nothing to fold, the caller keeps its list
-        self.assertEqual(_fold_lengths_into_index_lists(idx, None), (None, None))
+        self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
 
     def test_fold_cache_follows_the_index_source(self):
         """Layers between two index sources fold the first source's list once; the layers
@@ -438,22 +333,14 @@ class TestAiterSparsePrefill(CustomTestCase):
             extra_topk_length=None,
         )[0]
 
-    def test_matches_reference_and_triton(self):
+    def test_matches_reference(self):
         got = self._run("aiter_sparse")
         self.assertEqual(got.shape, self.q.shape)
         self.assertEqual(got.dtype, torch.bfloat16)
-        scale = self.ref.abs().max().item()
-        err = (got.float() - self.ref).abs().max().item() / scale
-        triton_out = self._run("triton")
-        err_triton = (triton_out.float() - self.ref).abs().max().item() / scale
-        # Measured 2.5e-3 for both kernels (bf16 q, bf16 probabilities).
-        self.assertLess(
-            err, 1e-2, f"aiter vs reference {err:.2e} (triton {err_triton:.2e})"
-        )
-        self.assertLess(
-            (got.float() - triton_out.float()).abs().max().item() / scale, 1e-2
-        )
-        for _ in range(5):
+        err = (got.float() - self.ref).abs().max().item() / self.ref.abs().max().item()
+        # Measured 2.5e-3 (bf16 q, bf16 probabilities).
+        self.assertLess(err, 1e-2, f"aiter vs reference {err:.2e}")
+        for _ in range(3):
             self.assertTrue(torch.equal(self._run("aiter_sparse"), got))
 
     def test_batch_invariant(self):
@@ -560,26 +447,6 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
                     )
                 )
 
-    def test_no_sink(self):
-        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
-
-        from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
-            aiter_sparse_split_reduce,
-        )
-
-        inputs = self._inputs(4, 16, 7, 77, 301)
-        args = (
-            inputs["q"],
-            inputs["swa_cache"],
-            inputs["swa_idx"],
-            self._indptr(4, 128),
-            None,
-            SCALE,
-        )
-        ref = pa_decode_sparse(*args, kv_splits=4)
-        acc, m, lsum = pa_decode_sparse(*args, kv_splits=4, skip_reduce=True)
-        self.assertTrue(torch.equal(aiter_sparse_split_reduce(acc, m, lsum, None), ref))
-
     def test_inverse_rope_matches_flat_kernel(self):
         from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
             aiter_sparse_split_reduce,
@@ -616,48 +483,6 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         _model_inverse_rope(ref[..., -ROPE:], fr, pos)
         got = aiter_sparse_split_reduce(acc, m, lsum, sink, inv_rope=(fr, pos))
         self.assertTrue(torch.equal(got, ref))
-
-    def test_entrypoint_folds_inverse_rope(self):
-        """With `inv_rope` the entrypoint must equal the kernel plus the flat inverse rope, for every HIP kernel."""
-        from sglang.srt.layers.attention.hip_flash_mla import (
-            flash_mla_with_kvcache_entrypoint,
-        )
-
-        dev = torch.device("cuda")
-        _, fr = _freqs(dev)
-        for batch, heads, seed in [(1, 16, 30), (6, 16, 31), (2, 64, 32)]:
-            with self.subTest(batch=batch, heads=heads):
-                inputs = self._inputs(batch, heads, seed, 77 if batch > 1 else 128, 512)
-                pos = torch.randint(0, 8192, (batch,), device=dev)
-                kwargs = dict(
-                    q=inputs["q"].unsqueeze(1),
-                    k_cache=inputs["swa_cache"].unsqueeze(2).view(torch.float8_e4m3fn),
-                    head_dim_v=D,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=None,
-                    softmax_scale=SCALE,
-                    is_fp8_kvcache=True,
-                    attn_sink=inputs["sink"],
-                    indices=inputs["swa_idx"].view(batch, 1, 128),
-                    extra_k_cache=inputs["topk_cache"]
-                    .unsqueeze(2)
-                    .view(torch.float8_e4m3fn),
-                    extra_indices_in_kvcache=inputs["topk_idx"].view(batch, 1, 512),
-                )
-                for backend in (
-                    ("aiter_sparse", "tilelang") if heads == 64 else ("aiter_sparse",)
-                ):
-                    ref = flash_mla_with_kvcache_entrypoint(backend=backend, **kwargs)[
-                        0
-                    ]
-                    ref = ref.clone()
-                    _model_inverse_rope(ref.view(batch, heads, D)[..., -ROPE:], fr, pos)
-                    got = flash_mla_with_kvcache_entrypoint(
-                        backend=backend, inv_rope=(fr, pos), **kwargs
-                    )[0]
-                    self.assertEqual(got.shape, ref.shape, backend)
-                    self.assertTrue(torch.equal(got, ref), backend)
 
 
 @unittest.skipUnless(

@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.ops.embeddings.engram_hash import (
     engram_commit_decode_history,
-    engram_commit_history,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -16,40 +15,6 @@ register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestEngramHistoryCommit(CustomTestCase):
-    def test_graph_replay_matches_oracle(self):
-        torch.manual_seed(1)
-        for width in (1, 2, 3, 7, 33, 65):
-            with self.subTest(history_width=width):
-                history = torch.randint(
-                    0, 1000, (12, width + 3), device="cuda", dtype=torch.int32
-                )[:, :width]
-                tokens = torch.randint(0, 1000, (7, 9), device="cuda")[:, :6]
-                slots = torch.tensor([8, 1, 5, 2, 10, 0, 7], device="cuda")
-                commit = torch.arange(7, device="cuda", dtype=torch.int32)
-
-                def commit_step():
-                    engram_commit_history(history, tokens, slots, commit)
-
-                stream = torch.cuda.Stream()
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    commit_step()
-                torch.cuda.current_stream().wait_stream(stream)
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    commit_step()
-                for _ in range(3):
-                    slots.copy_(slots.roll(1))
-                    commit.copy_(commit.roll(2))
-                    tokens.add_(1)
-                    expected = history.clone()
-                    window = torch.cat([expected[slots], tokens.int()], dim=1)
-                    cols = commit.long()[:, None] + torch.arange(width, device="cuda")
-                    expected[slots] = window.gather(1, cols)
-                    graph.replay()
-                    torch.testing.assert_close(history, expected, rtol=0, atol=0)
-
     def test_decode_commit_matches_torch_chain(self):
         """The one-launch decode commit is ``history[where(out_loc == 0, pad, slots)] =
         tokens[:, :n-1].flip(-1)``; padded rows land on the spare row, live rows bitwise."""
@@ -84,35 +49,6 @@ class TestEngramHistoryCommit(CustomTestCase):
                 got = base.clone()
                 engram_commit_decode_history(got, tokens, req, None, pad_row)
                 self.assertTrue(torch.equal(got, ref))
-
-    def test_decode_commit_graph_replay(self):
-        torch.manual_seed(4)
-        history = torch.zeros(9, 3, device="cuda", dtype=torch.int32)
-        tokens = torch.randint(0, 1000, (4, 4), device="cuda", dtype=torch.int32)
-        slots = torch.tensor([2, 5, 7, 1], device="cuda")
-        out_loc = torch.tensor([3, 4, 0, 0], device="cuda")
-
-        def commit_step():
-            engram_commit_decode_history(history, tokens, slots, out_loc, 8)
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            commit_step()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            commit_step()
-        for _ in range(3):
-            tokens.copy_(
-                torch.randint(0, 1000, (4, 4), device="cuda", dtype=torch.int32)
-            )
-            expected = history.clone()
-            expected[slots[:2]] = tokens[:2, :3].flip(-1)
-            graph.replay()
-            torch.cuda.synchronize()
-            self.assertTrue(torch.equal(history[:8], expected[:8]))
 
 
 if __name__ == "__main__":

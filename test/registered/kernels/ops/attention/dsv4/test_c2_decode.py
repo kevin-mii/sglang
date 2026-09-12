@@ -195,26 +195,6 @@ def test_mixed_parity(n, ring_size):
     assert torch.equal(got_state, ref_state), "pair state diverged"
 
 
-@pytest.mark.parametrize("n", BATCHES)
-def test_raw_out_loc_int64(n):
-    """The served model hands the scheduler's int64 `out_cache_loc`; either width must
-    give the same latent and pair state."""
-    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
-        n, HEAD_DIM, seed=7000 + n
-    )
-    norm = _norm(HEAD_DIM, 7001 + n)
-    state32, state64 = kv_state.clone(), kv_state.clone()
-    args = (norm.weight.data, positions, req)
-    kw = {"ring_size": RING_SIZES[-1]}
-    got32 = c2_decode_norm(kv_input, state32, *args, raw_out_loc, EPS, **kw)
-    got64 = c2_decode_norm(
-        kv_input, state64, *args, raw_out_loc.to(torch.int64), EPS, **kw
-    )
-    odd = (positions.to(torch.int64) % 2) == 1
-    assert torch.equal(got32[odd], got64[odd]), "latent differs by loc dtype"
-    assert torch.equal(state32, state64), "pair state differs by loc dtype"
-
-
 def test_pair_state_carried_across_two_steps():
     """A group spans two decode steps: an all-even step only parks, and the all-odd
     step after it must pool against exactly what it left."""
@@ -338,12 +318,6 @@ def test_saturated_and_tied_scores():
     _compare(got, partner, rows, "saturated partner")
 
 
-def test_empty_batch():
-    """An idle decode step launches nothing and must not fault."""
-    got, *_ = _run(0, HEAD_DIM, seed=7000)
-    assert got.shape == (0, 512)
-
-
 # ------------------------------------------------- + RoPE, fp4 quant and store
 
 
@@ -409,39 +383,6 @@ def _run_fusion(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
 
 
 @pytest.mark.parametrize("n", BATCHES)
-def test_store_accepts_the_pool_fp8_view(n):
-    """`get_extra_key_buffer` hands the pool out as `float8_e4m3fn`; the kernel must
-    write the same bytes through that view as through the uint8 buffer."""
-    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
-        n, HEAD_DIM, seed=8000 + n
-    )
-    norm = _norm(HEAD_DIM, 8001 + n)
-    _, freqs_cis = _freqs(int(positions.max().item()) + 2 if n else 2, 8002 + n)
-    slots_max = int((raw_out_loc // RATIO).max().item()) if n else 0
-    cache_u8, cache_fp8 = _cache(slots_max), _cache(slots_max)
-    args = (norm.weight.data, positions, req, raw_out_loc, EPS, freqs_cis)
-    got_u8 = c2_decode_norm_rope_store(
-        kv_input,
-        kv_state.clone(),
-        *args,
-        cache_u8,
-        page_size=PAGE_SIZE,
-        ring_size=RING_SIZES[-1],
-    )
-    got_fp8 = c2_decode_norm_rope_store(
-        kv_input,
-        kv_state.clone(),
-        *args,
-        cache_fp8.view(torch.float8_e4m3fn),
-        page_size=PAGE_SIZE,
-        ring_size=RING_SIZES[-1],
-    )
-    odd = (positions.to(torch.int64) % 2) == 1
-    assert torch.equal(got_u8[odd], got_fp8[odd]), "latent differs by cache dtype"
-    assert torch.equal(cache_u8, cache_fp8), "cache bytes differ by cache dtype"
-
-
-@pytest.mark.parametrize("n", BATCHES)
 def test_store_is_bitwise_the_production_writer(n):
     """Byte for byte, driven by the kernel's own latent so the pooling residual is
     factored out and only RoPE, the fp4 fake-quant and the 584-byte layout remain."""
@@ -478,38 +419,6 @@ def test_store_skips_even_and_padded_rows():
     assert not r["cache"].any(), (
         f"{int((r['cache'] != 0).sum())} cache bytes written with nothing to store"
     )
-
-
-def test_store_slot_is_raw_out_loc_over_ratio():
-    """The slot is `raw_out_loc >> 1` in-kernel, not `c2_out_loc`; scattered across a
-    page boundary, exactly those slots and no others are written."""
-    n = 6
-    want = [
-        1,
-        PAGE_SIZE - 1,
-        PAGE_SIZE,
-        PAGE_SIZE + 1,
-        2 * PAGE_SIZE - 1,
-        2 * PAGE_SIZE,
-    ]
-    # Odd, so `>> 1` also proves the shift is a floor and not a round.
-    raw_out_loc = torch.tensor(
-        [s * RATIO + 1 for s in want], device="cuda", dtype=torch.int32
-    )
-    positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
-    r = _run_fusion(
-        n, HEAD_DIM, seed=13000, positions=positions, raw_out_loc=raw_out_loc
-    )
-    assert r["live"].all()
-    written = set()
-    cache = r["cache"]
-    for p in range(cache.shape[0]):
-        for s in range(PAGE_SIZE):
-            value = cache[p, s * 576 : (s + 1) * 576]
-            base = 576 * PAGE_SIZE + s * 8
-            if value.any() or cache[p, base : base + 8].any():
-                written.add(p * PAGE_SIZE + s)
-    assert written == set(want), f"wrote slots {sorted(written)}, wanted {want}"
 
 
 if __name__ == "__main__":

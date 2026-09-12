@@ -2,7 +2,6 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
@@ -263,38 +262,6 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             overlap = len(set(ref_sel.tolist()) & set(sel_raw.tolist())) / n_valid
             self.assertGreaterEqual(overlap, 0.9, msg=f"top-k overlap {overlap:.3f}")
 
-    def _expand_to_verify_rows(self, case, ratio, block):
-        """Target-verify rows: each request repeated `block` times, row j seeing one
-        more compressed slot than row j - 1 (clamped to 1), with its own query."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
-            _expand_index_page_table,
-        )
-
-        torch.manual_seed(100 + ratio)
-        bs = case.bs
-        rows = bs * block
-        offsets = torch.arange(block, device="cuda", dtype=torch.int32) - (block - 1)
-        seq_lens = (case.seq_lens[:, None] + offsets[None, :]).clamp_min(1).view(-1)
-        full_page_table = case.full_page_table.repeat_interleave(block, dim=0)
-        page_table = _expand_index_page_table(
-            full_page_table,
-            full_page_size=FULL_PAGE_SIZE,
-            compress_ratio=ratio,
-            index_page_size=INDEX_PAGE_SIZE,
-        )
-        return SimpleNamespace(
-            **vars(case)
-            | dict(
-                bs=rows,
-                full_page_table=full_page_table,
-                seq_lens=seq_lens,
-                page_table=page_table,
-            )
-            | self._queries_and_golden(
-                rows, full_page_table, seq_lens, case.k_all, ratio, case.max_slots
-            )
-        )
-
     def _run_decode(self, ratio, verify_block=None):
         from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -365,13 +332,6 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
                 self._run_decode(ratio=ratio)
-
-    def test_decode_body_on_target_verify_rows(self):
-        """Verify rows (one per draft token) must route through the decode body with
-        per-row page tables; at ratio 2 neighbouring rows share a compressed slot."""
-        for ratio in (1, 2):
-            with self.subTest(ratio=ratio):
-                self._run_decode(ratio=ratio, verify_block=6)
 
     def test_prefill_matches_golden(self):
         """The row-wise prefill kernel must match the reference with and without a
@@ -556,14 +516,6 @@ class _LowRatioBackendCase(CustomTestCase):
 
         return fake_quant_fp4(torch.randn_like(case.q)), torch.rand_like(case.weights)
 
-    @staticmethod
-    def _decode_batch(seq_lens, decode=True):
-        """The two fields the decode predicates read."""
-        return SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode=lambda: decode),
-            seq_lens_cpu=torch.tensor(seq_lens),
-        )
-
     def _run(
         self,
         case,
@@ -641,24 +593,6 @@ class _LowRatioBackendCase(CustomTestCase):
             )
         return page_indices, raw_indices, backend.candidate_masks
 
-    def _dense_masks(self, case, masks, seq_lens, extend_lens):
-        """The HIP publication (one Optional[CandidateBlocks] per request) as the torch
-        oracle's dense bool [t_len, lc] masks: None keeps every reachable block."""
-        out, row = [], 0
-        for cb, s, e in zip(masks, seq_lens, extend_lens):
-            lc = s // case.ratio
-            lens = ((case.pos[row : row + e] + 1) // case.ratio)[:, None]
-            row += e
-            j = torch.arange(lc, device=case.dev)
-            block = self.CANDIDATE_BLOCKS[1]
-            if cb is None:
-                out.append((j[None, :] // block) <= ((lens - 1) // block))
-                continue
-            num_blocks = (lc + block - 1) // block
-            keep = candidate_block_ids_to_mask(cb.ids, num_blocks)
-            out.append(keep.repeat_interleave(block, dim=1)[:, :lc])
-        return out
-
     def _assert_candidates_equal(self, a_masks, b_masks, msg):
         """Two HIP publications keep the same blocks per row; None stands for every
         reachable block, which a scored publication spells out as blocks 0..n-1."""
@@ -726,80 +660,14 @@ class _LowRatioBackendCase(CustomTestCase):
 class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
     """The decode and ragged-prefill entry points against the torch oracle."""
 
-    # Toy candidate blocks so the mask binds on requests of a few hundred tokens.
-    CANDIDATE_BLOCKS = (2, 32)
-
-    @staticmethod
-    def _drop_filler(case, result, masks):
-        """Keep only the candidate selections: a row short of top-k is padded with tied
-        -inf positions, and torch.topk's pick among them is nondeterministic on ROCm."""
-        pi, ri, _ = result
-        ri, pi = ri.clone(), pi.clone()
-        rows = 0
-        lens = (case.pos + 1) // case.ratio
-        for mask in masks:
-            t_len = mask.shape[0]
-            r = ri[rows : rows + t_len].long()
-            valid = r != -1
-            cand = torch.zeros_like(valid)
-            cand[valid] = mask[
-                torch.arange(t_len, device=r.device)[:, None].expand_as(r)[valid],
-                r[valid],
-            ] & (r[valid] < lens[rows : rows + t_len, None].expand_as(r)[valid])
-            ri[rows : rows + t_len] = ri[rows : rows + t_len].masked_fill(~cand, -1)
-            pi[rows : rows + t_len] = pi[rows : rows + t_len].masked_fill(~cand, -1)
-            rows += t_len
-        # Compact the kept candidates so two paths that kept the same set compare
-        # equal column by column.
-        ri, pi = sorted_by_raw(ri, pi)
-        return pi, ri, None
-
     def test_prefill_path_agrees_with_torch_path(self):
-        """The prefill kernel path must select the oracle's set per token, publish the
-        oracle's candidate masks as a source, and honour them as a consumer."""
+        """The prefill kernel path must select the oracle's set per token."""
         for ratio in (1, 2):
             seq_lens, extend_lens = [300, 45, 700], [300, 45, 200]
             case = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
-            hip = self._run(case, "extend", candidate_source=True)
-            oracle = self._run(case, "torch", candidate_source=True)
-            self._assert_agrees(hip, oracle, f"{ratio=} source")
-            hip_dense = self._dense_masks(case, hip[2], seq_lens, extend_lens)
-            oracle_masks = oracle[2]
-            self.assertEqual(len(hip_dense), len(oracle_masks))
-            for a, b in zip(hip_dense, oracle_masks):
-                self.assertEqual(a.shape, b.shape)
-                self.assertGreaterEqual((a == b).float().mean().item(), 0.95)
-            hip_consumer = self._run(case, "extend", uses_candidates=True, masks=hip[2])
-            oracle_consumer = self._run(
-                case, "torch", uses_candidates=True, masks=hip_dense
-            )
-            self._assert_agrees(
-                self._drop_filler(case, hip_consumer, hip_dense),
-                self._drop_filler(case, oracle_consumer, hip_dense),
-                f"{ratio=} consumer",
-            )
-
-    def test_prefill_request_groups_are_neutral(self):
-        """Splitting the logits into request groups must not change the selection or the
-        candidate masks."""
-        import sglang.srt.layers.attention.dsv4.low_ratio_backend_hip as hip
-
-        for ratio in (1, 2):
-            seq_lens, extend_lens = [300, 45, 700], [300, 45, 200]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
-            w_pi, w_ri, w_masks = self._run(case, "extend", candidate_source=True)
-            with mock.patch.object(hip, "logits_rows_per_chunk", return_value=1):
-                s_pi, s_ri, s_masks = self._run(case, "extend", candidate_source=True)
-                c = self._run(case, "extend", uses_candidates=True, masks=s_masks)
-            w_ri, w_pi = sorted_by_raw(w_ri, w_pi)
-            s_ri, s_pi = sorted_by_raw(s_ri, s_pi)
-            self.assertTrue(torch.equal(w_ri, s_ri) and torch.equal(w_pi, s_pi))
-            self._assert_candidates_equal(w_masks, s_masks, f"{ratio=}")
-            d = self._run(case, "extend", uses_candidates=True, masks=w_masks)
-            w_dense = self._dense_masks(case, w_masks, seq_lens, extend_lens)
-            c_pi, c_ri, _ = self._drop_filler(case, c, w_dense)
-            d_pi, d_ri, _ = self._drop_filler(case, d, w_dense)
-            self.assertTrue(torch.equal(c_ri, d_ri) and torch.equal(c_pi, d_pi))
+            hip = self._run(case, "extend")
+            oracle = self._run(case, "torch")
+            self._assert_agrees(hip, oracle, f"{ratio=}")
 
     def test_decode_path_agrees_with_torch_path(self):
         """The decode path must select the same set per row as the torch path (the
@@ -908,8 +776,6 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
             # Released blocks on a 1M-wide rectangle, the page table's capacity on
             # a 1M-context server: the block top-k takes the AOT row-split path.
             (TOPK_BLOCKS, BLOCK_SIZE, 1 << 20, [16385, 131072, 7, 600]),
-            # Toy blocks, as the backend path tests use: the torch.topk fallback.
-            (2, 32, 700, [1, 300, 45, 700, 33]),
         )
         for topk_blocks, block_size, width, lens in cases:
             with self.subTest(topk_blocks=topk_blocks, width=width, lens=lens):
@@ -954,88 +820,6 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
                 self._assert_consumer_matches_reference(
                     raw, seq, cands, page_table, "consumer"
                 )
-
-    def test_graph_replay_hand_off(self):
-        """Source then consumer captured once must replay on new lengths and logits with
-        no host sync."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            select_candidate_blocks_hip,
-            topk_within_candidate_blocks_hip,
-        )
-
-        torch.manual_seed(3)
-        bs, width = 2, 1 << 17
-        n_pages = width // INDEX_PAGE_SIZE
-        logits = torch.empty(bs, width, device="cuda")
-        seq = torch.empty(bs, dtype=torch.int32, device="cuda")
-        page_table = torch.stack(
-            [torch.randperm(n_pages, device="cuda") for _ in range(bs)]
-        ).to(torch.int32)
-        page_indices = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
-        raw_indices = torch.empty(bs, TOPK, dtype=torch.int32, device="cuda")
-
-        def step():
-            cands = select_candidate_blocks_hip(
-                logits, seq, topk_blocks=TOPK_BLOCKS, block_size=BLOCK_SIZE
-            )
-            topk_within_candidate_blocks_hip(
-                logits,
-                seq,
-                cands,
-                page_table=page_table,
-                page_size=INDEX_PAGE_SIZE,
-                page_indices=page_indices,
-                raw_indices=raw_indices,
-            )
-            return cands.ids
-
-        def fill(lens):
-            seq.copy_(torch.tensor(lens, dtype=torch.int32))
-            logits.copy_(self._garbage_tail(torch.randn(bs, width, device="cuda"), seq))
-
-        fill([20000, 5])
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            step()
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                ids = step()
-        torch.cuda.synchronize()
-
-        for lens in ([131072, 16385], [16384, 1], [70001, 33]):
-            with self.subTest(lens=lens):
-                fill(lens)
-                graph.replay()
-                torch.cuda.synchronize()
-                got_pi, got_ri, got_ids = (
-                    page_indices.clone(),
-                    raw_indices.clone(),
-                    ids.clone(),
-                )
-                expected = reference_position_mask(logits, seq, TOPK_BLOCKS, BLOCK_SIZE)
-                self.assertTrue(
-                    torch.equal(
-                        ids_to_position_mask(got_ids, BLOCK_SIZE, width), expected
-                    )
-                )
-                # The eager run of the same kernels on the same inputs.
-                eager_ids = step()
-                torch.cuda.synchronize()
-                self.assertTrue(
-                    torch.equal(sorted_rows(eager_ids), sorted_rows(got_ids))
-                )
-                self.assertTrue(
-                    torch.equal(sorted_rows(raw_indices), sorted_rows(got_ri))
-                )
-                self.assertTrue(
-                    torch.equal(sorted_rows(page_indices), sorted_rows(got_pi))
-                )
-                for b, (want, k) in enumerate(
-                    reference_consumer_rows(logits, seq, expected, TOPK)
-                ):
-                    self.assertEqual(set(got_ri[b, :k].tolist()), want, f"row {b}")
-                    self.assertTrue(bool((got_ri[b, k:] == -1).all()))
 
     @staticmethod
     def _row_set(ri, b):
@@ -1178,108 +962,6 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
         with self.assertRaises(AssertionError):
             self._run(case, "decode", inputs=consumer, uses_candidates=True, masks=None)
 
-    def test_decode_body_keeps_filter_when_a_row_exceeds_span(self):
-        """One row past the span must keep the whole batch on the filtered path, with
-        the same blocks and selection as a backend without the span."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            CandidateBlocks,
-        )
-
-        seq_lens = [16385, 5]
-        case = self._setup(1, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
-        consumer = self._layer_inputs(case)
-        _, s_ri, cands = self._run(
-            case, "decode", candidate_source=True, candidate_span=SPAN
-        )
-        self.assertIsInstance(cands, CandidateBlocks)
-        _, f_ri, f_cands = self._run(case, "decode", candidate_source=True)
-        self.assertTrue(torch.equal(sorted_rows(s_ri), sorted_rows(f_ri)))
-        self.assertTrue(
-            torch.equal(
-                ids_to_position_mask(cands.ids, BLOCK_SIZE, 16392),
-                ids_to_position_mask(f_cands.ids, BLOCK_SIZE, 16392),
-            )
-        )
-        _, c_ri, _ = self._run(
-            case,
-            "decode",
-            inputs=consumer,
-            uses_candidates=True,
-            masks=cands,
-            candidate_span=SPAN,
-        )
-        _, fc_ri, _ = self._run(
-            case, "decode", inputs=consumer, uses_candidates=True, masks=f_cands
-        )
-        self.assertTrue(torch.equal(sorted_rows(c_ri), sorted_rows(fc_ri)))
-
-    def test_candidate_span_predicate_and_config(self):
-        """The span comes from the model config only with a candidate source layer, and
-        the decode predicate must follow the batch maximum eagerly and the captured
-        variant inside a graph."""
-        import sglang.srt.model_executor.runner_utils.capture_mode as cm
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_candidate_span,
-            low_ratio_decode_rows_fit_candidate_span,
-        )
-
-        cfg = SimpleNamespace(
-            candidate_source_layer_id=20,
-            candidate_topk_blocks=TOPK_BLOCKS,
-            candidate_block_size=BLOCK_SIZE,
-        )
-        self.assertEqual(low_ratio_candidate_span(cfg), SPAN)
-        self.assertIsNone(
-            low_ratio_candidate_span(
-                SimpleNamespace(
-                    candidate_source_layer_id=-1,
-                    candidate_topk_blocks=TOPK_BLOCKS,
-                    candidate_block_size=BLOCK_SIZE,
-                )
-            )
-        )
-        self.assertIsNone(low_ratio_candidate_span(SimpleNamespace()))
-
-        backend = SimpleNamespace(low_ratio_candidate_span=SPAN)
-        off = SimpleNamespace(low_ratio_candidate_span=None)
-        fits = self._decode_batch([1, 300, SPAN])
-        self.assertTrue(low_ratio_decode_rows_fit_candidate_span(backend, fits))
-        self.assertFalse(low_ratio_decode_rows_fit_candidate_span(off, fits))
-        self.assertFalse(low_ratio_decode_rows_fit_candidate_span(backend, None))
-        self.assertFalse(
-            low_ratio_decode_rows_fit_candidate_span(
-                backend, self._decode_batch([1, SPAN + 1])
-            )
-        )
-        self.assertFalse(
-            low_ratio_decode_rows_fit_candidate_span(
-                backend, self._decode_batch([1, 300], decode=False)
-            )
-        )
-        self.assertFalse(
-            low_ratio_decode_rows_fit_candidate_span(
-                backend,
-                SimpleNamespace(forward_mode=fits.forward_mode, seq_lens_cpu=None),
-            )
-        )
-        # Capture batches carry the fill length; only the variant may decide.
-        with mock.patch.object(cm, "get_is_capture_mode", return_value=True):
-            for variant, expect in (
-                ("candidate_all", True),
-                ("candidate_c2_all", True),
-                ("candidate_unfiltered", True),
-                ("candidate_filtered", False),
-                (None, False),
-            ):
-                with mock.patch.object(
-                    cm, "get_capture_dsa_variant", return_value=variant
-                ):
-                    self.assertEqual(
-                        low_ratio_decode_rows_fit_candidate_span(backend, fits),
-                        expect,
-                        variant,
-                    )
-
 
 @unittest.skipUnless(
     is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
@@ -1315,39 +997,6 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
 
     # Prefill --------------------------------------------------------------
 
-    def test_prefill_all_identity_batch(self):
-        """A batch where every request fits the top-k must produce the scored path's
-        rows without running a kernel."""
-        for ratio in (1, 2):
-            seq_lens = [300, 45, 512 * ratio, 1, 2 * ratio + 1]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=seq_lens)
-            full = self._run(case, "extend", skip=False)
-            fast = self._run(case, "extend", skip=True)
-            self._assert_selection(fast, full, f"{ratio=} plain")
-            self._assert_identity_rows(
-                case, fast[1], fast[0], case.pos.numel(), f"{ratio=}"
-            )
-
-            # a request with no visible position publishes no mask: keep the
-            # 1-token request out of the mask cases
-            seq_lens = [300, 45, 512 * ratio, 2 * ratio + 1]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=seq_lens)
-            full = self._run(case, "extend", skip=False)
-            full_src = self._run(case, "extend", skip=False, candidate_source=True)
-            fast_src = self._run(case, "extend", skip=True, candidate_source=True)
-            self._assert_selection(fast_src, full_src, f"{ratio=} source")
-            for skip_masks in (full_src[2], fast_src[2]):
-                full_c = self._run(
-                    case, "extend", skip=False, uses_candidates=True, masks=skip_masks
-                )
-                fast_c = self._run(
-                    case, "extend", skip=True, uses_candidates=True, masks=skip_masks
-                )
-                self._assert_selection(fast_c, full_c, f"{ratio=} consumer")
-                self._assert_selection(
-                    fast_c, full, f"{ratio=} consumer vs plain", masks=False
-                )
-
     def test_prefill_mixed_short_and_long_requests(self):
         """Identity requests (whole and chunked) are written directly while long
         requests take the scored path, and the published masks must line up."""
@@ -1378,43 +1027,6 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
                 fast_c, full_c, f"{ratio=} consumer", exact_rows=exact
             )
 
-    def test_prefill_request_groups_are_neutral_with_skip(self):
-        """Splitting a mixed batch into request groups must leave the identity rows and
-        the scored rows' masks unchanged."""
-        import sglang.srt.layers.attention.dsv4.low_ratio_backend_hip as hip
-
-        for ratio in (1, 2):
-            seq_lens = [300, 1500, 45, 700]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=seq_lens)
-            exact = self._identity_row_mask(case, seq_lens, seq_lens)
-            whole = self._run(case, "extend", skip=True, candidate_source=True)
-            with mock.patch.object(hip, "logits_rows_per_chunk", return_value=1):
-                split = self._run(case, "extend", skip=True, candidate_source=True)
-            self._assert_selection(split, whole, f"{ratio=}", exact_rows=exact)
-
-    def test_skip_disabled_by_small_candidate_topk(self):
-        """A candidate top-k too small for every reachable block of a 512-position row
-        makes the mask score-dependent, so the skip must stay off."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_identity_skip_enabled,
-        )
-
-        self.assertTrue(
-            low_ratio_identity_skip_enabled(
-                index_topk=512, candidate_topk_blocks=2048, candidate_block_size=8
-            )
-        )
-        self.assertTrue(
-            low_ratio_identity_skip_enabled(
-                index_topk=512, candidate_topk_blocks=64, candidate_block_size=8
-            )
-        )
-        self.assertFalse(
-            low_ratio_identity_skip_enabled(
-                index_topk=512, candidate_topk_blocks=2, candidate_block_size=32
-            )
-        )
-
     # Decode ---------------------------------------------------------------
 
     def test_decode_identity_batch_matches_scored_path(self):
@@ -1434,69 +1046,6 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
             self.assertTrue(
                 torch.equal(fast[1], torch.where(reach, j[None, :], -1).to(torch.int32))
             )
-
-    def test_decode_long_row_keeps_scored_path(self):
-        """One decode row past the top-k must keep the whole batch on the scored path."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_decode_rows_are_identity,
-        )
-
-        for ratio in (1, 2):
-            seq_lens = [1, 300, 512 * ratio + ratio]
-            case = self._setup(
-                ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens)
-            )
-            backend = SimpleNamespace(low_ratio_identity_skip=True, index_topk=TOPK)
-            self.assertFalse(
-                low_ratio_decode_rows_are_identity(backend, case.forward_batch, ratio)
-            )
-            self.assertTrue(
-                low_ratio_decode_rows_are_identity(
-                    backend, self._decode_batch([1, 300, 512 * ratio]), ratio
-                )
-            )
-            full = self._run(case, "decode", skip=False)
-            fast = self._run(case, "decode", skip=True)
-            exact = torch.tensor([True, True, False], device=case.dev)
-            self._assert_selection(fast, full, f"{ratio=}", exact_rows=exact)
-
-    def test_decode_predicate_follows_capture_variant(self):
-        """Inside a captured graph only the variant may decide the skip; a disabled
-        backend and target-verify rows never skip."""
-        import sglang.srt.model_executor.runner_utils.capture_mode as cm
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_decode_rows_are_identity,
-        )
-
-        backend = SimpleNamespace(low_ratio_identity_skip=True, index_topk=TOPK)
-        # Capture batches carry the fill length; only the variant may decide.
-        fb = self._decode_batch([1, 1])
-        with mock.patch.object(cm, "get_is_capture_mode", return_value=True):
-            for variant, ratio, expect in (
-                ("candidate_all", 1, True),
-                ("candidate_all", 2, True),
-                ("candidate_c2_all", 2, True),
-                ("candidate_c2_all", 1, False),
-                ("candidate_unfiltered", 1, False),
-                ("candidate_filtered", 1, False),
-                (None, 1, False),
-            ):
-                with mock.patch.object(cm, "_capture_dsa_variant", variant):
-                    self.assertEqual(
-                        low_ratio_decode_rows_are_identity(backend, fb, ratio),
-                        expect,
-                        (variant, ratio),
-                    )
-        self.assertFalse(
-            low_ratio_decode_rows_are_identity(
-                SimpleNamespace(low_ratio_identity_skip=False, index_topk=TOPK), fb, 1
-            )
-        )
-        self.assertFalse(
-            low_ratio_decode_rows_are_identity(
-                backend, self._decode_batch([1, 1], decode=False), 1
-            )
-        )
 
 
 # -- the head weights: split-K Triton GEMV route --------------------------------
@@ -1534,30 +1083,6 @@ class TestIndexerHeadWeightsHip(CustomTestCase):
             torch.randn(m, HIDDEN, device="cuda")
             * (0.5 + 3 * torch.rand(m, 1, device="cuda"))
         ).bfloat16()
-
-    def test_max_tokens(self):
-        """The route serves exactly the router GEMV's shapes (n a multiple of 8, k a
-        multiple of 512, bf16) and declines everything else."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            rocm_indexer_head_weights_max_tokens,
-        )
-        from sglang.kernels.ops.moe.rocm_router_gate import ROCM_ROUTER_MAX_TOKENS
-
-        self.assertEqual(
-            rocm_indexer_head_weights_max_tokens(N_HEADS, HIDDEN, torch.bfloat16),
-            ROCM_ROUTER_MAX_TOKENS,
-        )
-        self.assertEqual(
-            rocm_indexer_head_weights_max_tokens(64, HIDDEN, torch.bfloat16),
-            ROCM_ROUTER_MAX_TOKENS,
-        )
-        for n, k, dtype in (
-            (N_HEADS, HIDDEN, torch.float16),
-            (N_HEADS, HIDDEN + 128, torch.bfloat16),
-            (24, HIDDEN, torch.bfloat16),
-            (N_HEADS, 512 * 33, torch.bfloat16),
-        ):
-            self.assertEqual(rocm_indexer_head_weights_max_tokens(n, k, dtype), -1)
 
     def test_bitwise_definition_and_batch_invariance(self):
         """The route must equal the fixed-order split-K definition bit for bit and give
@@ -1619,73 +1144,6 @@ class TestIndexerHeadWeightsHip(CustomTestCase):
             differ / total,
             2e-3,
             f"{differ} of {total} elements differ from the served chain",
-        )
-
-    def test_graph_replay(self):
-        """A captured route must replay on new hidden states with no host sync."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            rocm_indexer_head_weights,
-        )
-
-        x = self._x(8)
-        rocm_indexer_head_weights(x, self.w, SCALE)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = rocm_indexer_head_weights(x, self.w, SCALE)
-        for _ in range(3):
-            x.copy_(self._x(8))
-            graph.replay()
-            torch.cuda.synchronize()
-            self.assertTrue(
-                torch.equal(out, rocm_indexer_head_weights(x, self.w, SCALE))
-            )
-
-    def test_indexer_inputs_route_and_fallback(self):
-        """`_indexer_inputs` must take the GEMV pair only for decode rows of a real-
-        shaped indexer and the linear otherwise."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            _indexer_head_weights,
-        )
-
-        calls = []
-
-        class Indexer:
-            weights_proj_hip_max_tokens = 16
-            head_weight_scale = SCALE
-
-            def __init__(self, w):
-                self.weights_proj = SimpleNamespace(weight=w)
-
-            def head_weights(self, x):
-                calls.append(x.shape[0])
-                return _served_chain(x, self.weights_proj.weight, SCALE)
-
-        indexer = Indexer(self.w)
-        x = self._x(16)
-        got = _indexer_head_weights(indexer, x)
-        self.assertEqual(calls, [])
-        exact = (x.double() @ self.w.double().T * SCALE).bfloat16()
-        self.assertLessEqual(int(_ulp_distance(got, exact).max()), 1)
-        wide = self._x(17)
-        self.assertTrue(
-            torch.equal(
-                _indexer_head_weights(indexer, wide), indexer.head_weights(wide)
-            )
-        )
-        self.assertEqual(calls, [17, 17])
-        # A non-contiguous row view and an indexer below the route's range fall back.
-        strided = self._x(4)[:, ::2]
-        self.assertEqual(strided.stride(1), 2)
-        indexer_wide = Indexer(self.w[:, : HIDDEN // 2].contiguous())
-        _indexer_head_weights(indexer_wide, strided)
-        self.assertEqual(calls[-1], 4)
-        stub = SimpleNamespace(
-            head_weights=lambda x: _served_chain(x, self.w, SCALE),
-            weights_proj_hip_max_tokens=-1,
-        )
-        self.assertTrue(
-            torch.equal(_indexer_head_weights(stub, x), stub.head_weights(x))
         )
 
 

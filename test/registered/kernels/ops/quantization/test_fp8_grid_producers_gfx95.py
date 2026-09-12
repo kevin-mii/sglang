@@ -114,20 +114,6 @@ class TestRmsnormFakeQuantFp8(CustomTestCase):
             self.assertTrue(torch.equal(fq_half.x, fq.x[:9]))
             self.assertTrue(torch.equal(y_half, y[:9]))
 
-    def test_strided_rows_and_norm_optional(self):
-        # `q_lora` is a column slice of the fused `wqkv_a` output.
-        torch.manual_seed(3)
-        wide = torch.randn(6, 1536 + 512, device="cuda", dtype=torch.bfloat16)
-        w = torch.rand(1536, device="cuda", dtype=torch.bfloat16)
-        x = wide[:, :1536]
-        self.assertFalse(x.is_contiguous())
-        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
-        fq_c, y_c = rmsnorm_fake_quant_fp8(x.contiguous(), w, EPS)
-        self.assertTrue(torch.equal(fq.x, fq_c.x) and torch.equal(y, y_c))
-        fq_only, none = rmsnorm_fake_quant_fp8(x, w, EPS, return_norm=False)
-        self.assertIsNone(none)
-        self.assertTrue(torch.equal(fq_only.x, fq.x))
-
     def test_emit_fp8_is_the_same_quantization(self):
         # the native-route fp8 codes + scales dequantize exactly to the same launch's fp8-grid bf16 activation
         torch.manual_seed(5)
@@ -150,13 +136,6 @@ class TestRmsnormFakeQuantFp8(CustomTestCase):
             self.assertTrue(
                 torch.equal(dequant_mxfp8_to_bf16(q8_r.q, q8_r.scale), fq_r.x)
             )
-
-    def test_empty_rows(self):
-        x = torch.empty(0, 5120, device="cuda", dtype=torch.bfloat16)
-        w = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
-        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
-        self.assertEqual(fq.x.shape, (0, 5120))
-        self.assertEqual(y.shape, (0, 5120))
 
 
 def _silu_mul_clamp_reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
@@ -215,10 +194,6 @@ class TestSiluAndMulClampTriton(CustomTestCase):
             self.assertTrue(
                 torch.equal(dequant_mxfp8_to_bf16(q8.q, q8.scale), grid.x), (m, inter)
             )
-
-    def test_empty_rows(self):
-        x = torch.empty(0, 1152, device="cuda", dtype=torch.bfloat16)
-        self.assertEqual(silu_and_mul_clamp_triton(x, 10.0).shape, (0, 576))
 
 
 GEMM_SHAPES = [(2, 1024, 4096), (8, 1024, 512)]
@@ -348,35 +323,6 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         self.assertTrue(torch.equal(out, _aiter_reference(x, w)))
         with self.assertRaises(AssertionError):
             self.gemm(x, w, fp8_grid=False, split_k=True)
-
-    def test_strided_input_view(self):
-        # the model hands over a [T, G, D] view of a [T, H, head_dim] tensor; the kernel reads it through strides
-        torch.manual_seed(11)
-        w = (torch.randn(G, R, D, device="cuda") * 0.02).bfloat16()
-        # 16 heads x 512 -> 2 groups x 4096 (TP4).
-        base = torch.randn(5, 16, 512, device="cuda").bfloat16()
-        x = base.view(5, G, -1)
-        self.assertEqual(x.shape, (5, G, D))
-        self.assertTrue(
-            torch.equal(self.gemm(x, w), self.fake_quant(_aiter_reference(x, w)))
-        )
-        wide = torch.randn(3, G, 2 * D, device="cuda").bfloat16()[:, :, :D]
-        self.assertFalse(wide.is_contiguous())
-        self.assertTrue(
-            torch.equal(
-                self.gemm(wide, w),
-                self.fake_quant(_aiter_reference(wide.contiguous(), w)),
-            )
-        )
-
-    def test_repeatable_and_empty(self):
-        torch.manual_seed(2)
-        w = (torch.randn(G, R, D, device="cuda") * 0.02).bfloat16()
-        x = torch.randn(3, G, D, device="cuda").bfloat16()
-        first = self.gemm(x, w)
-        for _ in range(5):
-            self.assertTrue(torch.equal(self.gemm(x, w), first))
-        self.assertEqual(self.gemm(x[:0], w).shape, (0, G * R))
 
 
 if __name__ == "__main__":

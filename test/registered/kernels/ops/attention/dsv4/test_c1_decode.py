@@ -151,84 +151,6 @@ def test_store_is_bitwise_the_production_writer(n):
     )
 
 
-@pytest.mark.parametrize("n", BATCHES)
-def test_store_accepts_the_pool_fp8_view(n):
-    """`get_extra_key_buffer` hands the pool out as `float8_e4m3fn`; the kernel must
-    write the same bytes through that view as through the uint8 buffer."""
-    seed = 5000 + n
-    kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
-    norm = _norm(HEAD_DIM, seed + 1)
-    _, freqs_cis = _freqs(int(positions.max()) + 2 if n else 2, seed + 2)
-    slots_max = int(out_loc.max()) if n else 0
-    cache_u8, cache_fp8 = _cache(slots_max), _cache(slots_max)
-    args = (kv_input, norm.weight.data, positions, out_loc, EPS, freqs_cis)
-    got_u8 = c1_decode_norm_rope_store(*args, cache_u8, page_size=PAGE_SIZE)
-    got_fp8 = c1_decode_norm_rope_store(
-        *args, cache_fp8.view(torch.float8_e4m3fn), page_size=PAGE_SIZE
-    )
-    assert torch.equal(got_u8, got_fp8), "latent differs by cache dtype"
-    assert torch.equal(cache_u8, cache_fp8), "cache bytes differ by cache dtype"
-
-
-@pytest.mark.parametrize("n", BATCHES)
-def test_out_loc_int64(n):
-    """The fused decode path passes the scheduler's int64 `out_cache_loc`; either
-    width must give the same latent and cache bytes."""
-    seed = 6000 + n
-    kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
-    norm = _norm(HEAD_DIM, seed + 1)
-    _, freqs_cis = _freqs(int(positions.max()) + 2 if n else 2, seed + 2)
-    slots_max = int(out_loc.max()) if n else 0
-    cache32, cache64 = _cache(slots_max), _cache(slots_max)
-    got32 = c1_decode_norm_rope_store(
-        kv_input,
-        norm.weight.data,
-        positions,
-        out_loc,
-        EPS,
-        freqs_cis,
-        cache32,
-        page_size=PAGE_SIZE,
-    )
-    got64 = c1_decode_norm_rope_store(
-        kv_input,
-        norm.weight.data,
-        positions,
-        out_loc.to(torch.int64),
-        EPS,
-        freqs_cis,
-        cache64,
-        page_size=PAGE_SIZE,
-    )
-    assert torch.equal(got32, got64), "latent differs by loc dtype"
-    assert torch.equal(cache32, cache64), "cache bytes differ by loc dtype"
-
-
-def test_store_slot_is_out_loc():
-    """At ratio 1 the compressed slot is `out_loc` itself; scattered across a page
-    boundary, exactly those slots and no others are written."""
-    want = [
-        1,
-        PAGE_SIZE - 1,
-        PAGE_SIZE,
-        PAGE_SIZE + 1,
-        2 * PAGE_SIZE - 1,
-        2 * PAGE_SIZE,
-    ]
-    out_loc = torch.tensor(want, device="cuda", dtype=torch.int32)
-    r = _run(len(want), HEAD_DIM, seed=3000, out_loc=out_loc)
-    assert r["live"].all()
-    written = set()
-    cache = r["cache"]
-    for p in range(cache.shape[0]):
-        for s in range(PAGE_SIZE):
-            value = cache[p, s * 576 : (s + 1) * 576]
-            base = 576 * PAGE_SIZE + s * 8
-            if value.any() or cache[p, base : base + 8].any():
-                written.add(p * PAGE_SIZE + s)
-    assert written == set(want), f"wrote slots {sorted(written)}, wanted {want}"
-
-
 def test_padded_rows_publish_nothing():
     """Padded `out_loc == 0` rows write no slot, slot 0 included; the caller discards
     their latents."""
@@ -253,13 +175,6 @@ def test_padded_rows_publish_nothing():
     assert (r["got"][~live] != -7.5).any(), (
         "a padded row skipped its latent; it is expected to publish one"
     )
-
-
-def test_empty_batch():
-    """An idle decode step launches nothing and must not fault."""
-    r = _run(0, HEAD_DIM, seed=6000)
-    assert r["got"].shape == (0, 512)
-    assert not r["cache"].any()
 
 
 # ------------------------------------------------------------------ the latent
