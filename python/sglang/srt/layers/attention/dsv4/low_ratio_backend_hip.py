@@ -26,10 +26,14 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
+from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+    rope_tail_fake_quant_fp4,
+)
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
 )
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -480,6 +484,18 @@ def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
     return indexer.head_weights(x).contiguous()
 
 
+def _indexer_queries(indexer, q_lora, freqs_cis, pos):
+    """`indexer.queries(q_lora, freqs_cis[pos])`; for bf16 rows the fused RoPE launch
+    gathers `freqs_cis[pos]` itself."""
+    q, _ = indexer.wq_b(q_lora)
+    q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
+    if q.dtype == torch.bfloat16:
+        return rope_tail_fake_quant_fp4(
+            q, freqs_cis, indexer.rope_head_dim, positions=pos
+        )
+    return _rope_fq4(q, freqs_cis[pos], indexer.rope_head_dim)
+
+
 def _indexer_inputs(layer, x, q_lora, pos):
     """(payload, scale) query in the FlyDSL layout and the pre-scaled head weights."""
     indexer = layer.indexer
@@ -506,8 +522,7 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
-    # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
-    q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
+    q = _indexer_queries(indexer, q_lora, layer.freqs_cis, pos)  # [T, H, 128] fp4 grid
     q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
     return q_fp4, q_scale, weights
