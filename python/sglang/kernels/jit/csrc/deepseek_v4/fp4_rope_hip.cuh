@@ -1,8 +1,6 @@
-/// Index-K write of `fp4_rope.cuh` into the split FlyDSL layout of the ROCm low-ratio indexer:
-/// payload `[npages, 1, 4, kPageSize, 16]` uint8 (chunk `c` holds elements `[32c, 32c + 32)`) and
-/// ue8m0 exponents `[npages, 1, 4, kPageSize]` uint8 with the slot axis transposed as a 16 x 4
-/// tile -- the bytes `fp4_indexer_hip.store_fp4_index_k_cache_split` writes. Norm, RoPE and pack
-/// repeat `flash_index_k_kernel` up to the store.
+/// Index-K write of `fp4_rope.cuh` into the split FlyDSL layout: payload `[npages, 1, 4, kPageSize, 16]`
+/// (chunk `c` holds elements `[32c, 32c + 32)`) and ue8m0 exponents `[npages, 1, 4, kPageSize]` with
+/// the slot axis transposed as a 16 x 4 tile -- the bytes `store_fp4_index_k_cache_split` writes.
 
 #pragma once
 

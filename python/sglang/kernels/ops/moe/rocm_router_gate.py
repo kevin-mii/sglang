@@ -1,10 +1,5 @@
-"""The DeepSeek-V4 MoE router at decode row counts on ROCm: a split-K bf16 GEMV
-(:func:`rocm_router_gemv_split_k`, fp32 partials) and a sqrtsoftplus top-k gate
-(:func:`rocm_router_gate`) that sums the partials in a fixed order and reproduces aiter's
-``topk_gating_kernel_opt`` bit for bit, ties included. Serves ``M <= ROCM_ROUTER_MAX_TOKENS``
-(decode batches and DSpark target-verify rows); :mod:`rocm_router_gate_sort` runs the gate
-together with aiter's MoE sorting in one launch.
-"""
+"""DeepSeek-V4 MoE router at decode row counts on ROCm: split-K bf16 GEMV partials and a
+sqrtsoftplus top-k gate bitwise aiter's ``topk_gating_kernel_opt``, ties included."""
 
 from __future__ import annotations
 

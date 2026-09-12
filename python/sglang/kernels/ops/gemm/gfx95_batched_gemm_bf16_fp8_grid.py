@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batched bf16 GEMM ``Y[g] = X[g] @ W[g]^T`` with the consumer's fp8-grid rounding in the
-epilogue: the DeepSeek-V4 ``wo_a`` absorb GEMM at decode on gfx950. Requires ``R % 32 == 0``.
-
-Two batch-invariant regimes. Above ``_SPLIT_K_MAX_M`` rows: aiter's ``_batched_gemm_bf16_kernel``
-loop at a fixed 16 x 32 x 512 tile, bitwise aiter's (with ``fp8_grid`` bitwise
-``fake_quant_fp8_activation(batched_gemm_bf16(...))``). At or below: the same tile split eight
-ways along K, fp32 partials, then a reduce launch with the epilogue, which fills the machine at
-decode row counts; the fixed sum order keeps rows batch-invariant, the bits differ from aiter's
-single chain by the reassociation.
-"""
+"""Batched bf16 GEMM ``Y[g] = X[g] @ W[g]^T`` with the consumer's fp8-grid rounding in the epilogue
+(the DeepSeek-V4 ``wo_a`` absorb GEMM on gfx950). Above ``_SPLIT_K_MAX_M`` rows aiter's tile loop,
+bitwise aiter's; at or below, the same tile split eight ways along K and reduced in a fixed order."""
 
 from __future__ import annotations
 
@@ -24,7 +17,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_round
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 16, 32, 512
 _NUM_WARPS, _NUM_STAGES, _WAVES_PER_EU, _MFMA_NONKDIM = 2, 2, 2, 16
 _CACHE_MODIFIER = ".cg"
-# split-K regime (see the module docstring): 8 splits of 256-wide K steps, up to this many rows
+# 8 splits of 256-wide K steps fill the machine up to this many rows
 _SPLIT_K, _SPLIT_K_BLOCK_K, _SPLIT_K_MAX_M = 8, 256, 64
 
 

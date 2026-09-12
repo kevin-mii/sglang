@@ -1,7 +1,5 @@
-"""Single-launch replacements for the torch glue around the DeepSeek-V4.1 sparse attention
-metadata on HIP. bs-1 decode is launch-bound, so a chain of small aten kernels costs its launch
-count; every kernel here reproduces the torch expression it replaces bit for bit, quoted in its
-docstring."""
+"""Single-launch replacements for the torch glue around the DeepSeek-V4.1 sparse attention metadata
+on HIP; every kernel reproduces the torch expression quoted in its docstring bit for bit."""
 
 from __future__ import annotations
 

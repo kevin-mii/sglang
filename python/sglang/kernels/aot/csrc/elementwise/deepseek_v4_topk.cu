@@ -46,9 +46,7 @@ constexpr size_t kSMEM = 48 * 1024;  // bytes
 #endif
 static_assert(kSMEM % (2 * sizeof(int32_t)) == 0, "kSMEM must be a multiple of 8 bytes.");
 
-// Every row reads scores[0, seq_len) and page_table[0, seq_len >> page_bits]: seq_lens[b] must not exceed
-// scores.size(1) nor page_table.size(1) << page_bits, or the row selects from memory past its end
-// (undefined contents, so also a slot the sort epilogue cannot recognise as padding).
+// seq_lens[b] must not exceed scores.size(1) or page_table.size(1) << page_bits: a row reads up to its length
 struct TopKParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;

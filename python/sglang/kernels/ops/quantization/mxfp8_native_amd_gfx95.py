@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints.
-
-The weight stays fp8, permuted once at load into the scaled-MFMA lane order
-(``shuffle_mxfp8_weight``) with its block scales as ue8m0 bytes; a bf16 copy exists only for
-shapes whose ``large_m_plan`` picks hipBLASLt. Every path multiplies the CUDA MXFP8 route's
-operands with a tile-fixed sum order, so calls are repeatable and rows batch-invariant within one
-M range: ``M <= 32`` runs ``mxfp8_gemv`` with the per-shape config from
-``mxfp8_gemv_gfx95_configs.json``, larger M the ``tl.dot_scaled`` GEMM or hipBLASLt bf16 per
-``large_m_plan``. gfx950 only; ``K % 128 == 0``, ``N % 32 == 0``.
-"""
+"""gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints: the weight stays fp8 in
+scaled-MFMA lane order; ``M <= 32`` runs the skinny gemv kernel, larger M the ``tl.dot_scaled`` GEMM
+or hipBLASLt bf16 per the tuned table in ``mxfp8_gemv_gfx95_configs.json``."""
 
 from __future__ import annotations
 
@@ -260,7 +253,6 @@ def prepare_mxfp8_native_weight(
     return shuffled, scale_ue8m0, weight_bf16
 
 
-# Triton tl.dot_scaled GEMM over the shuffled weight
 @triton.jit
 def _mxfp8_shuffled_gemm_kernel(
     x_ptr,

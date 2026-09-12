@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Split-KV combine for aiter's gfx950 gluon sparse decode kernel
-(``pa_decode_sparse(..., skip_reduce=True)``), one program per (query, head), with the
-DeepSeek-V4 inverse RoPE of the attention output folded in; the bf16 output is bitwise
-``_pa_decode_sparse_reduce``'s.
-"""
+"""Split-KV combine for aiter's gfx950 sparse decode kernel, bitwise ``_pa_decode_sparse_reduce``,
+with the DeepSeek-V4 inverse RoPE folded in."""
 
 from __future__ import annotations
 

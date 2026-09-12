@@ -1,7 +1,4 @@
-"""DeepSeek-V4 shared-expert activation on ROCm: clamp both SwiGLU branches, then
-silu(gate) * up, in one launch; the epilogue can also put the result on the fp8 e4m3
-grid with a per-32 ue8m0 scale (the gfx950 dense route's `fake_quant_fp8_activation` rule).
-"""
+"""ROCm SwiGLU with clamped branches in one launch, optionally quantized onto the fp8 grid."""
 
 from __future__ import annotations
 

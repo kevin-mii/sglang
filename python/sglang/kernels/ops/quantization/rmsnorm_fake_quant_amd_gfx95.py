@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RMSNorm fused with the fp8 e4m3 fake-quant of the gfx950 bf16-dequant route: the row is
-normalized in fp32, rounded to bf16 like the unfused norm, then put on the fp8 grid with the
-per-32 ue8m0 rule of ``fake_quant_fp8_activation``; the un-quantized bf16 norm output is written
-too when a second consumer needs it. One program per row with a reduction tree fixed by the row
-width, so a row's result is batch-invariant and repeatable; only the fp32 sum-of-squares order
-differs from the aiter / torch norm.
-"""
+"""RMSNorm fused with the per-32 ue8m0 fp8 e4m3 fake-quant of the gfx950 bf16-dequant route; one
+program per row with a reduction tree fixed by the row width, so a row is batch-invariant."""
 
 from __future__ import annotations
 

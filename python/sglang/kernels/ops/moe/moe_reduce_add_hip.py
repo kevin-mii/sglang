@@ -1,8 +1,5 @@
-"""The MoE top-k reduction with the shared-expert add folded in (ROCm): ``out[t] = alpha *
-sum_k valid[t, k] * x[t, k] + shared[t]``, fp32 accumulation over the slots in ascending order (as
-aiter's ``moe_reduction_kernel`` sums them), one rounding at the end; replaces aiter's separate
-reduce launch and the model's shared-expert add. Per-row fixed order, so a row does not depend on
-the batch."""
+"""MoE top-k reduction with the shared-expert add folded in (ROCm): fp32 over the slots in
+ascending order as aiter's ``moe_reduction_kernel`` sums them, one rounding at the end."""
 
 from __future__ import annotations
 

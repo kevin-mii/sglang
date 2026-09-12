@@ -1,8 +1,5 @@
-"""HIP fused mHC sublayer boundary: `hc_boundary_fused`, hc_post + collapse +
-mixing statistics in one launch, then the reduce + sinkhorn kernel shared with
-`hc_mix_stats_sinkhorn`. `hc_boundary_fused_deferred` leaves the reduce + sinkhorn
-as `HcCoefficients`, which the layer's next RMSNorm launch hosts
-(`rmsnorm_with_sinkhorn`) so decode pays no separate launch for it."""
+"""HIP fused mHC sublayer boundary: hc_post + collapse + mixing statistics in one launch, with the
+reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (``HcCoefficients``)."""
 
 from typing import Optional, Tuple, Union
 

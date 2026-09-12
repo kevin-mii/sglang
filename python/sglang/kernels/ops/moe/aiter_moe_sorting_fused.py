@@ -1,8 +1,5 @@
-"""One-launch replacement for aiter's MoE sorting (``moe_sorting`` in ``aiter/fused_moe.py``)
-at decode row counts: the same five tensors bit for bit, with the padded-row fills (ids to 0,
-weights to 0.0) folded into the launch. Meant for ``M <= AITER_FUSED_SORT_MAX_TOKENS``; the GEMM
-stages read the same sorted lists, so their outputs are unchanged.
-"""
+"""One-launch replacement for aiter's ``moe_sorting`` at decode row counts, bitwise its five outputs,
+with the padded-row fills folded in."""
 
 from __future__ import annotations
 

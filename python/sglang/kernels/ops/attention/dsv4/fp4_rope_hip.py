@@ -1,8 +1,4 @@
-"""ROCm-only index-K store of the DeepSeek-V4 FP4 indexer into the split FlyDSL layout.
-
-The HIP counterpart of ``index_k_norm_rope_pack_store`` in fp4_rope.py: the same
-rmsnorm + RoPE + FP4 pack, written as separate payload and scale buffers.
-"""
+"""ROCm index-K store of the FP4 indexer into the split FlyDSL layout (payload and scale buffers)."""
 
 from __future__ import annotations
 
