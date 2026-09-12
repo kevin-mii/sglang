@@ -2356,9 +2356,20 @@ def select_experts(
     # slots on the marker) and places that marker at id num_experts, which the
     # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
     # 384 routed experts on EP8, where the valid ids are 0..391.
+    #
+    # The same holds for every aiter path: _post_process_topk_ids appends the
+    # shared expert (fused_append_shared_experts, weight 1.0) whenever
+    # `_use_aiter and num_fused_shared_experts > 0`, and the gate is already
+    # asked for K_routed. Letting the JIT gate (moe_fused_gate) emit its own
+    # marker too made MiniMax-M3 on ROCm run 3 routed experts instead of 4 and
+    # count the shared expert twice (id 128 at weight 1.0 in two columns):
+    # GSM8K-500 0.81 fused vs 0.88 unfused.
     num_fused_shared_experts_for_gate = (
         0
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        if (
+            has_per_rank_fused_shared_slots(num_fused_shared_experts)
+            or _use_aiter
+        )
         else num_fused_shared_experts
     )
     if use_grouped_topk:
