@@ -3,6 +3,7 @@
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -317,6 +318,38 @@ class TestAiterSparseBackend(CustomTestCase):
         self.assertEqual(
             list(core._aiter_sparse_masked_indices), [(1, 0, (), None, None)]
         )
+
+    def test_indexer_dispatch_drops_the_ratio_folds(self):
+        """Every indexer body rewrites the ratio's page indices, so the dispatcher must
+        drop that ratio's folded lists before any body runs."""
+        import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as module
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        dropped, calls = [], []
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(drop_folded_sparse_indices=dropped.append)
+        )
+        backend._low_ratio_index_topk_torch = lambda *a, **k: calls.append("torch")
+        layer = SimpleNamespace(compress_ratio=2)
+        with mock.patch.object(
+            module,
+            "low_ratio_index_topk_hip_decode",
+            lambda *a, **k: calls.append("decode"),
+        ):
+            for mode in (ForwardMode.DECODE, ForwardMode.EXTEND):
+                forward_batch = SimpleNamespace(
+                    forward_mode=mode, seq_lens_cpu=None, extend_seq_lens_cpu=None
+                )
+                backend._low_ratio_index_topk(
+                    layer, None, None, None, None, forward_batch
+                )
+        self.assertEqual(dropped, [2, 2])
+        # extend without CPU lengths falls back to the torch oracle
+        self.assertEqual(calls, ["decode", "torch"])
 
 
 SWA, TOPK = 128, 512
