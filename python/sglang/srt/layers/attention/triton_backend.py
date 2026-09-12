@@ -86,6 +86,14 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+# Decode steps go through the grouped-head verify kernel only for head dims
+# whose block / split configuration was validated on the one-row decode shape
+# (verify_mla._BLOCK_CONFIG / _SPLIT_CONFIG, MiniMax-M3 dense layers and its
+# EAGLE3 draft). Other grouped-head models (e.g. Qwen3.5, head_dim 256) keep
+# the per-head decode kernel until measured.
+_DECODE_SHARED_KV_HEAD_DIMS = (128,)
+
+
 def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
@@ -242,6 +250,18 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # Decode steps of the same shapes (draft decode at topk 1, dense
+        # layers) reuse that kernel with one extend row per request; the page
+        # table already holds the new token, so the prefix is trimmed by one.
+        self.use_decode_shared_kv = (
+            self.use_verify_shared_kv
+            and not envs.SGLANG_DISABLE_TRITON_DECODE_SHARED_KV.get()
+        )
+        self._decode_shared_kv_qo_indptr = (
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+            if self.use_decode_shared_kv
+            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -2317,6 +2337,42 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        if (
+            self.use_decode_shared_kv
+            and not self.use_mla
+            and layer.qk_head_dim in _DECODE_SHARED_KV_HEAD_DIMS
+            and layer.qk_head_dim == layer.v_head_dim
+            and score_mod is None
+            and sinks is None
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= 0)
+            and k is not None
+            and v is not None
+            and q.shape[0] + 1 <= self._decode_shared_kv_qo_indptr.shape[0]
+            and self.verify_shared_kv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                1,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                max_bs=self.req_to_token_pool.size,
+                kv_len_adjust=-1,
+            )
+        ):
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
