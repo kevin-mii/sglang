@@ -351,7 +351,7 @@ def _freqs(device, max_pos=8192, seed=0):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     angles = torch.rand(max_pos, ROPE // 2, generator=gen) * 2 * math.pi
     freqs_cis = torch.polar(torch.ones_like(angles), angles).to(device)
-    return freqs_cis, torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    return torch.view_as_real(freqs_cis).flatten(-2).contiguous()
 
 
 def _model_inverse_rope(x, freqs_real, positions):
@@ -441,7 +441,7 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         )
 
         dev = torch.device("cuda")
-        _, fr = _freqs(dev)
+        fr = _freqs(dev)
         for batch, heads, splits, pos_dtype in [
             (1, 16, 4, torch.int64),
             (5, 16, 4, torch.int32),

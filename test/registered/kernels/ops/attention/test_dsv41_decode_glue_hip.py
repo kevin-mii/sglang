@@ -46,7 +46,7 @@ def _seed(seed: int) -> random.Random:
     return random.Random(seed)
 
 
-def _topk_inputs(rng, bs, width, topk, page_size, lens):
+def _topk_inputs(bs, width, page_size, lens):
     # a row longer than its logits reads past the tensor (scores[0, len) and
     # page_table[0, len // page_size]), and what it selects there differs by launch
     assert max(lens, default=0) <= width, (lens, width)
@@ -82,9 +82,7 @@ def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: b
                 if n <= width
             ]
             lens = [rng.choice(edges) for _ in range(bs)]
-            scores, seq_lens, page_table = _topk_inputs(
-                rng, bs, width, topk, page_size, lens
-            )
+            scores, seq_lens, page_table = _topk_inputs(bs, width, page_size, lens)
             # the unsorted transform, then sort_selection_rows' order (by position with
             # raw indices, by slot without); the Triton sort for a power-of-two k
             ref = torch.empty(bs, topk, dtype=torch.int32, device=DEVICE)
@@ -148,9 +146,7 @@ def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bo
         lens = [
             rng.choice([0, 1, 300, topk, topk + 5, 3000, width]) for _ in range(rows)
         ]
-        scores, seq_lens, page_table = _topk_inputs(
-            rng, rows, width, topk, page_size, lens
-        )
+        scores, seq_lens, page_table = _topk_inputs(rows, width, page_size, lens)
         cands = _candidates(
             rng, rows, width // block_size, topk_blocks, block_size, seq_lens
         )
