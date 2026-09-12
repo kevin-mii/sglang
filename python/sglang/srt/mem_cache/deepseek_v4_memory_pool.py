@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import deepseek_v4_index_k_hip as index_k_hip
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -451,17 +452,8 @@ class DeepSeekV4IndexerPool(KVCache):
         cache_k: torch.Tensor,
     ) -> None:
         if self.uses_aiter_fp4_layout:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-                store_fp4_index_k_cache_split,
-            )
-
-            return store_fp4_index_k_cache_split(
-                cache_k,
-                self.index_k_payload_buffer[layer_id - self.start_layer],
-                self.index_k_scale_buffer[layer_id - self.start_layer],
-                loc,
-                page_size=self.page_size,
-                rne=self.index_k_rne,
+            return index_k_hip.store_fp4_index_k(
+                self, layer_id - self.start_layer, loc, cache_k
             )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
@@ -483,15 +475,8 @@ class DeepSeekV4IndexerPool(KVCache):
         [page_size * 64 payload | page_size * 4 scale bytes]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         if self.uses_aiter_fp4_layout:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-                read_fp4_index_k_split,
-            )
-
-            return read_fp4_index_k_split(
-                self.index_k_payload_buffer[layer_id - self.start_layer],
-                self.index_k_scale_buffer[layer_id - self.start_layer],
-                slots,
-                page_size=self.page_size,
+            return index_k_hip.read_fp4_index_k(
+                self, layer_id - self.start_layer, slots
             )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
@@ -514,22 +499,9 @@ class DeepSeekV4IndexerPool(KVCache):
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         if self.uses_aiter_fp4_layout:
-            # ROCm keeps payload and packed ue8m0 scales in two buffers
-            if slots is None:
-                slots = torch.arange(self.size, device=self.device)
-            payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
-            payload_u8 = payload.view(torch.uint8)  # [n, 64]
-            scale_exps = torch.stack(
-                [(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1
-            )  # [n, 4]
-            fp4_codes = torch.stack(
-                [payload_u8 & 0x0F, (payload_u8 >> 4) & 0x0F], dim=-1
-            )  # [n, 64, 2]
-            dequant = DSV4_DEQUANT_FP4_TABLE.to(payload_u8.device)[
-                fp4_codes.long()
-            ].flatten(1)  # [n, 128]
-            scales = torch.exp2(scale_exps.float() - 127).repeat_interleave(32, dim=-1)
-            return (dequant * scales).to(torch.bfloat16)
+            return index_k_hip.dequant_fp4_index_k(
+                self, layer_id - self.start_layer, slots
+            )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)
