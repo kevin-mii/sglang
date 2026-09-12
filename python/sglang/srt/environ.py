@@ -1088,6 +1088,13 @@ class Envs:
     # at few extend rows and halved KV traffic at many rows.
     SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS = EnvInt(8192)
+    # Within the long-prefix EXTEND route, serve batches whose largest request
+    # has at least MIN_ROWS extend rows with aiter's CK paged batch-prefill
+    # kernel (prefix + chunk in one causal paged call) instead of the
+    # split-prefix Triton kernel. ROCm only; fp8 (per-tensor scales) or bf16
+    # KV at page size 1. Below the threshold the CK kernel is slower.
+    SGLANG_USE_AITER_EXTEND_LONG_PREFIX = EnvBool(False)
+    SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS = EnvInt(2048)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
