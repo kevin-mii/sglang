@@ -841,6 +841,7 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    packed_queries: int = 1,
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -862,6 +863,28 @@ def flash_decode_with_topk_idx(
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
+    # Packed scoring (chain verify): ``packed_queries`` consecutive rows belong to
+    # one request and share its K cache, so score them in ONE pass as extra q
+    # heads against the request's longest causal length (K reads dominate the
+    # score kernel; the block max/lse over at most ``packed_queries - 1``
+    # not-yet-visible keys of the tail block only affects that block, and the
+    # per-row top-k below still bounds each row by its own length). The top-k
+    # then runs per original row. Score-only layers only (disable_index_value).
+    pack = int(packed_queries) if packed_queries else 1
+    if pack > 1:
+        assert disable_index_value and not use_dense_main_attn
+        assert batch_size % pack == 0
+        rows_seq_lens, rows_slot_ids, rows_batch, rows_heads = (
+            seq_lens,
+            slot_ids,
+            batch_size,
+            num_q_heads,
+        )
+        batch_size = batch_size // pack
+        q = q.reshape(batch_size, pack * num_q_heads, head_dim)
+        num_q_heads = pack * num_q_heads
+        seq_lens = rows_seq_lens.view(batch_size, pack)[:, -1].contiguous()
+        slot_ids = rows_slot_ids.view(batch_size, pack)[:, 0].contiguous()
     gqa_group_size = num_q_heads // num_kv_heads
     # sm scale
     if sm_scale is None:
@@ -1008,6 +1031,16 @@ def flash_decode_with_topk_idx(
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
+    if pack > 1:
+        # [pack*H, bs, blocks] -> [H, bs*pack, blocks] with request-major rows.
+        H = rows_heads
+        score = (
+            score.view(pack, H, batch_size, score.shape[2])
+            .permute(1, 2, 0, 3)
+            .reshape(H, batch_size * pack, score.shape[2])
+        )
+        batch_size, num_q_heads = rows_batch, rows_heads
+        seq_lens, slot_ids = rows_seq_lens, rows_slot_ids
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (

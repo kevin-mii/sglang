@@ -396,6 +396,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=forward_batch.seq_lens.device,
                 )
+        # Verify top-k reuse (GPU chain verify): one persistent buffer per
+        # (bs*ndt) row count, like the decode buffer above.
+        if (
+            self.index_cache_enabled
+            and forward_batch.forward_mode.is_target_verify()
+            and self.speculative_num_draft_tokens
+        ):
+            rows = forward_batch.seq_lens.shape[0] * int(self.speculative_num_draft_tokens)
+            if rows > 0 and rows not in self._decode_topk_buf:
+                _nkv = self.kv_pool.main_pool.head_num
+                self._decode_topk_buf[rows] = torch.empty(
+                    (_nkv, rows, self.topk_blocks * self._idx_group_size),
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
         # Per-forward cache of the layer-invariant prefill seqblock trio.
         self._prefill_seqblock_meta = None
         if self.is_npu:
@@ -1438,6 +1453,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # host-derived otherwise); make sure the draft tail is covered.
         max_seqlen = int(self._max_seqlen_k) + int(ndt)
 
+        # Index top-k reuse across layers, as in forward_decode: the group's
+        # source layer scores + publishes, the other layers skip step 1.
+        _use_reuse = self.index_cache_enabled and disable_value
+        _topk_buf = self._decode_topk_buf.get(num_tokens) if _use_reuse else None
+        _cached_topk = None
+        _want_topk = False
+        if _use_reuse and _topk_buf is not None:
+            if self._topk_is_source.get(layer.layer_id, True):
+                _want_topk = True
+            else:
+                _cached_topk = _topk_buf
+
         idx_o, o = minimax_sparse_decode(
             q,
             None,
@@ -1467,6 +1494,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
+            cached_topk_idx=_cached_topk,
+            topk_out=_topk_buf if _want_topk else None,
+            # Score the request's ndt draft queries in one index pass.
+            packed_queries=int(ndt) if disable_value else 1,
         )
         return idx_o, o
 
