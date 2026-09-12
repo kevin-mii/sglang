@@ -554,9 +554,8 @@ class DSV4AttnMetadata:
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
         ).items():
             setattr(self, name, value)
-        # Decode too: without raw indices the AOT top-k orders a row by slot, so the
-        # sparse kernel's summation order follows the physical pages a request landed
-        # on (a radix prefix hit moves them), and the same context gives different bits.
+        # decode too: without raw indices the top-k orders a row by slot, so the summation
+        # order would follow where a radix prefix hit placed the pages
         self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
@@ -585,9 +584,7 @@ class DSV4Metadata:
     low_ratio_pos_i64: Optional[torch.Tensor] = None
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
-    # Two-level indexer state of the shared torch prefill oracle
-    # (`_low_ratio_index_topk_torch`, dsv4/candidate_indexer.py); the HIP paged
-    # paths publish on `candidate_masks` instead.
+    # published by the torch reference indexer; the HIP paged paths use `candidate_masks`
     candidate_metadata: Optional[CandidateMetadata] = None
     # The CUDA sparse-prefill cache has no HIP counterpart; always None here.
     sparse_prefill_cache: None = None
@@ -610,8 +607,7 @@ class DSV4Metadata:
     # AITER's rope kernels require int64 positions while the core metadata keeps
     # them int32, so widen once per forward instead of once per C4 layer.
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
-    # Set only on the metadata built for the late layers under decoder SWA
-    # bounded replay; None everywhere else.
+    # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
 
     @property
@@ -801,8 +797,7 @@ class DeepseekV4HipRadixBackend(
                 raise NotImplementedError(
                     "decoder SWA bounded replay on HIP does not support attention CP"
                 )
-        # Built with the regular prefill metadata; the model switches onto it
-        # after the last kv_source layer (enter_late_layer_tail).
+        # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -1822,9 +1817,7 @@ class DeepseekV4HipRadixBackend(
                 _candidate_tail_rows(mask, t)
                 for mask, t in zip(self.candidate_masks, tail.extend_seq_lens_cpu)
             ]
-        # The last index-source layer before the switch published its top-k into
-        # the full metadata's buffers; the consumer layers after the switch read
-        # the tail metadata's, so carry the tail rows over.
+        # the consumers after the switch read the tail buffers, so carry the last source's rows over
         full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
         for ratio in tail_core.low_ratios:
@@ -2264,8 +2257,7 @@ class DeepseekV4HipRadixBackend(
         """
         tail = getattr(self.forward_metadata, "late_layer_tail", None)
         if tail is not None:
-            # The tail's rows are a subset of the extend, so the full
-            # out_cache_loc below would be the wrong length; the tail owns its own.
+            # the tail's rows are a subset of the extend, so it owns its own store target
             return tail.swa_out_cache_loc
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)

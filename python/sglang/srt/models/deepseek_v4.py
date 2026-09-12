@@ -2254,8 +2254,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        # a fused wo_a fork already returned [T, G * R] on wo_b's input grid: the
-        # Blackwell Mxfp8SwizzledInput or the gfx950 fp8-grid wrapper
+        # a fused wo_a fork already returned [T, G * R] on wo_b's input grid, wrapped
         o, _ = self.wo_b(o if not isinstance(o, torch.Tensor) else o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)

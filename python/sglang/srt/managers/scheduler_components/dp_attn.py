@@ -97,10 +97,8 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
-    # Longest sequence this rank runs this step (0 when idle). Decode CUDA
-    # graphs keyed by context length (the DSA indexer variants) must be replayed
-    # from the same graph on every DP rank, so the max over the group drives
-    # the choice.
+    # longest sequence this rank runs this step (0 when idle); a decode graph keyed by
+    # context length must replay the same variant on every DP rank, so the group max picks it
     max_seq_len: int = 0
 
     # some gathered elements
