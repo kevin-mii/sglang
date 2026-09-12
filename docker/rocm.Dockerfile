@@ -569,9 +569,9 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry-pick ROCm/aiter#5283 (7b481fb) and #5279 (24a62b1): gfx950 DSV4 a8w8 blockscale bpreshuffle configs; drop at the next aiter bump
-# apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 # aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage 1 left LDS-DMA loads in flight across the K-step barrier, so a8w4 was not bitwise repeatable; drop at the aiter bump that carries the fix
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
+# apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
