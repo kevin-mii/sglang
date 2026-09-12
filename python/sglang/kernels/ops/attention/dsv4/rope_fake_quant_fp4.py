@@ -132,10 +132,8 @@ def rope_tail_fake_quant_fp4(
 ) -> torch.Tensor:
     """RoPE and FP4 round-trip: per-16 E4M3 for compressed KV, per-32 UE8M0 otherwise.
 
-    x: [T, ..., D] contiguous in the last dim; freqs: complex [T, rope_dim // 2],
-    or with ``positions`` ([T] int) the whole table [N, rope_dim // 2] that row t
-    reads at positions[t] (the same values as ``freqs[positions]``, without the
-    gather launch; every position must be below N).
+    x: [T, ..., D] contiguous in the last dim; freqs: complex [T, rope_dim // 2], or with
+    ``positions`` ([T] int) the whole table that row t reads at ``positions[t]``.
     """
     x = x.contiguous()
     if compressed_kv:

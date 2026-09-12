@@ -819,16 +819,10 @@ def index_q_pack_weights_hip(
     *,
     num_heads: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The HIP index-Q inputs in one launch: ``(q_fp4 [T, H, 64] int8, q_scale
-    [T, 1, 4, 16, 4] uint8, weights [T, H] bf16)``, bitwise ``pack_fp4_query_flydsl(
-    _rope_fq4(q.view(T, H, 128), freqs_cis[positions], rope_dim))`` and
-    ``rocm_indexer_head_weights``'s reduce of ``head_weight_partials``.
-
-    ``q`` is the ``[T, H * 128]`` bf16 ``wq_b`` output, ``freqs_cis`` the complex64
-    ``[max_pos, rope_dim // 2]`` table (gathered by ``positions`` in the kernel),
-    ``head_weight_partials`` the ``[split_k, T, H]`` fp32 partials of
-    ``rocm_router_gemv_split_k``. ``H % 16 == 0 and H <= 64``.
-    """
+    """The HIP index-Q inputs in one launch: ``(q_fp4 [T, H, 64] int8, q_scale [T, 1, 4, 16, 4]
+    uint8, weights [T, H] bf16)``, bitwise ``pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
+    freqs_cis[positions], rope_dim))`` and ``rocm_indexer_head_weights``'s reduce of the
+    ``[split_k, T, H]`` fp32 ``head_weight_partials``."""
     T = q.shape[0]
     H = num_heads
     assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
@@ -930,10 +924,8 @@ def _sort_selection_rows_kernel(
 def sort_selection_rows(
     page_indices: torch.Tensor, raw_indices: Optional[torch.Tensor] = None
 ) -> None:
-    """Order every row of a top-k selection ascending by position, -1 padding last, in place: the
-    sparse attention sums in the order given, so an unordered row is a different fp32 sum per launch.
-    ``page_indices`` int32 ``[rows, k]``, ``k`` a power of two; ``raw_indices`` the positions, or
-    None to order by slot."""
+    """Order every row of a top-k selection ascending by position (by slot without ``raw_indices``),
+    -1 padding last, in place: the sparse attention sums in the order given."""
     rows, k = page_indices.shape
     assert k & (k - 1) == 0, k
     assert page_indices.stride(1) == 1 and (

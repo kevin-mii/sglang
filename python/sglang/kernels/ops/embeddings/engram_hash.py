@@ -120,13 +120,8 @@ def engram_commit_decode_history(
     out_loc: Optional[torch.Tensor],
     pad_row: int,
 ) -> None:
-    """The decode commit of ``EngramHasher.forward`` in one launch::
-
-        rows = where(out_loc == 0, pad_row, req_slots) if out_loc is not None else req_slots
-        history[rows] = tokens[:, :n - 1].flip(-1).to(history.dtype)
-
-    ``tokens`` is the hash kernel's ``[bs, n]`` shift table (shift 0 = the token itself);
-    padded rows all land on the spare ``pad_row``, whose contents are never read."""
+    """The decode commit of ``EngramHasher.forward`` in one launch: ``history[rows] =
+    tokens[:, :n - 1].flip(-1)`` with padded rows (``out_loc == 0``) redirected to ``pad_row``."""
     bs = req_slots.numel()
     width = history.shape[1]
     if bs == 0 or width == 0:

@@ -98,11 +98,8 @@ def _router_gemv_split_k_kernel(
 
 
 def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """``x[M, K] @ w[N, K].T`` as fp32 split-K partials ``[K // 512, M, N]``.
-
-    Sum the partials over dim 0 in order (:func:`rocm_router_reduce_partials`,
-    or the fused gate) to get the logits. ``M <= ROCM_ROUTER_MAX_TOKENS``.
-    """
+    """``x[M, K] @ w[N, K].T`` as fp32 split-K partials ``[K // 512, M, N]``, summed over dim 0 in
+    order by :func:`rocm_router_reduce_partials` or the fused gate."""
     M, K = x.shape
     N, K_w = w.shape
     assert K == K_w and K % _BLOCK_K == 0 and N % _BLOCK_N == 0
@@ -399,12 +396,9 @@ def rocm_router_gate(
     *,
     partials: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """aiter ``topk_gating(..., score_func="sqrtsoftplus")`` for 384 experts.
-
-    Without ``partials``, ``gating_output`` ([M, 384] fp32 or bf16) is read; with ``partials``
-    their fixed-order fp32 sum is the gating input and is written into ``gating_output`` (fp32
-    [M, 384]). Returns fp32 weights and int32 ids, both [M, topk], identical to aiter's.
-    """
+    """aiter ``topk_gating(..., score_func="sqrtsoftplus")`` for 384 experts: fp32 weights and int32
+    ids ``[M, topk]``; with ``partials`` their fixed-order sum is gated and written into
+    ``gating_output``."""
     M, num_experts = gating_output.shape
     assert num_experts == _GATE_NUM_EXPERTS and 0 < topk <= _MAX_TOPK
     assert gating_output.stride(1) == 1

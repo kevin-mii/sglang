@@ -48,11 +48,8 @@ def _hc_mix_reduce_sinkhorn_row(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """HIP form of ``_hc_mix_reduce_sinkhorn_kernel`` for one row: one vector load per operand
-    over all slices; the tree order depends on NUM_SLICES only, never on M. ``scratch_ptr``
-    ([m, 32] fp32) round-trips the reduced mixes so the sinkhorn starts from a plain blocked
-    layout.
-    """
+    """``_hc_mix_reduce_sinkhorn_kernel`` for one row with a tree fixed by NUM_SLICES; ``scratch_ptr``
+    ([m, 32] fp32) round-trips the reduced mixes so the sinkhorn starts from a plain layout."""
     j = tl.arange(0, HC)
     jj = j[:, None]
     kk = j[None, :]
@@ -294,10 +291,8 @@ def hc_mix_reduce_sinkhorn_vec(
 
 
 class HcCoefficients:
-    """One boundary's mixing coefficients, held as the split-K partials of
-    ``_hc_boundary_partials`` until their reduce + sinkhorn runs: hosted by the layer's
-    next norm launch (``rmsnorm_with_sinkhorn``) or, on first access of ``pre`` /
-    ``post`` / ``comb``, launched alone (``materialize``)."""
+    """One boundary's mixing coefficients, held as split-K partials until ``rmsnorm_with_sinkhorn``
+    hosts their reduce + sinkhorn or the first access of ``pre`` / ``post`` / ``comb`` launches it."""
 
     def __init__(
         self,
@@ -387,10 +382,8 @@ def rmsnorm_with_sinkhorn(
     fake_quant: bool = True,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation, None], torch.Tensor]:
     """``rmsnorm_fake_quant_fp8(x, weight, eps)`` (the plain bf16 RMSNorm when ``fake_quant`` is
-    False) with the pending reduce + sinkhorn of ``coefficients`` in the same launch. ``x`` is
-    the ``[M, K]`` collapsed sublayer input the boundary produced from the rows the coefficients
-    belong to. Returns ``(fake_quant, norm)`` as ``rmsnorm_fake_quant_fp8`` does; ``fake_quant``
-    is None without the quant."""
+    False) with the pending reduce + sinkhorn of ``coefficients`` in the same launch; returns
+    ``(fake_quant or None, norm)``."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
     assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
@@ -494,11 +487,9 @@ def _hc_boundary_partial_kernel(
     HAS_POST: tl.constexpr,
     HAS_COMBINE: tl.constexpr,
 ):
-    """Grid (cdiv(M, BLOCK_M), H // BLOCK_K); slice pid_t covers hidden columns [pid_t*BLOCK_K, +BLOCK_K)
-    of every copy. HAS_POST: copy k of the new residual is post[k]*x + sum_j comb[j,k]*res[j] in
-    aiter::mhc_post's order, stored and read back as bf16 for the statistics; HAS_COMBINE:
-    y = sum_k pre_prev[k] * copy_k in _hc_combine_kernel's order.
-    """
+    """Grid (cdiv(M, BLOCK_M), H // BLOCK_K), one hidden slice of every copy per program. HAS_POST:
+    ``res_out[k] = post[k]*x + sum_j comb[j,k]*res[j]`` in aiter::mhc_post's order, read back as bf16
+    for the statistics; HAS_COMBINE: ``y = sum_k pre_prev[k] * copy_k`` in _hc_combine_kernel's order."""
     tl.static_assert(HC == 4, "the weight tiles are prefetched by name")
     pid_m = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -795,15 +786,9 @@ def hc_boundary_fused(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """HIP mHC sublayer boundary in two launches.
-
-    With ``x`` (the sublayer output, [M, H]) and ``post_in`` / ``comb_in``: ``residual_out =
-    hc_post(x, residual, post_in, comb_in)`` and the mixing statistics of ``residual_out``;
-    without ``x`` the statistics are those of ``residual`` ([M, HC, H]). With ``pre_prev`` the
-    collapsed input ``y = sum_k pre_prev[k] * copy_k`` is also produced. Returns ``(residual_out,
-    y, pre, post, comb)``, the first two None when not requested. Batch-invariant and repeatable;
-    pre/post/comb are not bitwise ``hc_mix_stats_sinkhorn``'s. Only hc_mult == 4 is supported.
-    """
+    """HIP mHC sublayer boundary in two launches: ``residual_out = hc_post(x, residual, post_in,
+    comb_in)`` when ``x`` is given, ``y = sum_k pre_prev[k] * copy_k`` when ``pre_prev`` is, and the
+    mixing coefficients of the (new) residual. Returns ``(residual_out, y, pre, post, comb)``."""
     residual_out, y, coefficients = hc_boundary_fused_deferred(
         x,
         residual,

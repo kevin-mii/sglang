@@ -150,11 +150,8 @@ def mxfp8_gemv(
     x_scale: Optional[torch.Tensor] = None,
     config: Optional[GemvConfig] = None,
 ) -> torch.Tensor:
-    """``out[M, N] bf16 = x[M, K] . W^T`` on the gfx950 scaled matrix core.
-
-    ``x`` is fp8 e4m3 with ``x_scale`` ue8m0 ``[M, K/32]``, or bf16 (quantized in-kernel with
-    the same rule; ``x_scale`` unused). ``weight_shuffled`` / ``weight_scale_ue8m0`` come from
-    ``shuffle_mxfp8_weight`` / ``ue8m0_weight_scale``. ``config`` overrides the table lookup."""
+    """``out[M, N] bf16 = x[M, K] . W^T`` on the gfx950 scaled matrix core; ``x`` is fp8 e4m3 with
+    ``x_scale`` ue8m0 ``[M, K/32]`` or bf16 quantized in-kernel; ``config`` overrides the table."""
     assert x.dim() == 2 and x.is_contiguous(), x.shape
     m, k = x.shape
     n = weight_shuffled.shape[0] * _TILE_N

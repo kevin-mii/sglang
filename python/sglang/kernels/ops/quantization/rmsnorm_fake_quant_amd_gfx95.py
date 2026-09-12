@@ -169,14 +169,9 @@ def rmsnorm_fake_quant_fp8(
     quant_eps: float = 1e-10,
     emit_fp8: bool = False,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation], Optional[torch.Tensor]]:
-    """``fake_quant_fp8_activation(RMSNorm(x))`` in one launch.
-
-    ``x`` is ``[M, K]`` bf16/fp16 with ``K % 32 == 0``; ``weight`` is ``[K]``. With ``residual`` the
-    sum ``x + residual`` is written back into ``residual`` and normalized (the ``fused_add_rmsnorm``
-    contract). Returns ``(fake_quant, norm)``: the fp8-grid activation as ``Fp8GridActivation``, or
-    as ``Mxfp8Activation`` (fp8 codes + ue8m0 bytes) with ``emit_fp8``, and the bf16 norm output
-    (``None`` unless ``return_norm``).
-    """
+    """``fake_quant_fp8_activation(RMSNorm(x))`` in one launch: ``(Fp8GridActivation, norm)``, or
+    ``(Mxfp8Activation, norm)`` with ``emit_fp8``; ``residual`` follows the ``fused_add_rmsnorm``
+    contract and ``norm`` is None unless ``return_norm``."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
     assert weight.dtype == x.dtype, (weight.dtype, x.dtype)

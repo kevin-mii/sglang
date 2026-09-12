@@ -50,10 +50,8 @@ def _sort_entries(
     NB_PER_E: tl.constexpr,
     JC: tl.constexpr,  # entries compared per chunk: [N, JC] tensors stay in registers
 ):
-    """aiter's moe_sorting of the ``N`` (token, slot) entries, entries in token-major order.
-
-    With so few entries, deduplication, per-expert counts, the block prefix and the token
-    ranks are pairwise comparisons: three passes over ``N // JC`` chunks of the entries."""
+    """aiter's moe_sorting of ``N`` token-major (token, slot) entries by pairwise comparison:
+    three passes over ``N // JC`` chunks."""
     N: tl.constexpr = e.shape[0]
     NC: tl.constexpr = N // JC
     i = tl.arange(0, N)
@@ -338,13 +336,8 @@ def rocm_router_gate_sort(
     zero_moe_buf: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, ...]:
-    """:func:`rocm_router_gate` followed by :func:`fused_aiter_moe_sorting`, one launch.
-
-    Returns ``(weights, ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-    moe_buf)``: the first two as aiter's ``topk_gating``, the rest as ``moe_sorting`` (see
-    :func:`fused_aiter_moe_sorting` for the shapes and the ``moe_buf`` rule). With
-    ``partials`` their fixed-order sum is gated and written into ``gating_output``.
-    """
+    """:func:`rocm_router_gate` followed by :func:`fused_aiter_moe_sorting` in one launch:
+    ``(weights, ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)``."""
     M, n_experts = gating_output.shape
     assert n_experts == _GATE_NUM_EXPERTS == num_experts and 0 < topk <= _MAX_TOPK
     assert 0 < M <= ROCM_GATE_SORT_MAX_TOKENS, (

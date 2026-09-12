@@ -80,10 +80,8 @@ def silu_and_mul_clamp_triton(
     eps: float = 1e-10,
     emit_fp8: bool = False,
 ):
-    """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim).
-
-    ``fp8_grid`` returns the result on the fp8 e4m3 grid (per-32 ue8m0) as ``Fp8GridActivation``;
-    ``emit_fp8`` returns the same quantization as fp8 codes plus scale bytes (``Mxfp8Activation``)."""
+    """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
+    ``Fp8GridActivation`` with ``fp8_grid`` or ``Mxfp8Activation`` with ``emit_fp8``."""
     assert gate_up.dim() == 2 and gate_up.shape[1] % 2 == 0, gate_up.shape
     M, N = gate_up.shape
     inter_size = N // 2

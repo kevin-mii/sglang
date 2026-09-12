@@ -183,14 +183,9 @@ def low_ratio_compression_metadata(
     raw_out_loc: torch.Tensor,
     low_ratios: Tuple[int, ...],
 ) -> dict:
-    """``_low_ratio_compression_metadata`` for ratios 1 and 2 in one launch::
-
-        cR_out_loc             = where(seq_lens[:nw] % R == 0, raw_out_loc.to(int64) // R, -1)
-        cR_topk_lengths_clamp1 = (seq_lens // R).clamp_min(1).to(int32)
-
-    ``seq_lens_casual`` int32 ``[rows]``, ``raw_out_loc`` ``[nw <= rows]``. Returns
-    ``{"c1_out_loc": ..., "c1_topk_lengths_clamp1": ..., "c2_...": ...}`` for the
-    ratios present."""
+    """``_low_ratio_compression_metadata`` for ratios 1 and 2 in one launch: ``cR_out_loc =
+    where(seq_lens[:nw] % R == 0, raw_out_loc // R, -1)`` (int64) and ``cR_topk_lengths_clamp1 =
+    (seq_lens // R).clamp_min(1)`` (int32), keyed ``c{R}_...`` for the ratios present."""
     assert seq_lens_casual.dtype is torch.int32 and seq_lens_casual.is_contiguous()
     assert raw_out_loc.dim() == 1 and raw_out_loc.is_contiguous()
     assert set(low_ratios) <= {1, 2}, low_ratios
@@ -291,15 +286,9 @@ def sparse_buffers(
     index_topk: int,
     page_index_align: int,
 ) -> dict:
-    """``init_flashmla_related``'s tensors in one launch::
-
-        c4_sparse_topk_lengths     = clamp(c4_topk_lengths_clamp1, max=topk)
-        c4_sparse_topk_lengths_raw = clamp(c4_topk_lengths_raw, max=topk)
-        cR_sparse_topk_lengths     = clamp(cR_topk_lengths_clamp1, max=topk)
-        c{4,R}_sparse_page_indices = pad(full((rows, topk), -1), align)   # int32
-
-    for the ratios R whose clamp-1 lengths are given. Returns a dict keyed by
-    attribute name."""
+    """``init_flashmla_related``'s tensors in one launch, keyed by attribute name: the top-k
+    lengths clamped to ``index_topk`` and the ``-1``-filled int32 page-index buffers padded to
+    ``page_index_align``, for ratio 4 and the ratios whose clamp-1 lengths are given."""
     for t in (
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,

@@ -60,14 +60,8 @@ def moe_topk_reduce_add(
     expert_mask: Optional[torch.Tensor] = None,
     alpha: float = 1.0,
 ) -> None:
-    """``out[t] = alpha * sum_k per_slot[t * topk + k] + shared[t]`` (slots whose expert is
-    not local under ``expert_mask`` skipped), fp32 accumulation, rounded once to ``out``'s
-    dtype.
-
-    ``per_slot`` is ``[M * topk, D]`` (or its flat view), ``shared`` and ``out`` ``[M, D]``
-    with unit row strides in the last dim. With ``expert_mask`` (``[num_experts]``,
-    nonzero for local experts) ``topk_ids`` ``[M, topk]`` selects the slots to keep.
-    """
+    """``out[t] = alpha * sum_k per_slot[t * topk + k] + shared[t]``, skipping slots whose expert
+    ``topk_ids`` maps outside ``expert_mask``; fp32 accumulation rounded once to ``out``'s dtype."""
     M, D = out.shape
     assert shared.shape == (M, D), (shared.shape, out.shape)
     assert per_slot.numel() == M * topk * D, (per_slot.shape, M, topk, D)
