@@ -1,4 +1,4 @@
-"""``moe_topk_reduce_add`` (the ROCm top-k reduction with the shared-expert add folded in) must match an fp32 reference bit for bit, be batch-invariant, and replace aiter's FlyDSL reduction only inside ``aiter_fused_reduce_shared_add``."""
+"""``moe_topk_reduce_add`` (the ROCm top-k reduction with the shared-expert add folded in) must match an fp32 reference bit for bit and be batch-invariant."""
 
 import unittest
 
