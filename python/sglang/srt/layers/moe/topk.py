@@ -101,7 +101,6 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
@@ -323,10 +322,8 @@ class StandardTopKOutput(NamedTuple):
 
 
 class StandardTopKOutputDeferredPad(StandardTopKOutput):
-    """A STANDARD output whose rows at and past ``num_token_non_padded`` still hold
-    the router's values; the aiter runner masks them in its fused sorting launch.
-    A plain 3-tuple to every other consumer.
-    """
+    """A STANDARD output whose rows at and past ``num_token_non_padded`` still hold the
+    router's values, which the aiter runner masks in its fused sorting launch."""
 
     def __new__(cls, topk_weights, topk_ids, router_logits, num_token_non_padded):
         self = super().__new__(cls, topk_weights, topk_ids, router_logits)
@@ -649,9 +646,8 @@ class TopK(BaseFusedOp):
         router_logits_partials: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         """``router_logits_partials`` (ROCm decode router): fp32 split-K partials whose
-        fixed-order sum is the logits; ``router_logits`` is then a buffer the fused
-        gate fills, and any path that reads it first reduces the partials into it.
-        """
+        fixed-order sum is the logits; ``router_logits`` is then a buffer the fused gate
+        fills, and any other reader first reduces the partials into it."""
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -1380,8 +1376,7 @@ def biased_topk_impl(
 def _reduce_router_logits_partials(
     router_logits: torch.Tensor, router_logits_partials: torch.Tensor
 ) -> None:
-    """Fill ``router_logits`` with the fixed-order sum of the split-K partials,
-    the same sum the fused ROCm gate computes."""
+    """Fill ``router_logits`` with the split-K sum in the fused ROCm gate's order."""
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_reduce_partials
 
     rocm_router_reduce_partials(router_logits_partials, router_logits)
@@ -1665,27 +1660,6 @@ def _fused_gate_emits_packed_ids(
         and num_fused_shared_experts == 0
         and not routing_overridden
     )
-
-
-def _defer_hip_pad_fill_to_aiter_sorting(
-    num_fused_shared_experts: int,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
-) -> bool:
-    """Whether the aiter runner's fused sorting will mask the padded rows.
-
-    True only for the plain aiter route (no dispatcher, EPLB remap or appended
-    shared expert), where nothing between select_experts and the runner reads them.
-    """
-    if not (_is_hip and _use_aiter):
-        return False
-    if num_fused_shared_experts > 0 or expert_location_dispatch_info is not None:
-        return False
-    if _eplb_remap_enabled():
-        return False
-    if not get_moe_a2a_backend().is_none():
-        return False
-    backend = get_moe_runner_backend()
-    return backend.is_aiter() or backend.is_auto()
 
 
 def _mask_topk_ids_padded_region(
@@ -2707,12 +2681,17 @@ def select_experts(
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
-    defer_hip_pad_fill = (
-        num_token_non_padded is not None
-        and _defer_hip_pad_fill_to_aiter_sorting(
-            num_fused_shared_experts, expert_location_dispatch_info
+    defer_hip_pad_fill = False
+    if _use_aiter and num_token_non_padded is not None:
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            fused_sorting_masks_padded_rows,
         )
-    )
+
+        defer_hip_pad_fill = fused_sorting_masks_padded_rows(
+            num_fused_shared_experts,
+            expert_location_dispatch_info,
+            eplb_remap=_eplb_remap_enabled(),
+        )
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,

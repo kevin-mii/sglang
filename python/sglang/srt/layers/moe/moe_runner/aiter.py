@@ -20,7 +20,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
@@ -269,6 +273,22 @@ def aiter_fused_reduce_shared_add(shared_output: torch.Tensor, alpha: float):
         yield request
     finally:
         _fused_reduce_request.reset(token)
+
+
+def fused_sorting_masks_padded_rows(
+    num_fused_shared_experts: int, expert_location_dispatch_info, *, eplb_remap: bool
+) -> bool:
+    """Whether select_experts may leave the padded rows to the fused sorting launch: only
+    the plain aiter route (no dispatcher, EPLB remap or appended shared expert), where
+    nothing between select_experts and the runner reads them."""
+    if not is_hip():
+        return False
+    if num_fused_shared_experts > 0 or expert_location_dispatch_info is not None:
+        return False
+    if eplb_remap or not get_moe_a2a_backend().is_none():
+        return False
+    backend = get_moe_runner_backend()
+    return backend.is_aiter() or backend.is_auto()
 
 
 def _fill_padded_rows_pair(topk_ids, topk_weights, num_token_non_padded) -> None:
