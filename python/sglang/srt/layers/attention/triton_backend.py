@@ -1541,6 +1541,23 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    # Largest per-request extend length routed to the verify kernels.
+    SMALL_EXTEND_MAX_TOKENS = 8
+
+    def _is_small_constant_extend(
+        self, forward_batch: ForwardBatch, kv_indices: torch.Tensor
+    ) -> bool:
+        ext = forward_batch.extend_seq_lens_cpu
+        return (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and ext is not None
+            and len(ext) > 0
+            and ext[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(e == ext[0] for e in ext)
+            and kv_indices is not None
+            and kv_indices.numel() > 0
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1721,12 +1738,16 @@ class TritonAttnBackend(AttentionBackend):
         # serial-prefix extend kernel launches only bs*heads work-groups and
         # costs O(context) per step at long prefix (2.2 ms at 100K for the
         # MiniMax-M3 EAGLE3 draft vs ~0.3 ms split-KV).
+        # A small constant-length EXTEND over a cached prefix (a new turn) has
+        # the same shape too; the serial extend kernel costs 6 ms per dense
+        # layer at 195K context there.
         if (
             verify_fwd is not None
             and score_mod is None
             and (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
+                or self._is_small_constant_extend(forward_batch, kv_indices)
             )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
