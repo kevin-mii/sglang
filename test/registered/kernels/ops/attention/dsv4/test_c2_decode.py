@@ -1,21 +1,17 @@
-"""Check ratio-2 pooling within two bf16 ulps and the pair state and cache stores bitwise."""
+"""Check ratio-2 pooling within two bf16 ulps and the pair state bitwise."""
 
 import sys
 
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 from sglang.kernels.ops.attention.dsv4.c2 import (
     c2_decode_norm,
-    c2_decode_norm_rope_store,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
     RMSNorm,
-    rope_tail,
 )
-from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_compressed_kv
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -37,13 +33,6 @@ BATCHES = (1, 64)
 # one of them (served: `next_power_of_2(draft + 1)`)
 RING_SIZES = (2, 8)
 
-ROPE_DIM = 64
-RATIO = 2
-# compressed-pool slots per page: the FULL page size over the ratio, 128 // 2 as served
-PAGE_SIZE = 64
-SLOT_BYTES = 584
-PAGE_BYTES = -(-SLOT_BYTES * PAGE_SIZE // 576) * 576
-
 # Two bf16 ulp: the intermediate bf16 cast in `finish` makes one ulp reachable and two
 # the ceiling. The floor only engages on elements the pair pooling cancelled to near zero.
 POOL_RTOL = 2**-6
@@ -59,8 +48,8 @@ def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
 
 
 def _norm(dim: int, seed: int) -> RMSNorm:
-    """`DeepseekV41Compressor.norm` as the model holds it: bf16 weight, because
-    the parameter is created inside `set_default_torch_dtype(model dtype)`."""
+    """`DeepseekV41Compressor.norm` as the model holds it: bf16 weight, because the
+    parameter is created inside `set_default_torch_dtype(model dtype)`."""
     with set_default_torch_dtype(torch.bfloat16):
         norm = RMSNorm(dim, EPS).cuda()
     assert norm.weight.dtype == torch.bfloat16
@@ -106,16 +95,15 @@ def _inputs(
 
 
 def _state_rows(req, positions, ring_size):
-    """`CompressStatePool.translate_from_req_position_to_state_loc`, for the
-    slot a row reads (`pos - 1`) and the one it writes (`pos`)."""
+    """`CompressStatePool.translate_from_req_position_to_state_loc`, for the slot a row
+    reads (`pos - 1`) and the one it writes (`pos`)."""
     base = req.to(torch.int64) * ring_size
     pos = positions.to(torch.int64)
     return base + (pos - 1) % ring_size, base + pos % ring_size
 
 
 def _torch_reference(kv_input, kv_state, norm, positions, req, raw_out_loc, ring_size):
-    """The ratio-2 decode branch and `finish`, transcribed. Updates `kv_state`
-    in place like the kernel does; returns `(latent, completes)`."""
+    """The ratio-2 decode branch and `finish`, transcribed."""
     dim = kv_input.shape[1] // 2
     kv, score = kv_input[:, :dim], kv_input[:, dim:]
     state_kv, state_score = kv_state[:, :dim], kv_state[:, dim:]
@@ -153,8 +141,8 @@ def _compare(got, expected, rows, ctx):
 
 
 def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
-    """One `c2_decode_norm` call against the reference, returning the two pair states
-    so callers can add their own assertions."""
+    """One `c2_decode_norm` call against the reference, returning the two pair states so
+    callers can add their own assertions."""
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(
         n, dim, seed, ring_size=ring_size, **kw
     )
@@ -187,8 +175,8 @@ def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
 @pytest.mark.parametrize("ring_size", RING_SIZES)
 @pytest.mark.parametrize("n", BATCHES)
 def test_mixed_parity(n, ring_size):
-    """Odd rows complete a group against the state while even rows park in it; both
-    ring sizes, since a wrong modular wrap shows on only one."""
+    """Odd rows complete a group against the state while even rows park in it; both ring
+    sizes, since a wrong modular wrap shows on only one."""
     *_, got_state, ref_state = _run(n, HEAD_DIM, seed=1000 + n, ring_size=ring_size)
     # Pure copy on the even rows, untouched on the odd ones -- no arithmetic, so
     # nothing here is allowed to differ by even one bit.
@@ -196,8 +184,8 @@ def test_mixed_parity(n, ring_size):
 
 
 def test_pair_state_carried_across_two_steps():
-    """A group spans two decode steps: an all-even step only parks, and the all-odd
-    step after it must pool against exactly what it left."""
+    """A group spans two decode steps: an all-even step only parks, and the all-odd step
+    after it must pool against exactly what it left."""
     n = 8
     g = torch.Generator(device="cuda").manual_seed(3000)
     first = torch.randn(
@@ -271,8 +259,8 @@ def test_padded_rows_publish_nothing():
 
 
 def test_saturated_and_tied_scores():
-    """The closed form is `exp(-|s0 - s1|)`: a tie must give exactly 0.5/0.5,
-    and a large gap must underflow to a clean one-sided pick, not a NaN."""
+    """The closed form is `exp(-|s0 - s1|)`: a tie must give exactly 0.5/0.5, and a
+    large gap must underflow to a clean one-sided pick, not a NaN."""
     n = 6
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(n, HEAD_DIM, seed=6000)
     positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
@@ -316,109 +304,6 @@ def test_saturated_and_tied_scores():
     rows = torch.zeros(n, dtype=torch.bool, device="cuda")
     rows[2::2] = True
     _compare(got, partner, rows, "saturated partner")
-
-
-# ------------------------------------------------- + RoPE, fp4 quant and store
-
-
-def _freqs(max_pos, seed):
-    """`layer.freqs_cis` and the fp32 real/imag-interleaved view the kernel
-    indexes itself, at `positions - 1`."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    ang = torch.randn(max_pos, ROPE_DIM // 2, generator=g, device="cuda")
-    freqs = torch.polar(torch.ones_like(ang), ang)
-    return freqs, torch.view_as_real(freqs).flatten(-2).contiguous().float()
-
-
-def _cache(max_slot):
-    """A compressed-pool buffer wide enough for `max_slot`, zeroed so an
-    untouched slot is recognizable."""
-    return torch.zeros(
-        max_slot // PAGE_SIZE + 2, PAGE_BYTES, dtype=torch.uint8, device="cuda"
-    )
-
-
-def _torch_store(latent, freqs, cache, slots):
-    """Torch RoPE and fake-quant, then the production writer for the 584-byte layout."""
-    fq4 = fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM))
-    fused_store_cache(
-        input=fq4, cache=cache, indices=slots, page_size=PAGE_SIZE, type="flashmla"
-    )
-
-
-def _run_fusion(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
-    """One `c2_decode_norm_rope_store` call, plus everything the store gates need."""
-    kv_input, kv_state, positions, req, raw_out_loc = _inputs(
-        n, dim, seed, ring_size=ring_size, **kw
-    )
-    norm = _norm(dim, seed + 1)
-    freqs, freqs_cis = _freqs(int(positions.max().item()) + 2 if n else 2, seed + 2)
-    slots = (raw_out_loc // RATIO).to(torch.int64)
-    cache = _cache(int(slots.max().item()) if n else 0)
-
-    odd = (positions.to(torch.int64) % 2) == 1
-    got = c2_decode_norm_rope_store(
-        kv_input,
-        kv_state,
-        norm.weight.data,
-        positions,
-        req,
-        raw_out_loc,
-        EPS,
-        freqs_cis,
-        cache,
-        page_size=PAGE_SIZE,
-        ring_size=ring_size,
-    )
-    live = odd & (raw_out_loc != 0)
-    return dict(
-        got=got,
-        live=live,
-        cache=cache,
-        slots=slots,
-        # `freqs_cis[group_pos]` as `_low_ratio_write_group` gathers it; only odd
-        # (completing) rows are compared, so the clamp is dead
-        freqs=freqs[(positions.to(torch.int64) - 1).clamp_min(0)],
-    )
-
-
-@pytest.mark.parametrize("n", BATCHES)
-def test_store_is_bitwise_the_production_writer(n):
-    """Byte for byte, driven by the kernel's own latent so the pooling residual is
-    factored out and only RoPE, the fp4 fake-quant and the 584-byte layout remain."""
-    r = _run_fusion(n, HEAD_DIM, seed=10000 + n)
-    live = r["live"]
-    ref_cache = torch.zeros_like(r["cache"])
-    if live.any():
-        _torch_store(r["got"][live], r["freqs"][live], ref_cache, r["slots"][live])
-    assert torch.equal(r["cache"], ref_cache), (
-        f"{n=}: {int((r['cache'] != ref_cache).sum())} of "
-        f"{r['cache'].numel()} cache bytes differ from the production writer"
-    )
-
-
-def test_store_skips_even_and_padded_rows():
-    """Every row is even or padded, so the buffer comes back untouched -- slot 0
-    included, where a `raw_out_loc == 0` row lands if the pad check is missing."""
-    n = 8
-    positions = torch.tensor([0, 2, 4, 6, 8, 1, 3, 5], device="cuda", dtype=torch.int32)
-    # The live rows are all even; the padded ones cover both parities.
-    raw_out_loc = torch.tensor(
-        [3, 5, 7, 9, 11, 0, 0, 0], device="cuda", dtype=torch.int32
-    )
-    r = _run_fusion(
-        n,
-        HEAD_DIM,
-        seed=12000,
-        positions=positions,
-        raw_out_loc=raw_out_loc,
-        req=torch.tensor([0, 1, 2, 3, 4, 0, 0, 0], device="cuda", dtype=torch.int64),
-        num_state_rows=5,
-    )
-    assert not r["live"].any(), "test needs no live completing row"
-    assert not r["cache"].any(), (
-        f"{int((r['cache'] != 0).sum())} cache bytes written with nothing to store"
-    )
 
 
 if __name__ == "__main__":

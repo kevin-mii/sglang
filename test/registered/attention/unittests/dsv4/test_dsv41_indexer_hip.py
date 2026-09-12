@@ -1,11 +1,10 @@
-"""The V4.1 low-ratio indexer on ROCm: FlyDSL fp4 paged logits + AOT top-k against a torch golden, the HIP backend entry points and the two-level top-k against the torch oracle."""
+"""The V4.1 low-ratio indexer kernels on ROCm: FlyDSL fp4 paged logits + AOT top-k against a torch golden, the two-level top-k against the reference, the split-K head weights bitwise."""
 
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.candidate_torch import CandidateMasks
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,7 +18,6 @@ N_HEADS = 32
 TOPK = 512
 # Released V4.1 config; the span 2048 x 8 = 16384 is where level one starts to bind.
 TOPK_BLOCKS, BLOCK_SIZE = 2048, 8
-SPAN = TOPK_BLOCKS * BLOCK_SIZE
 
 # the released hidden size; the scale is 2 ** -6 in fp32, so the aten multiply is exact
 HIDDEN = 5120
@@ -27,8 +25,8 @@ SCALE = 128**-0.5 * 32**-0.5
 
 
 def golden_scores(q, k, weights):
-    """Reference scoring (einsum(q, k).relu() * weights).sum(heads) in fp32: q [b, H, d],
-    weights [b, H], k [n, d] shared by every row or [b, n, d] per row -> [b, n]."""
+    """Reference scoring (einsum(q, k).relu() * weights).sum(heads) in fp32: q [b, H,
+    d], weights [b, H], k [n, d] shared by every row or [b, n, d] per row -> [b, n]."""
     eq = "bhd,bnd->bhn" if k.dim() == 3 else "bhd,nd->bhn"
     s = torch.einsum(eq, q.float(), k.float())
     return (s.relu() * weights.float().unsqueeze(-1)).sum(dim=1)
@@ -47,20 +45,6 @@ def index_slots(page_table, pos):
         page_table.gather(1, pos // INDEX_PAGE_SIZE) * INDEX_PAGE_SIZE
         + pos % INDEX_PAGE_SIZE
     )
-
-
-def sorted_rows(x):
-    """Rows as sorted sets with the -1 padding last: the AOT top-k emits a row's set
-    in arrival order."""
-    return x.masked_fill(x < 0, torch.iinfo(x.dtype).max).sort(dim=-1).values
-
-
-def sorted_by_raw(ri, pi):
-    """Raw indices sorted by position with the -1 padding last, and the page indices
-    carried along, so two selections of the same set compare column by column."""
-    key = ri.masked_fill(ri == -1, torch.iinfo(ri.dtype).max)
-    order = key.argsort(dim=-1)
-    return ri.gather(-1, order), pi.gather(-1, order)
 
 
 def reference_position_mask(logits, lens, topk_blocks, block_size):
@@ -104,41 +88,6 @@ def reference_consumer_rows(logits, lens, pos_mask, topk):
     return out
 
 
-class _StubIndexer:
-    """Stand-in indexer: precomputed fp4-grid queries and head weights per token,
-    fp32 golden scores, and the candidate-block config of the layer."""
-
-    weights_proj_hip_max_tokens = -1  # the linear serves the head weights
-
-    def __init__(
-        self,
-        q,
-        weights,
-        *,
-        candidate_source=False,
-        uses_candidates=False,
-        candidate_blocks=(TOPK_BLOCKS, BLOCK_SIZE),
-    ):
-        self.q, self.w = q, weights
-        self.index_topk = TOPK
-        self.is_candidate_source = candidate_source
-        self.uses_candidates = uses_candidates
-        self.candidate_topk_blocks, self.candidate_block_size = candidate_blocks
-        self.owns_k = False
-        self.n_local_heads = self.n_heads = q.shape[1]
-
-    def queries(self, q_lora, freqs, positions=None):
-        # the HIP path hands over the whole freqs table plus positions; the stub's
-        # queries are precomputed per token so both are ignored
-        return self.q[q_lora]
-
-    def head_weights(self, x):
-        return self.w[x]
-
-    def scores(self, q, k, weights):
-        return golden_scores(q, k, weights)
-
-
 # -- the kernels: FlyDSL paged logits and the AOT paged top-k transform ---------
 
 
@@ -148,8 +97,8 @@ class _StubIndexer:
 class TestFp4PagedLogitsKernels(CustomTestCase):
     @staticmethod
     def _queries_and_golden(rows, full_page_table, seq_lens, k_all, ratio, max_slots):
-        """Random fp4-grid queries and head weights per row, packed for FlyDSL, with
-        the fp32 golden scores over `max_slots` and each row's visible mask."""
+        """Random fp4-grid queries and head weights per row, packed for FlyDSL, with the
+        fp32 golden scores over `max_slots` and each row's visible mask."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             pack_fp4_query_flydsl,
         )
@@ -327,8 +276,8 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             self._assert_logits_match_golden(case, logits)
 
     def test_decode_matches_golden(self):
-        """The decode logits and the paged transform must reproduce the reference
-        scores and slots through a permuted FULL page table at both ratios."""
+        """The decode logits and the paged transform must reproduce the reference scores
+        and slots through a permuted FULL page table at both ratios."""
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
                 self._run_decode(ratio=ratio)
@@ -341,383 +290,10 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
                 self._run_prefill(ratio=ratio)
 
 
-# -- the backend entry points against the torch oracle -------------------------
-
-
-class _LowRatioBackendCase(CustomTestCase):
-    """fp4 indexer K behind a permuted FULL page table, one batch, and the backend entry
-    points on a bare `DeepseekV4HipRadixBackend` with a stub indexer."""
-
-    # (candidate_topk_blocks, candidate_block_size) of the stub indexer.
-    CANDIDATE_BLOCKS = (TOPK_BLOCKS, BLOCK_SIZE)
-
-    def _setup(self, ratio, seq_lens, extend_lens, seed=0):
-        """Requests of `seq_lens` tokens, the last `extend_lens` of each in the batch;
-        decode when every request extends by one."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            store_fp4_index_k_cache_split,
-        )
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
-            _expand_index_page_table,
-            _low_ratio_sparse_buffers,
-        )
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            refresh_low_ratio_prefill_workspaces,
-        )
-        from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
-
-        torch.manual_seed(1000 * ratio + seed)
-        dev = "cuda"
-        bs = len(seq_lens)
-        slots_per_page = FULL_PAGE_SIZE // ratio
-        n_full_pages = max((s + FULL_PAGE_SIZE - 1) // FULL_PAGE_SIZE for s in seq_lens)
-        n_phys_pages = bs * n_full_pages + 2
-        total_slots = n_phys_pages * slots_per_page
-        full_page_table = (
-            torch.randperm(n_phys_pages, device=dev)[: bs * n_full_pages]
-            .view(bs, n_full_pages)
-            .to(torch.int32)
-        )
-        req_to_token = torch.zeros(
-            bs, n_full_pages * FULL_PAGE_SIZE, dtype=torch.int32, device=dev
-        )
-        p = torch.arange(n_full_pages * FULL_PAGE_SIZE, device=dev)
-        for b in range(bs):
-            req_to_token[b] = (
-                full_page_table[b, p // FULL_PAGE_SIZE].to(torch.int64) * FULL_PAGE_SIZE
-                + p % FULL_PAGE_SIZE
-            ).to(torch.int32)
-
-        k_all = fake_quant_fp4(
-            torch.randn(total_slots, HEAD_DIM, device=dev, dtype=torch.bfloat16)
-        )
-        n_index_pages = total_slots // INDEX_PAGE_SIZE
-        payload = torch.zeros(
-            n_index_pages, 1, 4, INDEX_PAGE_SIZE, 16, dtype=torch.uint8, device=dev
-        ).view(torch.float4_e2m1fn_x2)
-        scale = torch.zeros(
-            n_index_pages, 1, 4, INDEX_PAGE_SIZE, dtype=torch.uint8, device=dev
-        )
-        store_fp4_index_k_cache_split(
-            k_all,
-            payload,
-            scale,
-            torch.arange(total_slots, dtype=torch.int32, device=dev),
-            page_size=INDEX_PAGE_SIZE,
-            rne=True,
-        )
-        pool = SimpleNamespace(
-            get_index_k_fp4_payload_buffer=lambda layer_id: payload,
-            get_index_k_fp4_scale_buffer=lambda layer_id: scale,
-            get_low_ratio_index_k_dequant=lambda layer_id, slots: k_all[
-                slots.to(torch.int64)
-            ],
-        )
-
-        pos_list, req_list = [], []
-        for b, (s, e) in enumerate(zip(seq_lens, extend_lens)):
-            pos_list += list(range(s - e, s))
-            req_list += [b] * e
-        pos = torch.tensor(pos_list, dtype=torch.int64, device=dev)
-        req = torch.tensor(req_list, dtype=torch.int64, device=dev)
-        num_tokens = pos.numel()
-        q = fake_quant_fp4(
-            torch.randn(num_tokens, N_HEADS, HEAD_DIM, device=dev, dtype=torch.bfloat16)
-        )
-        weights = torch.rand(num_tokens, N_HEADS, device=dev, dtype=torch.bfloat16)
-        tok_ids = torch.arange(num_tokens, device=dev)
-        is_decode = all(e == 1 for e in extend_lens)
-
-        # Per-request FULL page table in decode, per-token in prefill, as the
-        # backend builds them.
-        base_table = (
-            full_page_table
-            if is_decode
-            else (req_to_token[req, ::FULL_PAGE_SIZE] // FULL_PAGE_SIZE).to(torch.int32)
-        )
-        page_table = _expand_index_page_table(
-            base_table,
-            full_page_size=FULL_PAGE_SIZE,
-            compress_ratio=ratio,
-            index_page_size=INDEX_PAGE_SIZE,
-        )
-        lens_raw = ((pos + 1) // ratio).to(torch.int32)
-        lens_clamp1 = lens_raw.clamp_min(1)
-
-        def metadata():
-            """Prefill rows carry the raw visible count, decode rows the clamp-1 count,
-            as the backend builds it."""
-            _, page_indices, raw_indices = _low_ratio_sparse_buffers(
-                lens_clamp1, TOPK, is_prefill=True
-            )
-            core = SimpleNamespace(
-                sparse_page_indices=lambda r: page_indices,
-                sparse_raw_indices=lambda r: raw_indices,
-                # the indexer drops the ratio's length folds before it writes; none here
-                drop_folded_sparse_indices=lambda r: None,
-            )
-            indexer_metadata = PagedIndexerMetadata(
-                page_size=FULL_PAGE_SIZE,
-                page_table=page_table,
-                c4_seq_lens=lens_clamp1 if is_decode else lens_raw,
-                use_topk_v2=False,
-                compress_ratio=ratio,
-                index_page_size=INDEX_PAGE_SIZE,
-            )
-            meta = SimpleNamespace(
-                core_metadata=core,
-                late_layer_tail=None,
-                low_ratio_indexer_metadata=lambda r: indexer_metadata,
-                fp4_low_ratio_decode_workspaces={},
-                fp4_low_ratio_prefill_workspaces=(
-                    {}
-                    if is_decode
-                    else refresh_low_ratio_prefill_workspaces(
-                        {ratio: indexer_metadata}, None
-                    )
-                ),
-            )
-            return meta, page_indices, raw_indices
-
-        forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_decode=lambda: is_decode,
-                is_extend=lambda: not is_decode,
-                is_target_verify=lambda: False,
-            ),
-            seq_lens_cpu=list(seq_lens),
-            extend_seq_lens_cpu=list(extend_lens),
-            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32, device=dev),
-            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=dev),
-        )
-        return SimpleNamespace(
-            ratio=ratio,
-            dev=dev,
-            bs=bs,
-            pool=pool,
-            req_to_token=req_to_token,
-            pos=pos,
-            req=req,
-            q=q,
-            weights=weights,
-            tok_ids=tok_ids,
-            page_table=page_table,
-            lens=lens_raw.to(torch.int64),
-            metadata=metadata,
-            forward_batch=forward_batch,
-            is_decode=is_decode,
-        )
-
-    @staticmethod
-    def _layer_inputs(case):
-        """Another index-source layer's queries and head weights over the same K."""
-        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
-
-        return fake_quant_fp4(torch.randn_like(case.q)), torch.rand_like(case.weights)
-
-    def _run(
-        self,
-        case,
-        path,
-        *,
-        inputs=None,
-        skip=False,
-        candidate_source=False,
-        uses_candidates=False,
-        masks=None,
-        candidate_span=None,
-        forward_batch=None,
-    ):
-        """Run one indexer layer through `path` ("extend", "decode" or "torch") on a
-        bare backend; returns (page_indices, raw_indices, published candidate masks)."""
-        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-            DeepseekV4HipRadixBackend,
-        )
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            low_ratio_index_topk_hip_decode,
-            low_ratio_index_topk_hip_extend,
-        )
-
-        meta, page_indices, raw_indices = case.metadata()
-        backend = object.__new__(DeepseekV4HipRadixBackend)
-        backend.forward_metadata = meta
-        backend.token_to_kv_pool = case.pool
-        backend.req_to_token = case.req_to_token
-        backend.candidate_masks = masks
-        backend.low_ratio_identity_skip = skip
-        backend.low_ratio_candidate_span = candidate_span
-        backend.index_topk = TOPK
-        q, w = inputs if inputs is not None else (case.q, case.weights)
-        indexer = _StubIndexer(
-            q,
-            w,
-            candidate_source=candidate_source,
-            uses_candidates=uses_candidates,
-            candidate_blocks=self.CANDIDATE_BLOCKS,
-        )
-        layer = SimpleNamespace(
-            layer_id=0,
-            compress_ratio=case.ratio,
-            indexer=indexer,
-            freqs_cis=torch.zeros(int(case.pos.max()) + 1, device=case.dev),
-        )
-        if path == "extend":
-            low_ratio_index_topk_hip_extend(
-                backend, layer, case.tok_ids, case.tok_ids, case.pos, case.forward_batch
-            )
-        elif path == "decode":
-            low_ratio_index_topk_hip_decode(
-                backend,
-                layer,
-                case.tok_ids,
-                case.tok_ids,
-                case.pos,
-                forward_batch=(
-                    forward_batch if forward_batch is not None else case.forward_batch
-                ),
-            )
-        else:
-            # the shared torch oracle publishes and consumes through the metadata
-            meta.candidate_metadata = (
-                None if masks is None else CandidateMasks(request_masks=masks)
-            )
-            backend._low_ratio_index_topk_torch(
-                layer, case.tok_ids, case.tok_ids, case.req, case.pos
-            )
-            published = meta.candidate_metadata
-            return (
-                page_indices,
-                raw_indices,
-                None if published is None else published.request_masks,
-            )
-        return page_indices, raw_indices, backend.candidate_masks
-
-    def _assert_candidates_equal(self, a_masks, b_masks, msg):
-        """Two HIP publications keep the same blocks per row; None stands for every
-        reachable block, which a scored publication spells out as blocks 0..n-1."""
-
-        def keeps_every_block(cb):
-            n = (cb.compact_lens // cb.block_size)[:, None]
-            pad = 1 << 30  # -1 padding sorts after every block id
-            ids = cb.ids.masked_fill(cb.ids < 0, pad).sort(dim=1).values
-            j = torch.arange(ids.shape[1], device=ids.device)[None, :]
-            return bool(torch.equal(ids, torch.where(j < n, j, pad).to(ids.dtype)))
-
-        self.assertEqual(len(a_masks), len(b_masks), msg)
-        for x, y in zip(a_masks, b_masks):
-            if x is None or y is None:
-                other = y if x is None else x
-                self.assertTrue(other is None or keeps_every_block(other), msg)
-                continue
-            self.assertTrue(torch.equal(x.compact_lens, y.compact_lens), msg)
-            self.assertTrue(
-                torch.equal(x.ids.sort(dim=1).values, y.ids.sort(dim=1).values),
-                f"{msg}: candidate blocks differ",
-            )
-
-    def _assert_selection(self, a, b, msg, *, exact_rows=None, masks=True):
-        """`exact_rows` (default all) agree exactly, the other rows by -1 pattern and 95%
-        of the selected positions, since torch.topk breaks ties in no fixed order."""
-        a_pi, a_ri, a_masks = a
-        b_pi, b_ri, b_masks = b
-        if exact_rows is None:
-            exact_rows = torch.ones(a_ri.shape[0], dtype=torch.bool, device=a_ri.device)
-        self.assertTrue(
-            torch.equal(a_ri[exact_rows], b_ri[exact_rows]),
-            f"{msg}: raw indices differ",
-        )
-        self.assertTrue(
-            torch.equal(a_pi[exact_rows], b_pi[exact_rows]),
-            f"{msg}: page indices differ",
-        )
-        scored = ~exact_rows
-        if bool(scored.any()):
-            a_ri_s, a_pi_s = sorted_by_raw(a_ri[scored], a_pi[scored])
-            b_ri_s, b_pi_s = sorted_by_raw(b_ri[scored], b_pi[scored])
-            self.assertTrue(torch.equal(a_ri_s == -1, b_ri_s == -1), msg)
-            self.assertTrue(torch.equal(a_pi_s == -1, b_pi_s == -1), msg)
-            agree = ((a_ri_s == b_ri_s) | (a_ri_s == -1)).float().mean().item()
-            self.assertGreaterEqual(
-                agree, 0.95, f"{msg}: scored rows agreement {agree}"
-            )
-        if not masks:
-            return
-        if a_masks is None or b_masks is None:
-            self.assertIs(a_masks, b_masks, msg)
-            return
-        self._assert_candidates_equal(a_masks, b_masks, msg)
-
-    def _assert_agrees(self, a, b, msg):
-        """Every row scored: the same -1 pattern and 95% of the selected positions."""
-        none = torch.zeros(a[1].shape[0], dtype=torch.bool, device=a[1].device)
-        self._assert_selection(a, b, msg, exact_rows=none, masks=False)
-
-
 @unittest.skipUnless(
     is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
 )
-class TestLowRatioIndexerHipPaths(_LowRatioBackendCase):
-    """The decode and ragged-prefill entry points against the torch oracle."""
-
-    def test_prefill_path_agrees_with_torch_path(self):
-        """The prefill kernel path must select the oracle's set per token."""
-        for ratio in (1, 2):
-            seq_lens, extend_lens = [300, 45, 700], [300, 45, 200]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
-            hip = self._run(case, "extend")
-            oracle = self._run(case, "torch")
-            self._assert_agrees(hip, oracle, f"{ratio=}")
-
-    def test_decode_path_agrees_with_torch_path(self):
-        """The decode path must select the same set per row as the torch path (the
-        transform returns rows unsorted) and resolve the same slots for it."""
-        for ratio in (1, 2):
-            case = self._setup(
-                ratio, seq_lens=[300, 45, 700, 1], extend_lens=[1, 1, 1, 1]
-            )
-            k_pi, k_ri, _ = self._run(case, "decode")
-            t_pi, t_ri, _ = self._run(case, "torch")
-            for b in range(k_ri.shape[0]):
-                lc = int((case.pos[b] + 1) // ratio)
-                if lc == 0:
-                    # The decode kernel scores the clamp-1 length and selects the
-                    # dummy slot 0 where torch leaves the row at -1.
-                    self.assertTrue(bool((t_ri[b] == -1).all()))
-                    self.assertTrue(bool((k_ri[b, 1:] == -1).all()))
-                    continue
-                n_valid = min(TOPK, lc)
-                self.assertEqual(int((k_ri[b] >= 0).sum()), n_valid, f"{ratio=} {b=}")
-                self.assertEqual(int((t_ri[b] >= 0).sum()), n_valid, f"{ratio=} {b=}")
-                got, ref = (
-                    set(k_ri[b, :n_valid].tolist()),
-                    set(t_ri[b, :n_valid].tolist()),
-                )
-                overlap = len(got & ref) / n_valid
-                self.assertGreaterEqual(
-                    overlap, 0.95, f"{ratio=} {b=} overlap {overlap}"
-                )
-                # Slots resolve the same raw positions through the same page table.
-                order = torch.argsort(k_ri[b, :n_valid])
-                sorted_k_ri = k_ri[b, :n_valid][order]
-                sorted_k_pi = k_pi[b, :n_valid][order]
-                common = torch.isin(sorted_k_ri, t_ri[b, :n_valid])
-                t_pos = {
-                    int(r): int(p)
-                    for r, p in zip(
-                        t_ri[b, :n_valid].tolist(), t_pi[b, :n_valid].tolist()
-                    )
-                }
-                for r, p in zip(
-                    sorted_k_ri[common].tolist(), sorted_k_pi[common].tolist()
-                ):
-                    self.assertEqual(p, t_pos[r])
-
-
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
-)
-class TestTwoLevelDecodeHip(_LowRatioBackendCase):
+class TestTwoLevelDecodeHip(CustomTestCase):
     """Level one of the two-level top-k: the source keeps TOPK_BLOCKS x BLOCK_SIZE positions, later ratio-1 sources select inside them."""
 
     def _garbage_tail(self, logits, lens):
@@ -821,231 +397,7 @@ class TestTwoLevelDecodeHip(_LowRatioBackendCase):
                     raw, seq, cands, page_table, "consumer"
                 )
 
-    @staticmethod
-    def _row_set(ri, b):
-        sel = ri[b]
-        return set(sel[sel >= 0].tolist())
-
-    @staticmethod
-    def _inside(sel, pos_mask_row):
-        if not sel:
-            return 1.0
-        idx = torch.tensor(sorted(sel), dtype=torch.int64, device=pos_mask_row.device)
-        return pos_mask_row[idx].float().mean().item()
-
-    def test_decode_body_selects_inside_candidates_beyond_16k(self):
-        """Past 16384 compressed positions the consumer must select inside the published
-        candidate blocks and match the torch oracle's two-level selection."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            CandidateBlocks,
-        )
-
-        seq_lens = [20000, 16384, 16385, 33000, 300]
-        case = self._setup(1, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
-        consumer = self._layer_inputs(case)
-        width = case.page_table.shape[1] * INDEX_PAGE_SIZE
-        self.assertGreater(width, SPAN)
-
-        # The source publishes the candidate blocks ...
-        s_pi, s_ri, cands = self._run(case, "decode", candidate_source=True)
-        self.assertIsInstance(cands, CandidateBlocks)
-        ids = cands.ids
-        self.assertEqual(ids.shape, (case.bs, TOPK_BLOCKS))
-        h_mask = ids_to_position_mask(ids, BLOCK_SIZE, width)
-        # ... against the oracle's on its own (golden fp32) logits.
-        _, _, t_masks = self._run(case, "torch", candidate_source=True)
-        # The consumer layer selects inside the published blocks ...
-        c_pi, c_ri, _ = self._run(
-            case, "decode", inputs=consumer, uses_candidates=True, masks=cands
-        )
-        # ... the same layer without the filter (the path before this change) ...
-        u_pi, u_ri, _ = self._run(case, "decode", inputs=consumer)
-        # ... and the oracle consumer restricted to the same blocks, so the
-        # comparison isolates the top-k from the logits kernels' small differences.
-        o_masks = [h_mask[b : b + 1, : int(case.lens[b])] for b in range(case.bs)]
-        _, o_ri, _ = self._run(
-            case, "torch", inputs=consumer, uses_candidates=True, masks=o_masks
-        )
-
-        bound = False
-        for b in range(case.bs):
-            lc = int(case.lens[b])
-            n_valid = min(TOPK, lc)
-            for name, ri in (
-                ("source", s_ri),
-                ("consumer", c_ri),
-                ("unfiltered", u_ri),
-            ):
-                self.assertEqual(int((ri[b] >= 0).sum()), n_valid, f"{name} row {b}")
-                self.assertTrue(bool((ri[b, :n_valid] >= 0).all()), f"{name} row {b}")
-            agree = (h_mask[b, :lc] == t_masks[b][0, :lc]).float().mean().item()
-            self.assertGreaterEqual(agree, 0.95, f"mask agreement {agree} row {b}")
-            self.assertLessEqual(int(h_mask[b, :lc].sum()), SPAN)
-
-            consumer_set = self._row_set(c_ri, b)
-            unfiltered = self._row_set(u_ri, b)
-            oracle = self._row_set(o_ri, b)
-            overlap = len(consumer_set & oracle) / n_valid
-            self.assertGreaterEqual(
-                overlap, 0.95, f"consumer vs oracle {overlap} row {b}"
-            )
-            self.assertEqual(
-                self._inside(consumer_set, h_mask[b]),
-                1.0,
-                f"selection escaped, row {b}",
-            )
-            # Slots resolve the selected positions through the request's page table.
-            sel = c_ri[b, :n_valid].to(torch.int64)
-            expect = index_slots(case.page_table[b : b + 1], sel[None])[0]
-            self.assertTrue(torch.equal(c_pi[b, :n_valid].to(torch.int64), expect))
-            if lc <= SPAN:
-                # Every block is a candidate: the filter changes nothing.
-                self.assertEqual(consumer_set, unfiltered, f"row {b}")
-                continue
-            bound = True
-            escaped = 1.0 - self._inside(unfiltered, h_mask[b])
-            if lc >= 1.1 * SPAN:
-                # With 10% or more of the blocks dropped the consumer's own top-k
-                # lands in them (a row of 16385 drops one block of eight).
-                self.assertGreater(
-                    escaped,
-                    0.0,
-                    f"unfiltered selection stayed inside the blocks, row {b}",
-                )
-        self.assertTrue(bound, "no request exercised a binding candidate mask")
-
     # -- the candidate span: both levels skipped when the batch fits it --------
-
-    def test_decode_body_skips_both_levels_when_batch_fits_span(self):
-        """With the batch inside the span every block is a candidate, so source and
-        consumer must select the identical set and slots as the filtered path."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            CandidateBlocks,
-        )
-
-        seq_lens = [1, 300, 4096, 8192, 16383, 16384]
-        case = self._setup(1, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens))
-        consumer = self._layer_inputs(case)
-
-        filtered_source_pages, filtered_source_raw, cands = self._run(
-            case, "decode", candidate_source=True
-        )
-        self.assertIsInstance(cands, CandidateBlocks)
-        filtered_consumer_pages, filtered_consumer_raw, _ = self._run(
-            case, "decode", inputs=consumer, uses_candidates=True, masks=cands
-        )
-        skipped_source_pages, skipped_source_raw, published = self._run(
-            case, "decode", candidate_source=True, candidate_span=SPAN
-        )
-        self.assertIsNone(published, "the source published under the skip")
-        skipped_consumer_pages, skipped_consumer_raw, _ = self._run(
-            case,
-            "decode",
-            inputs=consumer,
-            uses_candidates=True,
-            masks=None,
-            candidate_span=SPAN,
-        )
-        for name, a, b in (
-            ("source raw", skipped_source_raw, filtered_source_raw),
-            ("source slots", skipped_source_pages, filtered_source_pages),
-            ("consumer raw", skipped_consumer_raw, filtered_consumer_raw),
-            ("consumer slots", skipped_consumer_pages, filtered_consumer_pages),
-        ):
-            self.assertTrue(torch.equal(sorted_rows(a), sorted_rows(b)), name)
-        for b, n in enumerate(seq_lens):
-            self.assertEqual(
-                int((skipped_consumer_raw[b] >= 0).sum()), min(TOPK, n), f"row {b}"
-            )
-
-        # A consumer that did not skip while the source did fails loudly.
-        with self.assertRaises(AssertionError):
-            self._run(case, "decode", inputs=consumer, uses_candidates=True, masks=None)
-
-
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
-)
-class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
-    """A request whose visible compressed context fits index_topk is written without scoring; the skipped path must equal the scored path exactly."""
-
-    def _identity_row_mask(self, case, seq_lens, extend_lens):
-        """Rows of the requests the skip writes without scores."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-            is_identity_request,
-        )
-
-        mask = torch.zeros(case.pos.numel(), dtype=torch.bool, device=case.dev)
-        row = 0
-        for s, e in zip(seq_lens, extend_lens):
-            mask[row : row + e] = is_identity_request(s, case.ratio, TOPK)
-            row += e
-        return mask
-
-    def _assert_identity_rows(self, case, ri, pi, n_rows, msg):
-        """Identity rows hold 0..lens-1 then -1, with slots resolved through the
-        request's page table."""
-        j = torch.arange(TOPK, device=case.dev)
-        reach = j[None, :] < case.lens[:n_rows, None]
-        self.assertTrue(
-            torch.equal(
-                ri[:n_rows], torch.where(reach, j[None, :], -1).to(torch.int32)
-            ),
-            msg,
-        )
-        self.assertTrue(torch.equal(pi[:n_rows] == -1, ~reach), msg)
-
-    # Prefill --------------------------------------------------------------
-
-    def test_prefill_mixed_short_and_long_requests(self):
-        """Identity requests (whole and chunked) are written directly while long
-        requests take the scored path, and the published masks must line up."""
-        cases = {
-            1: ([300, 1500, 45, 700, 512], [300, 1500, 45, 700, 200]),
-            2: ([300, 1500, 3, 2100, 1024], [300, 1500, 3, 2100, 300]),
-        }
-        for ratio, (seq_lens, extend_lens) in cases.items():
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=extend_lens)
-            exact = self._identity_row_mask(case, seq_lens, extend_lens)
-            self.assertTrue(bool(exact.any()) and not bool(exact.all()))
-            full = self._run(case, "extend", skip=False)
-            fast = self._run(case, "extend", skip=True)
-            self._assert_selection(fast, full, f"{ratio=} plain", exact_rows=exact)
-
-            full_src = self._run(case, "extend", skip=False, candidate_source=True)
-            fast_src = self._run(case, "extend", skip=True, candidate_source=True)
-            self._assert_selection(
-                fast_src, full_src, f"{ratio=} source", exact_rows=exact
-            )
-            full_c = self._run(
-                case, "extend", skip=False, uses_candidates=True, masks=full_src[2]
-            )
-            fast_c = self._run(
-                case, "extend", skip=True, uses_candidates=True, masks=fast_src[2]
-            )
-            self._assert_selection(
-                fast_c, full_c, f"{ratio=} consumer", exact_rows=exact
-            )
-
-    # Decode ---------------------------------------------------------------
-
-    def test_decode_identity_batch_matches_scored_path(self):
-        """A decode batch inside the top-k must skip to the transform's sequential
-        branch (0..len-1 in order, then -1) and match the scored path exactly."""
-        for ratio in (1, 2):
-            seq_lens = [1, 37, 300, 512 * ratio, 512 * ratio + ratio - 1]
-            case = self._setup(
-                ratio, seq_lens=seq_lens, extend_lens=[1] * len(seq_lens)
-            )
-            full = self._run(case, "decode", skip=False)
-            fast = self._run(case, "decode", skip=True)
-            self._assert_selection(fast, full, f"{ratio=}")
-            lens = torch.tensor([max(1, s // ratio) for s in seq_lens], device=case.dev)
-            j = torch.arange(TOPK, device=case.dev)
-            reach = j[None, :] < lens[:, None]
-            self.assertTrue(
-                torch.equal(fast[1], torch.where(reach, j[None, :], -1).to(torch.int32))
-            )
 
 
 # -- the head weights: split-K Triton GEMV route --------------------------------

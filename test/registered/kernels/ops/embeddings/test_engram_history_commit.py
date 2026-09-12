@@ -17,7 +17,8 @@ register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 class TestEngramHistoryCommit(CustomTestCase):
     def test_decode_commit_matches_torch_chain(self):
         """The one-launch decode commit is ``history[where(out_loc == 0, pad, slots)] =
-        tokens[:, :n-1].flip(-1)``; padded rows land on the spare row, live rows bitwise."""
+        tokens[:, :n-1].flip(-1)``; padded rows land on the spare row, live rows
+        bitwise."""
         torch.manual_seed(3)
         for bs, n, slots in (
             (1, 4, 10),

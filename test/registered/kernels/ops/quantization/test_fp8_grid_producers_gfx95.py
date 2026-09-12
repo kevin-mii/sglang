@@ -220,8 +220,9 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         self.fake_quant = fake_quant_fp8_activation
 
     def _assert_within_bf16_of_exact(self, out, x, w, ctx):
-        """One bf16 rounding (half an ulp of the result) of an fp32 sum whose association
-        differs from aiter's: the fp32 error is bounded by the sum of absolute products."""
+        """One bf16 rounding (half an ulp of the result) of an fp32 sum whose
+        association differs from aiter's: the fp32 error is bounded by the sum of
+        absolute products."""
         exact = torch.einsum("tgd,grd->tgr", x.double(), w.double()).flatten(1)
         absprod = torch.einsum(
             "tgd,grd->tgr", x.abs().float(), w.abs().float()
@@ -258,8 +259,8 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
             self.assertTrue(torch.equal(self.gemm(x, w), self.fake_quant(plain)))
 
     def test_split_k_regime(self):
-        """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product (the
-        reassociated sum), on the grid, batch-invariant and repeatable."""
+        """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product
+        (the reassociated sum), on the grid, batch-invariant and repeatable."""
         from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
             _split_k_applies,
         )
@@ -290,7 +291,8 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
 
     def test_odd_r_takes_the_single_launch(self):
         """R that is not a 32 multiple never takes split-K (its partial kernel stores
-        whole N tiles): the default regime is the single launch and matches the reference."""
+        whole N tiles): the default regime is the single launch and matches the
+        reference."""
         from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
             _split_k_applies,
         )

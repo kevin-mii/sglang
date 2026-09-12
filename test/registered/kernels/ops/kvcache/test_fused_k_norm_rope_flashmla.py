@@ -86,8 +86,9 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         " kernel is claimed on gfx950 only",
     )
     def test_query_rope_in_the_k_launch(self):
-        """With `q` the K launch must rope every query head's trailing ROPE_DIM bitwise like the flat
-        rope kernel, leave the cache bytes and the nope part untouched, and rope rows without a slot."""
+        """With `q` the K launch must rope every query head's trailing ROPE_DIM bitwise
+        like the flat rope kernel, leave the cache bytes and the nope part untouched,
+        and rope rows without a slot."""
         dev = "cuda"
         page_size = 256
         for num_tokens, heads, pos_dtype, seed in (

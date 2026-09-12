@@ -90,8 +90,8 @@ def _decode_case(batch, heads, gen, dev):
 
 
 def _reference(q, sink, sets):
-    """Decode form of `_reference_prefill`: sets = [(deq_keys, indices [b, 1, w], lengths [b])],
-    a slot at or past its row's length being padding."""
+    """Decode form of `_reference_prefill`: sets = [(deq_keys, indices [b, 1, w],
+    lengths [b])], a slot at or past its row's length being padding."""
     folded = []
     for deq, idx, length in sets:
         pos = torch.arange(idx.shape[-1], device=idx.device)
@@ -161,14 +161,14 @@ class TestAiterSparseBackend(CustomTestCase):
                 )
 
     def test_short_lists_skip_the_padding_key(self):
-        """The -1 inside the length (index 3 of the top-k list) must not be attended: on a
-        5-key list a stray key moves the softmax mass past this tolerance, where the
+        """The -1 inside the length (index 3 of the top-k list) must not be attended: on
+        a 5-key list a stray key moves the softmax mass past this tolerance, where the
         640-key cases absorb it."""
         self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
 
     def test_fold_cache_follows_the_index_source(self):
-        """Layers between two index sources fold the first source's list once; the layers
-        after the second source must fold its list, not reuse the first one's."""
+        """Layers between two index sources fold the first source's list once; the
+        layers after the second source must fold its list, not reuse the first one's."""
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DSV4AttnMetadata,
             _fold_lengths_for_aiter_sparse,
@@ -265,8 +265,7 @@ def _prefill_lists(num_tokens, device, gen):
 
 
 def _reference_prefill(q, sink, sets, chunk=256):
-    """q [t, 1, h, D] bf16; sets = [(deq_keys [slots, D], indices [t, 1, w])].
-    fp32 softmax over the valid (!= -1) gathered keys plus the sink logit."""
+    """q [t, 1, h, D] bf16; sets = [(deq_keys [slots, D], indices [t, 1, w])]."""
     t, _, h, _ = q.shape
     out = torch.empty(t, 1, h, D, device=q.device, dtype=torch.float32)
     for t0 in range(0, t, chunk):
@@ -362,8 +361,9 @@ def _freqs(device, max_pos=8192, seed=0):
 
 
 def _model_inverse_rope(x, freqs_real, positions):
-    """The model's standalone inverse RoPE of the attention output: `fused_rope_inplace(...,
-    inverse=True)` with the batched flat kernel (`set_batched_rope(True)`)."""
+    """The model's standalone inverse RoPE of the attention output:
+    `fused_rope_inplace(..., inverse=True)` with the batched flat kernel
+    (`set_batched_rope(True)`)."""
     from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
     from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
 
@@ -470,54 +470,37 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
     is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
 )
 class TestAiterSparseDecodeSplitPin(CustomTestCase):
-    """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output is bitwise
-    the same at every batch size; aiter's cost model changes the count past 64 rows."""
+    """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output is
+    bitwise the same at every batch size; aiter's cost model changes the count past 64
+    rows."""
 
     ROWS = 96  # aiter picks 2 splits here, 4 at 1..64 rows
 
-    def _run(self, batch, seed=40):
+    def _run(self, batch):
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
         )
 
+        # row i of every batch is row i of the same case
         dev = torch.device("cuda")
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        swa_cache, _ = _pack_cache(2, dev, gen)
-        topk_cache, _ = _pack_cache(5, dev, gen)
-        heads = 16
-        # row i of every batch gets the same query and lists
-        rows = []
-        for i in range(self.ROWS):
-            g = torch.Generator(device="cpu").manual_seed(seed * 1000 + i)
-            rows.append(
-                (
-                    (torch.randn(heads, D, generator=g) * 0.5).to(torch.bfloat16),
-                    torch.randperm(2 * PAGE, generator=g)[:128],
-                    torch.randperm(5 * PAGE, generator=g)[:512],
-                )
-            )
-        q = torch.stack([r[0] for r in rows])[:batch].unsqueeze(1).to(dev)
-        swa_idx = torch.stack([r[1] for r in rows])[:batch].to(torch.int32)
-        topk_idx = torch.stack([r[2] for r in rows])[:batch].to(torch.int32)
-        sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
-
-        def lens(n):
-            return torch.full((batch,), n, dtype=torch.int32, device=dev)
-
+        c = _decode_case(
+            self.ROWS, 16, torch.Generator(device="cpu").manual_seed(40), dev
+        )
+        lens = lambda n: torch.full((batch,), n, dtype=torch.int32, device=dev)
         return flash_mla_with_kvcache_entrypoint(
             backend="aiter_sparse",
-            q=q,
-            k_cache=swa_cache,
+            q=c.q[:batch],
+            k_cache=c.swa_cache,
             head_dim_v=D,
             block_table=None,
             cache_seqlens=None,
             tile_scheduler_metadata=None,
             softmax_scale=SCALE,
             is_fp8_kvcache=True,
-            attn_sink=sink,
-            extra_k_cache=topk_cache,
-            indices=_masked(swa_idx.unsqueeze(1).to(dev), lens(128)),
-            extra_indices_in_kvcache=_masked(topk_idx.unsqueeze(1).to(dev), lens(512)),
+            attn_sink=c.sink,
+            extra_k_cache=c.topk_cache,
+            indices=_masked(c.swa_idx[:batch], lens(128)),
+            extra_indices_in_kvcache=_masked(c.topk_idx[:batch], lens(512)),
         )[0]
 
     def test_pinned_splits_are_batch_invariant(self):

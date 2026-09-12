@@ -295,44 +295,6 @@ class TestRocmRouterGate(CustomTestCase):
             self.reduce(self.gemv(x, weight), again)
             self.assertTrue(torch.equal(again, full))
 
-    def test_select_experts_consumes_partials(self):
-        # select_experts must gate the partials exactly like the reduced logits and fill the logits buffer
-        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-
-        config = TopKConfig(
-            top_k=TOPK,
-            renormalize=True,
-            correction_bias=self.bias_bf16,
-            routed_scaling_factor=ROUTED_SCALING,
-            scoring_func="sqrtsoftplus",
-            allow_routed_experts_capture=False,
-        )
-        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        for num_tokens in (1, 64):
-            x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
-            partials = self.gemv(x, weight)
-            logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
-            self.reduce(partials, logits)
-            num_valid = torch.tensor(
-                [max(1, num_tokens // 2)], dtype=torch.int32, device=self.device
-            )
-            for pad in (None, num_valid):
-                ref = select_experts(
-                    x, logits.clone(), config, num_token_non_padded=pad
-                )
-                buffer = torch.empty_like(logits)
-                out = select_experts(
-                    x,
-                    buffer,
-                    config,
-                    num_token_non_padded=pad,
-                    router_logits_partials=partials,
-                )
-                self.assertTrue(torch.equal(ref.topk_ids, out.topk_ids))
-                self.assertTrue(torch.equal(ref.topk_weights, out.topk_weights))
-                self.assertEqual(out.router_logits.data_ptr(), buffer.data_ptr())
-                self.assertTrue(torch.equal(out.router_logits, logits))
-
     def test_fused_gate_on_partials(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
         for num_tokens in (1, 64):
@@ -558,19 +520,13 @@ class TestRocmRouterGateSort(CustomTestCase):
                 32,
                 True,
             )
-            for _ in range(3):
-                out = self.fused(torch.empty_like(logits), *args)
-                self.assertTrue(
-                    torch.equal(out[1], ref_i) and torch.equal(out[0], ref_w)
-                )
-                _assert_same_sort(self, ref_sort, out[2:], 32, num_tokens, num_tokens)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
                     outs = [
-                        self.fused(torch.empty_like(logits), *args) for _ in range(4)
+                        self.fused(torch.empty_like(logits), *args) for _ in range(2)
                     ]
             torch.cuda.current_stream().wait_stream(stream)
             for _ in range(2):

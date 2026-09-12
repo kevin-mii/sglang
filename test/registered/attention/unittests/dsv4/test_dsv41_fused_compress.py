@@ -432,6 +432,33 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
             )
 
+    def test_padded_rows_publish_nothing(self):
+        """A padded graph suffix carries `raw_out_loc == 0` and `out_loc == 0`, which
+        both kernels must read off the arrays (the caller passes no mask)."""
+        n, pad = 8, 3
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                t = _build(n, ratio, seed=200 + ratio)
+                core = t.backend.forward_metadata.core_metadata
+                core.raw_out_loc[-pad:] = 0
+                core.c1_out_loc[-pad:] = 0
+                core.c2_out_loc[-pad:] = 0
+                DeepseekV4AttnBackend._low_ratio_compress_fused(
+                    t.backend, t.layer, t.x, t.req, t.pos
+                )
+                torch.cuda.synchronize()
+                # slot 0 of page 0 is the reserved dummy a padded row lands on without the predicate
+                self.assertFalse(
+                    t.kv_cache.view(torch.uint8)[0, :576].any(),
+                    "a padded row wrote main-KV slot 0",
+                )
+                if t.index_k_split:
+                    payload, scale = t.index_cache
+                    self.assertFalse(payload[0, 0, :, 0, :].any())
+                    self.assertFalse(scale[0, 0, :, 0].any())
+                else:
+                    self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
+
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it `c2_out_loc == -1`; an index-K writer taking that -1 straight from

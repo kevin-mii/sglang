@@ -12,7 +12,6 @@ import torch
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
-    mask_indices_by_length,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -177,38 +176,6 @@ def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bo
             assert torch.equal(outs[0][1], outs[1][1])
 
 
-def _ref_mask(indices, lengths):
-    w = indices.shape[-1]
-    pos = torch.arange(w, device=indices.device, dtype=lengths.dtype)
-    return torch.where(pos < lengths.view(-1, 1, 1), indices, indices.new_full((), -1))
-
-
-@pytest.mark.parametrize("s", [1])
-@pytest.mark.parametrize("len_dtype", [torch.int32])
-def test_mask_indices_by_length_single_and_pair(s: int, len_dtype):
-    rng = _seed(3)
-    for b in (1, 6):
-        w1, w2 = 128, 512
-        idx1 = torch.randint(-1, 1 << 20, (b, s, w1), dtype=torch.int32, device=DEVICE)
-        idx2 = torch.randint(-1, 1 << 20, (b, s, w2), dtype=torch.int32, device=DEVICE)
-        len1 = torch.tensor(
-            [rng.choice([0, 1, 5, w1, w1 + 3]) for _ in range(b)],
-            dtype=len_dtype,
-            device=DEVICE,
-        )
-        len2 = torch.tensor(
-            [rng.choice([0, 1, 17, w2 - 1, w2, 999]) for _ in range(b)],
-            dtype=len_dtype,
-            device=DEVICE,
-        )
-        out1, out2 = mask_indices_by_length(idx1, len1, idx2, len2)
-        assert torch.equal(out1, _ref_mask(idx1, len1))
-        assert torch.equal(out2, _ref_mask(idx2, len2))
-        only, none = mask_indices_by_length(idx2, len2)
-        assert none is None and torch.equal(only, _ref_mask(idx2, len2))
-        assert out1.dtype is idx1.dtype and out1.shape == idx1.shape
-
-
 @pytest.mark.parametrize("bpp", [4])
 def test_expand_index_page_table(bpp: int):
     _seed(5)
@@ -260,8 +227,8 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
 
 
 def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then zeros
-    and a permuted copy into the scale layout."""
+    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then
+    zeros and a permuted copy into the scale layout."""
     num_tokens, heads = q.shape[0], q.shape[1]
     assert heads % 16 == 0 and heads <= 64, heads
     q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
