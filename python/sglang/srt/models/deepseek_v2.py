@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -107,9 +106,6 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
-from sglang.srt.layers.moe.moe_runner.aiter import (
-    aiter_fused_reduce_shared_add,
-)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -229,6 +225,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
+    from sglang.srt.layers.moe.moe_runner.aiter import aiter_fused_reduce_shared_add
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
         aiter_dsv3_router_split_k,
@@ -329,8 +326,6 @@ class DeepseekV2MLP(nn.Module):
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
-        self._hip_act_fp8_grid = False
-        self._hip_act_native_consumer = False
 
     def forward(
         self,
@@ -459,7 +454,7 @@ class DeepseekV2MLP(nn.Module):
                     activation="silu",
                 )
 
-        # Fallback: fused silu+clamp kernel (still faster than unfused); the JIT kernel is CUDA-only
+        # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
             if _is_hip:
                 x = _hip_act.silu_and_mul_clamp(self, gate_up)
@@ -1015,8 +1010,7 @@ class DeepseekV2MoE(nn.Module):
         fused_gate: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """The router logits and, on the ROCm decode router, the split-K partials
-        ``self.topk`` sums into them. ``fused_gate=False`` when anything but
-        ``self.topk`` reads the logits: they are then computed here in full."""
+        ``self.topk`` sums into them; ``fused_gate=False`` when anything else reads them."""
         if fused_gate and _use_aiter and not getattr(self, "is_hash", False):
             logits_and_partials = aiter_dsv3_router_split_k(self.gate, hidden_states)
             if logits_and_partials is not None:
@@ -1346,7 +1340,7 @@ class DeepseekV2MoE(nn.Module):
                 shared_add_alpha(self.experts, self.routed_scaling_factor),
             )
             if fuse_shared_into_reduce and shared_output is not None
-            else contextlib.nullcontext()
+            else nullcontext()
         )
         with fused_reduce_scope as fused_reduce:
             if pre_quant_input is not None:
