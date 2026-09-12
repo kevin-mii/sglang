@@ -1373,13 +1373,7 @@ class DeepseekV4HipRadixBackend(
             else:
                 metadata.low_ratio_req_indices = token_req_indices(forward_batch)
                 metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
-
-        # same capture-safe workspace contract as the c4 ones below
-        if (
-            isinstance(metadata, DSV4Metadata)
-            and metadata.core_metadata.low_ratios
-            and one_token_rows
-        ):
+            # same capture-safe workspace contract as the c4 ones below
             metadata.fp4_low_ratio_decode_workspaces = (
                 build_low_ratio_decode_workspaces(
                     {

@@ -624,35 +624,30 @@ class AiterRunnerCore(MoeRunnerCore):
             else contextlib.nullcontext()
         )
         with scope as request:
-            output = self._call_fused_moe(
-                fused_moe, runner_input, quant_info, a1_scale, extra
+            output = fused_moe(
+                hidden_states=runner_input.hidden_states,
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                topk_weight=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                quant_type=_aiter_quant_type(runner_input.quant_type),
+                activation=_aiter_activation(self.config.activation),
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=quant_info.a2_scale,
+                bias1=quant_info.b13,
+                bias2=quant_info.b2,
+                expert_mask=quant_info.expert_mask,
+                doweight_stage1=quant_info.doweight_stage1,
+                hidden_pad=quant_info.hidden_pad,
+                intermediate_pad=quant_info.intermediate_pad,
+                **extra,
             )
         if request is not None and not request.fired:
             # fused_moe took a route that never sorts (grouped GEMM); the padded rows stayed unmasked
             _warn_fused_sorting_unused()
         return AiterRunnerOutput(hidden_states=output)
-
-    def _call_fused_moe(self, fused_moe, runner_input, quant_info, a1_scale, extra):
-        return fused_moe(
-            hidden_states=runner_input.hidden_states,
-            w1=quant_info.w13_weight,
-            w2=quant_info.w2_weight,
-            topk_weight=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
-            quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=quant_info.a2_scale,
-            bias1=quant_info.b13,
-            bias2=quant_info.b2,
-            expert_mask=quant_info.expert_mask,
-            doweight_stage1=quant_info.doweight_stage1,
-            hidden_pad=quant_info.hidden_pad,
-            intermediate_pad=quant_info.intermediate_pad,
-            **extra,
-        )
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
