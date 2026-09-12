@@ -1513,6 +1513,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
+            # aiter: MXFP8 experts shuffled into AITER's layout and run on the
+            # FlyDSL fp8 per-1x32 fused-MoE kernels (see Fp8MoEMethod).
+            allowed.append("aiter")
 
         if view.moe_a2a_backend == "flashinfer_megamoe":
             mxfp8_default = "flashinfer_megamoe"
