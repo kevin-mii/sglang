@@ -62,13 +62,13 @@ def _make_pool():
 
 def _build(n: int, ratio: int, seed: int):
     """One decode step against the real pool."""
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _low_ratio_compression_metadata,
+    )
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
         DeepseekV41Compressor,
         DeepseekV41Indexer,
         RMSNorm,
-    )
-    from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
-        _low_ratio_compression_metadata,
     )
     from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -361,7 +361,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
 
     def test_static_verify_dispatch_and_real_pool_writes(self):
         from sglang.kernels.ops.attention.dsv4.c2 import c2_verify_norm_rope_store
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_compression_metadata,
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -463,7 +463,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it `c2_out_loc == -1`; an index-K writer taking that -1 straight from
         the array would wrap to the last slot."""
-        from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_compression_metadata,
         )
 

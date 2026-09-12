@@ -38,6 +38,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    PAGE_INDEX_ALIGNED_SIZE,
+    DeepseekV4AttnBackend,
+    _pad_last_dim,
+)
 from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMetadata
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -46,15 +51,11 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
-    PAGE_INDEX_ALIGNED_SIZE,
-    LowRatioBackendMixin,
-    _pad_last_dim,
-)
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
     build_low_ratio_decode_workspaces,
     low_ratio_candidate_span,
+    low_ratio_compress_fused_hip,
     low_ratio_decode_rows_are_identity,
     low_ratio_identity_skip_enabled,
     low_ratio_index_topk_hip_decode,
@@ -706,7 +707,6 @@ class DeepseekV4HipRadixBackend(
     AttentionBackend,
     C4IndexerBackendMixin,
     CompressorBackendMixin,
-    LowRatioBackendMixin,
 ):
     # DSV4 TBO runs ONLY in eager prefill (prefill cuda-graph is disabled);
     # decode/target-verify graphs are non-TBO (primary backend only). So the TBO
@@ -718,6 +718,20 @@ class DeepseekV4HipRadixBackend(
     supports_ragged_verify_graph: bool = True
     # each bucket keeps one metadata object; the captured segments read the SWA store target by address
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
+
+    # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
+    # unbound; HIP differs only in the index-K store layout and the paged top-k
+    forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
+    _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
+    _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
+    _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
+    _low_ratio_compress_decode = DeepseekV4AttnBackend._low_ratio_compress_decode
+    _low_ratio_compress_torch = DeepseekV4AttnBackend._low_ratio_compress_torch
+    _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
+    _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
+    _low_ratio_index_topk_torch = DeepseekV4AttnBackend._low_ratio_index_topk_torch
+    _low_ratio_compress_fused = low_ratio_compress_fused_hip
 
     def __init__(
         self,

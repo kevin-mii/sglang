@@ -26,7 +26,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
-from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
+from sglang.srt.layers.attention.deepseek_v4_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
 )
@@ -730,6 +730,113 @@ def low_ratio_index_topk_hip_decode(
     )
 
 
+def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
+    """Per request, the c1/c2 pool slots of its visible compressed positions, and
+    each request's start offset in their concatenation."""
+    slot_chunks, starts, start = [], [], 0
+    for r, lc in enumerate(lc_per_req):
+        starts.append(start)
+        if lc == 0:
+            continue
+        j = torch.arange(lc, device=device)
+        slot_chunks.append(
+            req_to_token[req_pool_indices[r], j * ratio].to(torch.int64) // ratio
+        )
+        start += lc
+    return slot_chunks, starts
+
+
+def low_ratio_compress_fused_hip(backend, layer, x, req, pos, *, draft_len=1) -> None:
+    """``DeepseekV4AttnBackend._low_ratio_compress_fused`` with the index keys stored in
+    the FlyDSL split payload / scale layout when the pool keeps one. Both write kernels
+    consume metadata dtypes directly and suppress padded stores."""
+    from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
+    from sglang.kernels.ops.attention.dsv4.c2 import (
+        c2_decode_norm_rope_store,
+        c2_verify_norm_rope_store,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_rope import index_k_norm_rope_pack_store
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
+        index_k_norm_rope_pack_store_split,
+    )
+
+    pool = backend.token_to_kv_pool
+    core = backend.forward_metadata.core_metadata
+    compressor = layer.compressor
+    layer_id = layer.layer_id
+    # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
+    freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
+    kv_cache = pool.get_extra_key_buffer(layer_id)
+    page_size = pool.get_extra_key_page_size(layer_id)
+    assert kv_cache is not None
+
+    if layer.compress_ratio == 1:
+        # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
+        latent = c1_decode_norm_rope_store(
+            compressor.wkv(x),
+            compressor.norm.weight.data,
+            pos,
+            core.raw_out_loc,
+            compressor.norm.eps,
+            freqs_cis,
+            kv_cache,
+            page_size=page_size,
+        )
+        out_loc = core.c1_out_loc
+    else:
+        # pending-pair ring: | kv | score | at req * ring_size + pos % ring_size
+        state = pool.get_attention_compress_states(layer_id)
+        c2_compress = (
+            c2_verify_norm_rope_store if draft_len > 1 else c2_decode_norm_rope_store
+        )
+        verify_args = {"draft_len": draft_len} if draft_len > 1 else {}
+        latent = c2_compress(
+            compressor.project_fused(x),
+            state.kv_score_buffer.kv_score,
+            compressor.norm.weight.data,
+            pos,
+            req,
+            core.raw_out_loc,
+            compressor.norm.eps,
+            freqs_cis,
+            kv_cache,
+            page_size=page_size,
+            ring_size=state.ring_size,
+            **verify_args,
+        )
+        out_loc = core.c2_out_loc
+
+    indexer = layer.indexer
+    if indexer is not None and indexer.owns_k:
+        # out_loc is -1 for an incomplete group and 0 for padding; the kernel stores neither
+        assert out_loc is not None
+        k = indexer.forward_wk(latent)
+        if pool.low_ratio_index_k_is_split(layer_id):
+            # FlyDSL split payload / scale layout; same bytes as store_fp4_index_k_cache_split
+            index_k_norm_rope_pack_store_split(
+                k,
+                indexer.k_norm.weight.data,
+                indexer.k_norm.eps,
+                freqs_cis,
+                pos,
+                out_loc,
+                pool.get_index_k_fp4_payload_buffer(layer_id),
+                pool.get_index_k_fp4_scale_buffer(layer_id),
+                ratio=layer.compress_ratio,
+            )
+        else:
+            index_k_norm_rope_pack_store(
+                k,
+                indexer.k_norm.weight.data,
+                indexer.k_norm.eps,
+                freqs_cis,
+                pos,
+                out_loc,
+                pool.get_index_k_with_scale_buffer(layer_id),
+                ratio=layer.compress_ratio,
+            )
+
+
 def low_ratio_index_topk_hip_extend(
     backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
 ) -> None:
@@ -773,7 +880,8 @@ def low_ratio_index_topk_hip_extend(
     publish = [] if indexer.is_candidate_source else None
     if any(is_identity):
         # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
-        slot_chunks, starts = backend._low_ratio_extend_k_slots(
+        slot_chunks, starts = _extend_k_slots(
+            backend.req_to_token,
             ratio=ratio,
             lc_per_req=lc_per_req,
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int64),
