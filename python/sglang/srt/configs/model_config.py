@@ -209,6 +209,11 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) == "DSparkDraftModel"
 
 
+def is_llama_eagle3_draft(config) -> bool:
+    """Llama-architecture EAGLE3 draft head (e.g. the MiniMax-M3 EAGLE3 draft)."""
+    return _hf_arch(config) == "LlamaForCausalLMEagle3"
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
