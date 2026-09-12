@@ -23,14 +23,19 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
-def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm."""
+def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
+    """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
+    ``positions``, ``freqs`` is the whole table and the fused kernel gathers ``freqs[positions]``."""
     if x.is_cuda and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,
         )
 
-        return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
+        return rope_tail_fake_quant_fp4(
+            x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
+        )
+    if positions is not None:
+        freqs = freqs[positions]
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -264,10 +269,17 @@ class DeepseekV41Indexer(nn.Module):
         k = self.k_norm(self.forward_wk(latent))
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
-    def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def queries(
+        self,
+        q_lora: torch.Tensor,
+        freqs: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``freqs`` per token, or the whole table with ``positions`` (gathered inside the
+        fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
-        return _rope_fq4(q, freqs, self.rope_head_dim)
+        return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
