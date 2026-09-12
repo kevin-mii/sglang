@@ -185,10 +185,6 @@ class RadixAttention(nn.Module):
             and (torch.compiler.is_compiling() or not _force_eager_attn.get())
         ):
             if kwargs.get("idx_q") is not None:
-                if is_in_breakable_cuda_graph():
-                    return get_attn_backend().forward(
-                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
-                    )
                 idx_q = kwargs["idx_q"]
                 idx_k = kwargs["idx_k"]
                 idx_v = kwargs.get("idx_v")
@@ -196,7 +192,17 @@ class RadixAttention(nn.Module):
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim)
                 )
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
-                unified_sparse_attention_with_output(
+                # Under a breakable prefill graph the sparse attention must be
+                # an eager break like the dense path: its metadata (cu_seqlens,
+                # page layout, top-k block tables) is per batch, so a captured
+                # copy would replay the capture batch's layout for every later
+                # batch.
+                sparse_attn_fn = (
+                    breakable_unified_sparse_attention_with_output
+                    if is_in_breakable_cuda_graph()
+                    else unified_sparse_attention_with_output
+                )
+                sparse_attn_fn(
                     q,
                     k,
                     v,
@@ -520,9 +526,7 @@ def unified_attention_with_output_and_lse(
     return lse
 
 
-@register_custom_op(mutates_args=["attn_out", "idx_out"])
-@register_split_op()
-def unified_sparse_attention_with_output(
+def _unified_sparse_attention_with_output_impl(
     query: torch.Tensor,
     key: Optional[torch.Tensor],
     value: Optional[torch.Tensor],
@@ -532,7 +536,6 @@ def unified_sparse_attention_with_output(
     idx_k: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
-    *,
     idx_v: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_tc_piecewise_forward_context()
@@ -580,6 +583,42 @@ def unified_sparse_attention_with_output(
         _zero_padded_pcg_tail(buf, context)
     return
 
+
+@register_custom_op(mutates_args=["attn_out", "idx_out"])
+@register_split_op()
+def unified_sparse_attention_with_output(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    attn_out: torch.Tensor,
+    idx_out: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    idx_v: Optional[torch.Tensor] = None,
+) -> None:
+    _unified_sparse_attention_with_output_impl(
+        query,
+        key,
+        value,
+        attn_out,
+        idx_out,
+        idx_q,
+        idx_k,
+        save_kv_cache,
+        layer_id,
+        idx_v=idx_v,
+    )
+
+
+# Breakable prefill graph: the sparse attention runs eagerly between graph
+# segments (plain function, not the custom op) so per-batch metadata is
+# rebuilt at replay. Mirrors ``breakable_unified_attention_with_output``.
+breakable_unified_sparse_attention_with_output = eager_on_graph(True)(
+    _unified_sparse_attention_with_output_impl
+)
 
 breakable_unified_attention_with_output = eager_on_graph(True)(
     unified_attention_with_output
