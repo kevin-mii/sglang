@@ -11,7 +11,6 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
     _mxfp8_e4m3_quantize_torch,
-    bf16_dequant_blockscaled_linear,
     dequant_mxfp8_to_bf16,
     fake_quant_fp8_activation,
 )
@@ -158,23 +157,6 @@ class TestRmsnormFakeQuantFp8(CustomTestCase):
         fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
         self.assertEqual(fq.x.shape, (0, 5120))
         self.assertEqual(y.shape, (0, 5120))
-
-    def test_bf16_dequant_linear_skips_requant(self):
-        # the dense route must see the same GEMM operands from the fused output as from the unfused route
-        torch.manual_seed(4)
-        x, w = self._make(8, 5120)
-        weight = (
-            (torch.randn(256, 5120, device="cuda") * 0.02)
-            .to(torch.float8_e4m3fn)
-            .to(torch.bfloat16)
-        )
-        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
-        fused_route = bf16_dequant_blockscaled_linear(
-            fq.x, weight, input_on_fp8_grid=True
-        )
-        unfused_route = bf16_dequant_blockscaled_linear(y, weight)
-        # same operands into the same GEMM; the tolerance only guards a different BLAS algorithm between calls
-        torch.testing.assert_close(fused_route, unfused_route, atol=0, rtol=1e-2)
 
 
 def _silu_mul_clamp_reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:

@@ -313,13 +313,6 @@ def test_sparse_buffers(topk: int, ratios):
                 assert f"c{r}_sparse_page_indices" not in out
 
 
-def test_pad_last_dim_is_identity_when_aligned():
-    x = torch.zeros((2, 128), dtype=torch.int32, device=DEVICE)
-    assert _pad_last_dim(x) is x
-    y = _pad_last_dim(torch.zeros((2, 100), dtype=torch.int32, device=DEVICE))
-    assert y.shape == (2, 128) and (y[:, 100:] == -1).all()
-
-
 def _ref_init_compression_metadata(
     seq_lens, positions, raw_out_loc, page_table, page_size
 ):

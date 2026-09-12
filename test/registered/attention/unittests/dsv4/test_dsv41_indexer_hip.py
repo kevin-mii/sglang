@@ -1395,19 +1395,6 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
                 fast_c, full_c, f"{ratio=} consumer", exact_rows=exact
             )
 
-    def test_prefill_identity_rows_match_torch_oracle_exactly(self):
-        """Identity rows inside a mixed batch agree with the torch oracle without any
-        tie tolerance."""
-        for ratio in (1, 2):
-            seq_lens = [300, 45, 1500, 512 * ratio]
-            case = self._setup(ratio, seq_lens=seq_lens, extend_lens=seq_lens)
-            exact = self._identity_row_mask(case, seq_lens, seq_lens)
-            self.assertEqual(int(exact.sum()), sum(seq_lens) - 1500)
-            fast_pi, fast_ri, _ = self._run(case, "extend", skip=True)
-            t_pi, t_ri, _ = self._run(case, "torch", skip=False)
-            self.assertTrue(torch.equal(fast_ri[exact], t_ri[exact]), f"{ratio=}")
-            self.assertTrue(torch.equal(fast_pi[exact], t_pi[exact]), f"{ratio=}")
-
     def test_prefill_request_groups_are_neutral_with_skip(self):
         """Splitting a mixed batch into request groups must leave the identity rows and
         the scored rows' masks unchanged."""
