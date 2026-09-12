@@ -71,6 +71,8 @@ def _mxfp8_quant_kernel(
     s_ptr,
     M,
     K,
+    M_XQ,
+    M_S,
     sxm,
     sxk,
     sqm,
@@ -79,7 +81,13 @@ def _mxfp8_quant_kernel(
     ssk,
     BLOCK_M: tl.constexpr,
 ):
-    """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per ``[BLOCK_M, 32]``."""
+    """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per ``[BLOCK_M, 32]``.
+
+    Rows ``[0, M)`` are real. ``xq`` rows ``[M, M_XQ)`` and scale rows
+    ``[M, M_S)`` are padding written as zeros (E8M0 0 == 2^-127, finite), so a
+    consumer that needs row-aligned operands (torch._scaled_mm MX: fp8 rows
+    %32, scale rows %128) gets them straight from this launch.
+    """
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)  # which 32-element block along K
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -97,32 +105,50 @@ def _mxfp8_quant_kernel(
     sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
     descale = tl.exp2(sb - 127.0)
     xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
+    # x loads as 0 for pad rows -> xq is already 0 there; force the scale to 0.
+    sb = tl.where(m_mask, sb, 0.0)
     tl.store(
         xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
         xq,
-        mask=m_mask[:, None],
+        mask=(offs_m < M_XQ)[:, None],
     )
-    tl.store(s_ptr + offs_m * ssm + pid_b * ssk, sb.to(tl.uint8), mask=m_mask)
+    tl.store(s_ptr + offs_m * ssm + pid_b * ssk, sb.to(tl.uint8), mask=offs_m < M_S)
+
+
+def _round_up(v: int, m: int) -> int:
+    return (v + m - 1) // m * m
 
 
 def _mxfp8_e4m3_quantize_triton(
     x: torch.Tensor,
+    pad_rows_to: int = 1,
+    scale_pad_rows_to: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused 2D MXFP8 quant (row-major [M, K//32] UE8M0 scales)."""
+    """Fused 2D MXFP8 quant (row-major [M, K//32] UE8M0 scales).
+
+    ``pad_rows_to`` / ``scale_pad_rows_to`` round the fp8 / scale row counts up
+    (pad rows are zero-filled by the kernel) so the caller does not need a
+    separate zeros()+copy_() pair per operand -- 4 extra launches per GEMM on
+    the decode path, where M is a handful of tokens.
+    """
     M, K = x.shape
     x = x.contiguous()
-    xq = torch.empty((M, K), dtype=MXFP8_VALUE_DTYPE, device=x.device)
+    m_xq = _round_up(M, pad_rows_to)
+    m_s = _round_up(M, scale_pad_rows_to)
+    xq = torch.empty((m_xq, K), dtype=MXFP8_VALUE_DTYPE, device=x.device)
     scales = torch.empty(
-        (M, K // MXFP8_BLOCK_SIZE), dtype=MXFP8_SCALE_DTYPE, device=x.device
+        (m_s, K // MXFP8_BLOCK_SIZE), dtype=MXFP8_SCALE_DTYPE, device=x.device
     )
     BLOCK_M = 64
-    grid = (triton.cdiv(M, BLOCK_M), K // MXFP8_BLOCK_SIZE)
+    grid = (triton.cdiv(max(m_xq, m_s), BLOCK_M), K // MXFP8_BLOCK_SIZE)
     _mxfp8_quant_kernel[grid](
         x,
         xq,
         scales,
         M,
         K,
+        m_xq,
+        m_s,
         x.stride(0),
         x.stride(1),
         xq.stride(0),
@@ -134,15 +160,29 @@ def _mxfp8_e4m3_quantize_triton(
     return xq, scales
 
 
-def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def mxfp8_e4m3_quantize(
+    x: torch.Tensor,
+    *,
+    pad_rows_to: int = 1,
+    scale_pad_rows_to: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token MXFP8 quant -> (fp8 values, [.., K//32] uint8 UE8M0 scales).
 
     Uses the single fused Triton kernel for the common 2D, ``K % 32 == 0`` case
-    (activations); falls back to the torch reference otherwise.
+    (activations); falls back to the torch reference otherwise. With
+    ``pad_rows_to`` / ``scale_pad_rows_to`` > 1 (2D only) the returned tensors
+    carry zero pad rows up to those multiples; rows ``[0, M)`` are the data.
     """
     if x.ndim == 2 and x.shape[-1] % MXFP8_BLOCK_SIZE == 0 and x.is_cuda:
-        return _mxfp8_e4m3_quantize_triton(x.contiguous())
-    return _mxfp8_e4m3_quantize_torch(x)
+        return _mxfp8_e4m3_quantize_triton(
+            x.contiguous(), pad_rows_to, scale_pad_rows_to
+        )
+    xq, sc = _mxfp8_e4m3_quantize_torch(x)
+    if x.ndim == 2 and (pad_rows_to > 1 or scale_pad_rows_to > 1):
+        M = x.shape[0]
+        xq = F.pad(xq, (0, 0, 0, _round_up(M, pad_rows_to) - M))
+        sc = F.pad(sc, (0, 0, 0, _round_up(M, scale_pad_rows_to) - M))
+    return xq, sc
 
 
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -259,9 +299,15 @@ def _run_mxfp8_linear_kernel(
     return out
 
 
+# torch._scaled_mm MX (1x32) operand alignment on ROCm: fp8 rows %32, E8M0
+# scale rows %128.
+_SCALED_MM_ROW_ALIGN = 32
+_SCALED_MM_SCALE_ROW_ALIGN = 128
+
+
 def _pad_mx_scale_e8m0(s: torch.Tensor) -> torch.Tensor:
     m, g = s.shape
-    mp = (m + 127) // 128 * 128
+    mp = _round_up(m, _SCALED_MM_SCALE_ROW_ALIGN)
     if mp == m:
         return s.contiguous().view(torch.float8_e8m0fnu)
     out = torch.zeros(mp, g, dtype=s.dtype, device=s.device)
@@ -269,27 +315,44 @@ def _pad_mx_scale_e8m0(s: torch.Tensor) -> torch.Tensor:
     return out.view(torch.float8_e8m0fnu)
 
 
+def _weight_scale_e8m0(w_scale: torch.Tensor) -> torch.Tensor:
+    """Row-aligned E8M0 view of a (static) weight scale, built once per tensor."""
+    v = getattr(w_scale, "_scaled_mm_e8m0", None)
+    if v is None:
+        v = _pad_mx_scale_e8m0(w_scale)
+        try:
+            w_scale._scaled_mm_e8m0 = v
+        except AttributeError:
+            pass
+    return v
+
+
 def _run_scaled_mm_mxfp8_linear(
-    x_q: torch.Tensor,  # [M, K] fp8 e4m3
-    x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
+    x_q: torch.Tensor,  # [M or M_pad, K] fp8 e4m3
+    x_scale: torch.Tensor,  # [M or M_pad', K//32] uint8 (E8M0)
     w: torch.Tensor,  # [N, K] fp8 e4m3
     w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
     out_dtype: torch.dtype,
+    m: Optional[int] = None,
 ) -> torch.Tensor:
-    m = x_q.shape[0]
-    mp = (m + 31) // 32 * 32
-    if mp != m:
+    """``m`` is the real row count when ``x_q``/``x_scale`` were produced with
+    pad rows (see ``mxfp8_e4m3_quantize(pad_rows_to=...)``); the pad rows are
+    then consumed as-is and only sliced off the output."""
+    if m is None:
+        m = x_q.shape[0]
+    mp = _round_up(x_q.shape[0], _SCALED_MM_ROW_ALIGN)
+    if mp != x_q.shape[0]:
         x_pad = torch.zeros(mp, x_q.shape[1], dtype=x_q.dtype, device=x_q.device)
-        x_pad[:m] = x_q
+        x_pad[: x_q.shape[0]] = x_q
         x_q = x_pad
     out = torch._scaled_mm(
         x_q,
         w.t(),
         scale_a=_pad_mx_scale_e8m0(x_scale),
-        scale_b=_pad_mx_scale_e8m0(w_scale),
+        scale_b=_weight_scale_e8m0(w_scale),
         out_dtype=out_dtype,
     )
-    return out[:m] if mp != m else out
+    return out[:m] if out.shape[0] != m else out
 
 
 @functools.cache
@@ -403,7 +466,21 @@ def dot_scaled_mxfp8_blockscaled_linear(
 
     if k % 128 == 0:
         if input_scale is None:
-            # Quantize the bf16/fp16 activations per token inside the path.
+            # Quantize the bf16/fp16 activations per token inside the path. For
+            # torch._scaled_mm, emit the row-aligned operands straight from the
+            # quant kernel (no zeros()+copy_() pair per operand per GEMM).
+            if _use_scaled_mm_mxfp8_gemm():
+                x_q, x_scale = mxfp8_e4m3_quantize(
+                    input_2d,
+                    pad_rows_to=_SCALED_MM_ROW_ALIGN,
+                    scale_pad_rows_to=_SCALED_MM_SCALE_ROW_ALIGN,
+                )
+                out = _run_scaled_mm_mxfp8_linear(
+                    x_q, x_scale, weight, weight_scale, input_2d.dtype, m=m
+                )
+                if bias is not None:
+                    out = out + bias
+                return out.to(output_dtype).view(*output_shape)
             x_q, x_scale = mxfp8_e4m3_quantize(input_2d)
             kernel_out_dtype = input_2d.dtype
         else:
