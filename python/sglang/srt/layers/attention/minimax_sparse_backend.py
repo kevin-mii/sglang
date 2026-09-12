@@ -158,6 +158,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        # (forward_batch, meta) for eager verify; see _forward_gpu_triton_verify.
+        self._verify_meta_eager = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -1435,18 +1437,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ndt = num_tokens // max(bs, 1)
         vmeta = self._verify_meta_cg.get((bs, ndt))
         if vmeta is None:
-            # seq_lens is the prefix length here (see init_forward_metadata_in_graph).
-            prefix = forward_batch.seq_lens.to(torch.long)
-            offsets = torch.arange(1, int(ndt) + 1, device=q.device, dtype=torch.long)
-            per_query_seq_lens = (
-                (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
-            )
-            per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
-                int(ndt)
-            )
-        else:
-            per_query_seq_lens = vmeta.per_query_seq_lens
-            per_query_req = vmeta.per_query_req
+            # Eager (non-graph) verify: build the per-query metadata once per
+            # forward and reuse it across the 60 layers instead of re-deriving
+            # it (6 small launches) in every layer.
+            cached = self._verify_meta_eager
+            if cached is not None and cached[0] is forward_batch:
+                vmeta = cached[1]
+            else:
+                # seq_lens is the prefix length here (see init_forward_metadata_in_graph).
+                prefix = forward_batch.seq_lens.to(torch.long)
+                offsets = torch.arange(
+                    1, int(ndt) + 1, device=q.device, dtype=torch.long
+                )
+                vmeta = SimpleNamespace(
+                    per_query_seq_lens=(prefix.unsqueeze(1) + offsets.unsqueeze(0))
+                    .reshape(-1)
+                    .to(forward_batch.seq_lens.dtype),
+                    per_query_req=forward_batch.req_pool_indices.repeat_interleave(
+                        int(ndt)
+                    ),
+                )
+                self._verify_meta_eager = (forward_batch, vmeta)
+        per_query_seq_lens = vmeta.per_query_seq_lens
+        per_query_req = vmeta.per_query_req
         per_query_req = per_query_req.to(forward_batch.req_pool_indices.dtype)
         per_query_seq_lens = per_query_seq_lens.to(forward_batch.seq_lens.dtype)
         # ``_max_seqlen_k`` is capture-safe (max_context_len under capture,
