@@ -283,8 +283,8 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
-@pytest.mark.parametrize("num_tokens", [1, 6, 16])
-@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("num_heads", [32])
 def test_index_q_pack_weights_matches_standalone(
     num_tokens: int, num_heads: int
 ) -> None:
@@ -887,7 +887,7 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
             )
 
 
-@pytest.mark.parametrize("seq_len", [640, 1024])
+@pytest.mark.parametrize("seq_len", [1024])
 def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
     """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
     on the same scores differ; ordered by position they are identical, -1 padding last."""

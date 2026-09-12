@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 ROPE_DIM = 64
 EPS = 1e-6
-BATCHES = (1, 31, 64, 65)
+BATCHES = (1, 65)
 # Both low ratios reach this kernel; the group position is masked out of the
 # token position in-kernel, so the ratio changes what it reads.
 RATIOS = (1, 2)

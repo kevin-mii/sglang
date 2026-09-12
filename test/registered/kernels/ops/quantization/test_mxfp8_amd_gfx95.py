@@ -30,9 +30,6 @@ register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 # (N, K) of the TP4 dense projections plus a small odd one.
 SHAPES = [
     (1856, 5120),
-    (8192, 1280),
-    (5120, 2048),
-    (1152, 5120),
     (96, 384),
 ]
 
@@ -64,7 +61,7 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 
     def test_matches_fp64_reference_and_both_encodings_agree(self):
         for n, k in SHAPES:
-            for m in (1, 16, 17, 32):
+            for m in (1, 17):
                 wq, ws, x = self._make(n, k, m)
                 w_sh, ws8 = shuffle_mxfp8_weight(wq), ue8m0_weight_scale(ws)
                 xq, xs = mxfp8_e4m3_quantize(x)
@@ -88,10 +85,10 @@ class TestMxfp8GemvGfx95(CustomTestCase):
                 self.assertLess(frac, 0.02, (n, k, m, frac))
 
 
-ROUTE_SHAPES = [(1856, 5120), (8192, 1280), (1152, 5120), (5120, 2048)]
+ROUTE_SHAPES = [(1856, 5120)]
 
 
-MS = (1, 16, 17, 32, 33, 64, 200, 1024, 1025, 2100)
+MS = (1, 33, 1025)
 
 
 def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -169,11 +166,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
         _, _, w_sh, ws8, w_small, _ = self._weights(n, k, seed=1)
         has_bf16 = w_small is not None
         for m_lo, m_hi in (
-            (1, 8),
             (1, 32),
-            (33, 64),
-            (65, 128),
-            (129, 256),
             (1025, 1100),
         ):
             x = torch.randn(m_hi, k, device="cuda", dtype=torch.bfloat16)

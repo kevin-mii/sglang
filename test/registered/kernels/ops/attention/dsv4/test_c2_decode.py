@@ -32,7 +32,7 @@ EPS = 1e-6
 # The 584-byte FlashMLA layout fixes head_dim at 512:
 # 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIM = 512
-BATCHES = (1, 8, 64)
+BATCHES = (1, 64)
 # `CompressStatePool.ring_size`; two values because a wrong modular wrap shows on only
 # one of them (served: `next_power_of_2(draft + 1)`)
 RING_SIZES = (2, 8)

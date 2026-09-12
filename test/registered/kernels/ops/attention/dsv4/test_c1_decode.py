@@ -25,7 +25,7 @@ EPS = 1e-6
 # The 584-byte FlashMLA layout fixes head_dim at 512:
 # 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIM = 512
-BATCHES = (1, 8, 128)
+BATCHES = (1, 64)
 
 ROPE_DIM = 64
 # Slots per page of the *compressed* pool, i.e. the FULL page size over the

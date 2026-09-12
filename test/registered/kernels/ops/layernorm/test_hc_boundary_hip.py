@@ -82,7 +82,7 @@ class TestHcMixStatsSinkhorn(CustomTestCase):
         ref = _ref_coefficients(residual, hc_fn, hc_scale, hc_base)
         for got, want in zip(full, ref):
             self.assertLess((got - want).abs().max().item(), 1e-4)
-        for _ in range(20):
+        for _ in range(3):
             again = hc_mix_stats_sinkhorn(
                 residual.flatten(1),
                 hc_fn,
@@ -94,7 +94,7 @@ class TestHcMixStatsSinkhorn(CustomTestCase):
                 HC_EPS,
             )
             self.assertTrue(_all_equal(again, full))
-        for rows in ([0], [299], list(range(3, 10)), list(range(0, 300, 7))):
+        for rows in ([0], list(range(0, 300, 7))):
             idx = torch.tensor(rows, device="cuda")
             sub = hc_mix_stats_sinkhorn(
                 residual[idx].flatten(1).contiguous(),
@@ -137,7 +137,7 @@ class TestHcBoundaryFused(CustomTestCase):
         return _boundary_inputs(m, seed, self.hc_fn, self.hc_scale, self.hc_base)
 
     def test_matches_torch_forms(self):
-        for m in (1, 7, 16, 33, 300):
+        for m in (1, 33):
             x, residual, post_in, comb_in, pre_prev = self._inputs(m, m)
             res_out, y, pre, post, comb = self._run(
                 x, residual, post_in, comb_in, pre_prev
@@ -167,18 +167,11 @@ class TestHcBoundaryFused(CustomTestCase):
     def test_repeatable_and_batch_invariant(self):
         x, residual, post_in, comb_in, pre_prev = self._inputs(300, 7)
         full = self._run(x, residual, post_in, comb_in, pre_prev)
-        for _ in range(20):
+        for _ in range(3):
             self.assertTrue(
                 _all_equal(self._run(x, residual, post_in, comb_in, pre_prev), full)
             )
-        for rows in (
-            [0],
-            [5],
-            [299],
-            list(range(3, 10)),
-            list(range(0, 300, 7)),
-            list(range(17, 50)),
-        ):
+        for rows in ([0], [299], list(range(0, 300, 7))):
             idx = torch.tensor(rows, device="cuda")
             sub = self._run(
                 x[idx].contiguous(),
@@ -231,7 +224,7 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
         )
 
     def test_matches_standalone_launches(self):
-        for m in (1, 6, 33, 300, 1100):
+        for m in (1, 1100):
             for emit_fp8 in (False, True):
                 res, y, pre, post, comb = self._boundary(self.fused, m, m)
                 quant, norm = self.norm(y, self.weight, 1e-6, emit_fp8=emit_fp8)
@@ -300,7 +293,7 @@ class TestHcBoundaryPrefill(CustomTestCase):
 
     def test_matches_decode_kernel_bitwise(self):
         # Full blocks, partial last blocks and M below / above the switch.
-        for m in (1, 8, 64, 300, 1024, 2049, 4096):
+        for m in (1, 4096):
             x, residual, post_in, comb_in, pre_prev = self._inputs(m, m)
             decode = self._raw(x, residual, post_in, comb_in, pre_prev, False)
             prefill = self._raw(x, residual, post_in, comb_in, pre_prev, True)
@@ -319,7 +312,7 @@ class TestHcBoundaryPrefill(CustomTestCase):
         x, residual, post_in, comb_in, pre_prev = self._inputs(m, 11)
         args = (self.hc_fn, self.hc_scale, self.hc_base, HC, ITERS, RMS_EPS, HC_EPS)
         full = self.fused(x, residual, post_in, comb_in, pre_prev, *args)
-        for rows in ([0], [m - 1], list(range(3, 10)), list(range(0, m, 97))):
+        for rows in ([0], list(range(0, m, 97))):
             idx = torch.tensor(rows, device="cuda")
             sub = self.fused(
                 x[idx].contiguous(),

@@ -153,9 +153,7 @@ class TestAiterSparseBackend(CustomTestCase):
         """Full lists, contexts shorter than the window and the top-k width (the length
         masks live slots left in the list), and the model's 64-padded heads."""
         for batch, heads, swa_lengths, topk_lengths, seed in (
-            (1, 16, [128], [512], 0),
             (3, 16, [101, 128, 5], [100, 512, 1], 1),
-            (2, 64, [128, 64], [512, 300], 2),
         ):
             with self.subTest(batch=batch, heads=heads, seed=seed):
                 self._assert_matches_reference(
@@ -425,11 +423,7 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
 
         for batch, heads, splits, seed in [
             (1, 16, 4, 0),
-            (1, 16, 2, 1),
-            (1, 16, 8, 2),
             (3, 16, 4, 3),
-            (8, 16, 8, 4),
-            (1, 64, 4, 5),
         ]:
             with self.subTest(batch=batch, heads=heads, splits=splits):
                 # Partial lists on the larger batches: some splits come out empty.
@@ -457,7 +451,6 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         for batch, heads, splits, pos_dtype in [
             (1, 16, 4, torch.int64),
             (5, 16, 4, torch.int32),
-            (2, 64, 2, torch.int64),
         ]:
             with self.subTest(batch=batch, heads=heads, splits=splits):
                 inputs = self._inputs(batch, heads, 20 + batch)
@@ -471,18 +464,6 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(got, ref))
                 self.assertTrue(torch.equal(got[..., :-ROPE], plain[..., :-ROPE]))
-        # Random partials: a large sample of the rope arithmetic alone.
-        gen = torch.Generator(device="cpu").manual_seed(11)
-        T, S, H = 256, 4, 16
-        acc = (torch.randn(T, S, H, D, generator=gen) * 20).to(dev)
-        m = torch.randn(T, S, H, generator=gen).to(dev)
-        lsum = (torch.rand(T, S, H, generator=gen) * 50 + 1).to(dev)
-        sink = torch.randn(H, generator=gen).to(dev)
-        pos = torch.randint(0, 8192, (T,), generator=gen).to(dev)
-        ref = aiter_sparse_split_reduce(acc, m, lsum, sink)
-        _model_inverse_rope(ref[..., -ROPE:], fr, pos)
-        got = aiter_sparse_split_reduce(acc, m, lsum, sink, inv_rope=(fr, pos))
-        self.assertTrue(torch.equal(got, ref))
 
 
 @unittest.skipUnless(

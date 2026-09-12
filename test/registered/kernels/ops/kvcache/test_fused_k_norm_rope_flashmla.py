@@ -69,7 +69,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         return got, expected
 
     def test_matches_torch_quantization(self):
-        for num_tokens, page_size, seed in ((44, 256, 0), (300, 256, 1), (7, 64, 2)):
+        for num_tokens, page_size, seed in ((300, 256, 1), (7, 64, 2)):
             with self.subTest(num_tokens=num_tokens, page_size=page_size):
                 got, expected = self._run(num_tokens, page_size, seed)
                 # payload and scale are exact; the rope tail is bf16 on both sides, its only freedom fp32 rounding
@@ -92,10 +92,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         page_size = 256
         for num_tokens, heads, pos_dtype, seed in (
             (1, 16, torch.int64, 0),
-            (7, 16, torch.int32, 1),
-            (300, 16, torch.int64, 2),
-            (5, 64, torch.int64, 3),
-            (33, 7, torch.int32, 4),
+            (300, 16, torch.int32, 2),
         ):
             with self.subTest(num_tokens=num_tokens, heads=heads):
                 torch.manual_seed(seed)

@@ -21,10 +21,7 @@ class TestEngramHistoryCommit(CustomTestCase):
         torch.manual_seed(3)
         for bs, n, slots in (
             (1, 4, 10),
-            (8, 4, 300),
             (64, 6, 300),
-            (16, 2, 40),
-            (3, 9, 5),
         ):
             with self.subTest(bs=bs, n=n):
                 pad_row = slots

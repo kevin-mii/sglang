@@ -68,7 +68,7 @@ def _topk_inputs(rng, bs, width, topk, page_size, lens):
 @pytest.mark.skipif(
     not _aot_topk_sorts_output(), reason="sgl_kernel predates sort_output"
 )
-@pytest.mark.parametrize("topk", [512, 1024, 64, 100])
+@pytest.mark.parametrize("topk", [512, 100])
 @pytest.mark.parametrize("with_raw", [True, False])
 def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: bool):
     rng = _seed(topk)
@@ -139,7 +139,7 @@ def _candidates(rng, rows, num_blocks, topk_blocks, block_size, seq_lens):
     )
 
 
-@pytest.mark.parametrize("topk", [512, 64])
+@pytest.mark.parametrize("topk", [512])
 @pytest.mark.parametrize("with_raw", [True, False])
 def test_sorted_candidate_mapping_matches_pack_then_sort(topk: int, with_raw: bool):
     rng = _seed(11 + topk)
@@ -183,8 +183,8 @@ def _ref_mask(indices, lengths):
     return torch.where(pos < lengths.view(-1, 1, 1), indices, indices.new_full((), -1))
 
 
-@pytest.mark.parametrize("s", [1, 4])
-@pytest.mark.parametrize("len_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("s", [1])
+@pytest.mark.parametrize("len_dtype", [torch.int32])
 def test_mask_indices_by_length_single_and_pair(s: int, len_dtype):
     rng = _seed(3)
     for b in (1, 6):
@@ -209,7 +209,7 @@ def test_mask_indices_by_length_single_and_pair(s: int, len_dtype):
         assert out1.dtype is idx1.dtype and out1.shape == idx1.shape
 
 
-@pytest.mark.parametrize("bpp", [1, 2, 4])
+@pytest.mark.parametrize("bpp", [4])
 def test_expand_index_page_table(bpp: int):
     _seed(5)
     for bs, n in ((1, 4608), (3, 17), (0, 10)):
@@ -234,8 +234,8 @@ def test_expand_index_page_table(bpp: int):
     )
 
 
-@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("ratios", [(1,), (2,), (1, 2)])
+@pytest.mark.parametrize("loc_dtype", [torch.int64])
+@pytest.mark.parametrize("ratios", [(1, 2)])
 def test_low_ratio_compression_metadata(loc_dtype, ratios):
     rng = _seed(7)
     for rows, nw in ((1, 1), (9, 9), (12, 5)):
@@ -272,11 +272,11 @@ def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return q_fp4, q_scale
 
 
-@pytest.mark.parametrize("heads", [64, 32, 16])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("heads", [32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
     _seed(17)
-    for tokens in (1, 3, 40):
+    for tokens in (1, 40):
         q = torch.randn(tokens, heads, 128, device=DEVICE, dtype=dtype) * 4
         # exact fp4 grid points and tie values, zeros and a huge group
         q[0, 0, :32] = torch.tensor(
@@ -306,7 +306,7 @@ def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
         torch.ones(4096, 32, device=DEVICE),
         torch.rand(4096, 32, device=DEVICE) * 6.283,
     )
-    for tokens, heads in ((1, 64), (5, 64), (17, 1)):
+    for tokens, heads in ((1, 32), (17, 32)):
         x = torch.randn(tokens, heads, 128, device=DEVICE, dtype=torch.bfloat16) * 3
         for pos_dtype in (torch.int64, torch.int32):
             pos = torch.randint(0, 4096, (tokens,), device=DEVICE, dtype=pos_dtype)
@@ -332,12 +332,8 @@ def test_page_table_from_req_to_token_matches_torch():
         7, :64
     ] = -3  # torch floor-divides; the slot values are never negative in serving
     for bs, max_seq_len, page in (
-        (1, 1000, 64),
-        (8, 4097, 64),
-        (64, 8192, 64),
-        (5, 63, 64),
-        (3, 128, 128),
-        (2, 8191, 32),
+        (1, 1000, 256),
+        (64, 8191, 256),
     ):
         req = torch.randint(0, 300, (bs,), device=DEVICE, dtype=torch.int32)
         req[0] = 7

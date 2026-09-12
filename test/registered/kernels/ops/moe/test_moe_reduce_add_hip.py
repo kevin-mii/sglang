@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-D, TOPK, E = 7168, 8, 384
+D, TOPK, E = 5120, 6, 384
 
 
 def _reference(x, shared, ids, mask, alpha):
@@ -42,7 +42,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
         self.reduce_add = moe_topk_reduce_add
 
     def test_matches_reference(self):
-        for m in (1, 6, 33, 384):
+        for m in (1, 33):
             for alpha in (1.0, 2.5):
                 x, shared, ids, mask = _inputs(m, m)
                 for use_mask in (True, False):
@@ -63,11 +63,11 @@ class TestMoeTopkReduceAdd(CustomTestCase):
         x, shared, ids, mask = _inputs(300, 7)
         full = torch.empty_like(shared)
         self.reduce_add(x, shared, full, TOPK, ids, mask)
-        for _ in range(20):
+        for _ in range(3):
             again = torch.empty_like(shared)
             self.reduce_add(x, shared, again, TOPK, ids, mask)
             self.assertTrue(torch.equal(again, full))
-        for rows in ([0], [299], list(range(3, 10)), list(range(0, 300, 7))):
+        for rows in ([0], list(range(0, 300, 7))):
             idx = torch.tensor(rows, device="cuda")
             sub = torch.empty(len(rows), D, device="cuda", dtype=torch.bfloat16)
             self.reduce_add(

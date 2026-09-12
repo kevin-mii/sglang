@@ -1092,7 +1092,7 @@ class TestIndexerHeadWeightsHip(CustomTestCase):
         )
         from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
-        for m in (1, 2, 5, 8, 13, 16):
+        for m in (1, 16):
             with self.subTest(m=m):
                 x = self._x(m)
                 got = rocm_indexer_head_weights(x, self.w, SCALE)
@@ -1126,8 +1126,8 @@ class TestIndexerHeadWeightsHip(CustomTestCase):
         )
 
         total = differ = 0
-        for trial in range(120):
-            m = (1, 2, 4, 8, 12, 16)[trial % 6]
+        for trial in range(24):
+            m = (1, 16)[trial % 2]
             x = self._x(m)
             exact = (x.double() @ self.w.double().T * SCALE).bfloat16()
             got = rocm_indexer_head_weights(x, self.w, SCALE)

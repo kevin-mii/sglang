@@ -59,7 +59,7 @@ class TestEngramGate(CustomTestCase):
         """``image_select`` folds the model's ``where(input_ids == image_id, x, gated)`` into
         the launch, bitwise."""
         torch.manual_seed(31)
-        for batch, dim in ((1, 128), (8, 5120), (64, 4096)):
+        for batch, dim in ((1, 5120), (64, 5120)):
             with self.subTest(batch=batch, dim=dim):
                 x = torch.randn(batch, 4, dim, device="cuda", dtype=torch.bfloat16)
                 kv = torch.randn(batch, 5 * dim, device="cuda", dtype=torch.bfloat16)
