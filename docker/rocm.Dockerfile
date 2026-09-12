@@ -570,9 +570,7 @@ RUN pip uninstall -y aiter
 # preserve.
 # cherry-pick ROCm/aiter#5283 (7b481fb) and #5279 (24a62b1): gfx950 DSV4 a8w8 blockscale bpreshuffle configs; drop at the next aiter bump
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
-# aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage-1 left LDS-DMA loads in flight across the
-# K-step barrier (partial vmcnt(N) + scheduler hoists), so a8w4 stage-1 was not bitwise repeatable.
-# Stands in for an upstream fix not yet filed (patch text and ISA evidence in docker/patches/rocm/); drop at the bump that carries it.
+# aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage 1 left LDS-DMA loads in flight across the K-step barrier, so a8w4 was not bitwise repeatable; drop at the aiter bump that carries the fix
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -1185,9 +1183,7 @@ ENV SGLANG_USE_ROCM700A=0
 ENV AITER_BF16_FP8_MOE_BOUND=0
 # bf16 GEMMs through hipBLASLt
 ENV TORCH_BLAS_PREFER_HIPBLASLT=1
-# aiter's tuned-FMoE rows for DeepSeek-V4.1 EP4 a8w4 on gfx950, bitwise-repeatable only with the
-# stage-1 LDS-DMA drain patch above; drop once the rows land in aiter. Placed under model_configs/
-# so aiter merges them into its table: AITER_CONFIG_FMOE=<file> would replace every other model's rows.
+# DeepSeek-V4.1 EP4 a8w4 tuned FMoE rows, under model_configs/ so aiter merges them into its table (AITER_CONFIG_FMOE=<file> would replace every other model's rows); drop once they land in aiter
 COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
 # bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
 ENV AITER_FLYDSL_FORCE_REDUCE=1
