@@ -65,7 +65,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -172,7 +171,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
-    forward_hc_pre_from_prev_fused_boundary,
     is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -439,12 +437,9 @@ _wo_a_aiter_batched_gemm_disabled = False
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
-_gfx95_dense = None
+_hip = None
 if _is_hip:
-    from sglang.srt.layers.attention.hip_flash_mla import hip_attention_needs_head_pad
-    from sglang.srt.models.deepseek_common.amd import (
-        deepseek_v4_gfx95_dense as _gfx95_dense,
-    )
+    from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
         apply_wo_a_fp8_mxscale_fused_invrope,
@@ -478,7 +473,7 @@ def _apply_wo_a_bf16_matmul(
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows write token-major output directly to avoid
     the layout copy before wo_b. ROCm decode can use aiter batched GEMM (with
-    ``fp8_grid`` an ``Fp8GridActivation`` on wo_b's grid); other cases use torch.einsum.
+    ``fp8_grid`` emitting wo_b's fp8-grid operand); other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
@@ -525,8 +520,8 @@ def _apply_wo_a_bf16_matmul(
         and _wo_a_aiter_batched_gemm_enabled
         and not _wo_a_aiter_batched_gemm_disabled
     ):
-        if _gfx95_dense is not None:
-            y = _gfx95_dense.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
+        if _is_hip:
+            y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid)
             if y is not None:
                 return y
         try:
@@ -741,9 +736,9 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
         layer=layer,
         x=x[:real_num_tokens],
         q_lora=(
-            q_lora[:real_num_tokens]
-            if _gfx95_dense is None
-            else _gfx95_dense.live_rows(q_lora, real_num_tokens)
+            _hip.live_rows(q_lora, real_num_tokens)
+            if _is_hip
+            else q_lora[:real_num_tokens]
         ),
         positions=positions[:real_num_tokens],
         forward_batch=forward_batch,
@@ -854,8 +849,8 @@ class MqaAttentionBase(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
-        self._wo_b_fp8_grid_checked = False
-        self._wo_b_fp8_grid_operand = False
+        if _is_hip:
+            _hip.init_mqa_attention_base(self)
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -1130,20 +1125,11 @@ class MQALayer(MqaAttentionBase):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        # the fused qk-norm-rope store quantizes for a 128x128-block wq_b; 32-block keeps the plain path
-        self.use_fused_qk_norm_rope = (
-            _is_hip
-            and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
-            and self.q_head_norm
-            and isinstance(quant_config, Fp8Config)
-            and quant_config.weight_block_size == [128, 128]
+        self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(
+            self, quant_config
         )
-        # gfx950 32-block route: `q_norm` also emits the fp8-grid operand of `wq_b`.
-        self.fused_rmsnorm_fake_quant = (
-            _is_hip and _gfx95_dense.fused_rmsnorm_fake_quant_eligible(quant_config)
-        )
-        self._wq_b_native_consumer_checked = False
-        self._wq_b_native_consumer = None
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -1175,13 +1161,10 @@ class MQALayer(MqaAttentionBase):
             cache_dtype=torch.float32,
         )
 
-    def _q_norm_for_wq_b(
-        self, q_lora: torch.Tensor
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, Tuple]]:
-        """`q_norm(q_lora)` as (the bf16 norm the indexer reads, the operand `wq_b`
-        consumes); on the gfx950 32-block route the second is already on the fp8 grid."""
-        if self.fused_rmsnorm_fake_quant:
-            return _gfx95_dense.q_norm_fake_quant(self, q_lora)
+    def _q_norm_for_wq_b(self, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
+        """`q_norm(q_lora)` as (the bf16 norm the indexer reads, the operand `wq_b` consumes)."""
+        if _is_hip:
+            return _hip.q_norm_for_wq_b(self, q_lora)
         q_lora = self.q_norm(q_lora)
         return q_lora, q_lora
 
@@ -1201,16 +1184,10 @@ class MQALayer(MqaAttentionBase):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
-        skip_rope: bool = False,
     ) -> torch.Tensor:
-        """``skip_rope`` leaves the query heads un-rotated: the caller ropes them
-        inside the K norm-rope-store launch (``_compute_kv_to_cache(q_rope=)``)."""
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
-            if skip_rope:
-                assert q_out is None
-                return q
             if (
                 _is_cuda
                 and q_out is not None
@@ -1241,16 +1218,6 @@ class MQALayer(MqaAttentionBase):
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
 
-    def _fuses_q_rope_into_k_store(self, q_out: Optional[torch.Tensor]) -> bool:
-        """Whether the K norm-rope-store kernel ropes the query heads in its launch: only
-        where it is the cache writer and the query is consumed in place (no padded copy)."""
-        return (
-            _is_hip
-            and q_out is None
-            and not self.q_head_norm
-            and not envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()
-        )
-
     def _compute_kv_to_cache(
         self,
         x: torch.Tensor,
@@ -1264,8 +1231,7 @@ class MQALayer(MqaAttentionBase):
 
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
-        ``q_rope`` ([T, H, head_dim]) has its query heads roped in place by the
-        same launch (``_fuses_q_rope_into_k_store``).
+        ``q_rope`` ([T, H, head_dim]) has its query heads roped by the same launch.
         """
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
             assert q_rope is None
@@ -1824,11 +1790,14 @@ class MQALayer(MqaAttentionBase):
             q_for_wq_b = q_lora
             if not early_sources:
                 q_lora, q_for_wq_b = self._q_norm_for_wq_b(q_lora)
-            # only the plain store path ropes the query heads in the K kernel's launch
-            fuse_q_rope = (
-                not unified and not use_cp and self._fuses_q_rope_into_k_store(q_out)
+            fuse_q_rope = _is_hip and _hip.fuses_q_rope_into_k_store(
+                self, q_out, unified=unified, use_cp=use_cp
             )
-            q = self._compute_q_b(q_for_wq_b, positions, q_out, skip_rope=fuse_q_rope)
+            if fuse_q_rope:
+                # the K store launch below ropes the query heads
+                q = _hip.wq_b_unroped(self, q_for_wq_b)
+            else:
+                q = self._compute_q_b(q_for_wq_b, positions, q_out)
             if q_for_wq_b is not q_lora:
                 # the indexer's wq_b would re-round onto the same grid, so hand it the fused operand
                 q_lora = q_for_wq_b
@@ -1983,10 +1952,7 @@ class MQALayer(MqaAttentionBase):
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
         skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
-        # only tilelang is built for padded head widths; aiter and Triton take the real head count
-        skip_hip_pad = (
-            _is_hip and self.attn_tp_size > 1 and not hip_attention_needs_head_pad()
-        )
+        skip_hip_pad = _is_hip and _hip.skip_head_pad(self)
         if self.attn_tp_size > 1 and not skip_hip_pad:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
@@ -2079,16 +2045,16 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
-        # the attention kernel applies the inverse RoPE itself; fp8 wo_a and the graph op keep theirs
         inv_rope = None
-        if (
-            _is_hip
-            and not (self.wo_a_fp8 and _wo_a_fp8_mxscale_fused_invrope is not None)
-            and not (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
+        if _is_hip:
+            # the attention kernel applies the inverse RoPE itself; the else-branch below keeps it
+            inv_rope = _hip.attention_inv_rope(
+                self,
+                positions,
+                forward_batch,
+                wo_a_applies_inv_rope=self.wo_a_fp8
+                and _wo_a_fp8_mxscale_fused_invrope is not None,
             )
-        ):
-            inv_rope = (torch.view_as_real(self.freqs_cis).flatten(-2), positions)
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -2243,7 +2209,7 @@ class MQALayer(MqaAttentionBase):
                                 or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
                             )
                         ),
-                        fp8_grid=_is_hip and _gfx95_dense.wo_b_takes_fp8_grid(self),
+                        fp8_grid=_is_hip and _hip.wo_b_takes_fp8_grid(self),
                     )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -2359,14 +2325,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_scale,
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
-        self.fused_rmsnorm_fp8_quant = (
-            _is_hip and _gfx95_dense.fused_rmsnorm_fp8_quant_eligible(quant_config)
-        )
-        self.fused_rmsnorm_fake_quant = (
-            _is_hip and _gfx95_dense.fused_rmsnorm_fake_quant_eligible(quant_config)
-        )
-        self._wqkv_a_native_consumer_checked = False
-        self._wqkv_a_native_consumer = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
@@ -2376,10 +2334,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
-        # ROCm: hc_post, pre-collapse and mixing stats in one launch; the kernel only supports hc_mult 4
-        self.hc_boundary_fused = (
-            _is_hip and self.hc_pre_from_prev_sublayer and hc_mult == 4
-        )
+        if _is_hip:
+            _hip.init_decoder_layer(self, quant_config)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(
@@ -2427,21 +2383,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         coefficients=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the pre-quantized
-        operand of its dense projections or None). ``coefficients`` is the ROCm boundary's pending
-        reduce + sinkhorn, hosted by the gfx950 norm launch when that one runs."""
-        if self.fused_rmsnorm_fp8_quant and allow_aiter_quant:
-            if coefficients is not None:
-                coefficients.materialize()
-            x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
-                hidden_states,
-                self.input_layernorm.weight,
-                self.rms_norm_eps,
-            )
-            return hidden_states, x_quant
-        if self.fused_rmsnorm_fake_quant:
-            return _gfx95_dense.input_norm_fake_quant(self, hidden_states, coefficients)
-        if coefficients is not None:
-            coefficients.materialize()
+        operand of its dense projections or None); ``coefficients`` is a ROCm boundary's pending
+        reduce + sinkhorn."""
+        if _is_hip:
+            return _hip.input_norm(self, hidden_states, allow_aiter_quant, coefficients)
         return self.input_layernorm(hidden_states), None
 
     def hc_pre(
@@ -3782,7 +3727,7 @@ class DeepseekV4Model(nn.Module):
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
         prev_pre = None
-        # the fused boundary leaves the FFN hc_post pending; residual-stream readers apply it first
+        # HIP: the fused boundary hands the next layer its FFN hc_post unapplied
         pending_post = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
@@ -3803,24 +3748,12 @@ class DeepseekV4Model(nn.Module):
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
-            if pending_post is not None and (
-                engram is not None
-                or (capture_dspark and i in self.dspark_layers_to_capture)
-            ):
-                hidden_states = self.layers[i].hc_post(*pending_post)
-                pending_post = None
             if engram is not None:
                 before_engram = hidden_states
-                keep_image_rows = (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                )
-                # HIP: the image-token select rides in the fused gate launch
+                # the fused HIP gate keeps the image-token rows itself
                 image_select = (
-                    (input_ids.contiguous(), self.config.image_token_id)
-                    if keep_image_rows
-                    and hidden_states.is_cuda
-                    and hip_fused_decode_glue()
+                    _hip.engram_image_select(self.config, input_ids)
+                    if _is_hip
                     else None
                 )
                 if i == 14 and prefetched_engram_kv is not None:
@@ -3839,7 +3772,10 @@ class DeepseekV4Model(nn.Module):
                         cp_all_tokens=cp_extend,
                         image_select=image_select,
                     )
-                if keep_image_rows and image_select is None:
+                if image_select is None and (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                ):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
@@ -3857,10 +3793,11 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                if self.layers[i].hc_boundary_fused:
+                if _is_hip and self.layers[i].hc_boundary_fused:
                     hidden_states, prev_pre, pending_post = (
-                        forward_hc_pre_from_prev_fused_boundary(
-                            self.layers[i],
+                        _hip.forward_layer_fused_boundary(
+                            self,
+                            i,
                             positions=positions,
                             hidden_states=hidden_states,
                             input_ids=input_ids,
@@ -3868,7 +3805,7 @@ class DeepseekV4Model(nn.Module):
                             input_ids_global=input_ids_global,
                             prev_pre=prev_pre,
                             pending_post=pending_post,
-                            defer_post=i + 1 < self.end_layer,
+                            capture_dspark=capture_dspark,
                         )
                     )
                     continue
@@ -3880,8 +3817,6 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                     prev_pre=prev_pre,
                 )
-        if pending_post is not None:
-            hidden_states = self.layers[self.end_layer - 1].hc_post(*pending_post)
         if saved_full is not None:
             attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return hidden_states, prev_pre, tail
