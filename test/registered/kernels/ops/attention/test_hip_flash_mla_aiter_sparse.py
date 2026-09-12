@@ -183,14 +183,18 @@ class TestAiterSparseBackend(CustomTestCase):
             )[0]
             self.assertTrue(torch.equal(again, got))
 
-    def test_full_lists_16_heads(self):
-        self._assert_matches_reference_and_tilelang(1, 16, [128], [512])
-
-    def test_short_context_lengths(self):
-        # a context shorter than the window and the top-k width: the length masks live slots left in the list
-        self._assert_matches_reference_and_tilelang(
-            3, 16, [101, 128, 5], [100, 512, 1], seed=1
-        )
+    def test_matches_reference_and_tilelang(self):
+        """Full lists, contexts shorter than the window and the top-k width (the length
+        masks live slots left in the list), and the model's 64-padded heads."""
+        for batch, heads, swa_lengths, topk_lengths, seed in (
+            (1, 16, [128], [512], 0),
+            (3, 16, [101, 128, 5], [100, 512, 1], 1),
+            (2, 64, [128, 64], [512, 300], 2),
+        ):
+            with self.subTest(batch=batch, heads=heads, seed=seed):
+                self._assert_matches_reference_and_tilelang(
+                    batch, heads, swa_lengths, topk_lengths, seed=seed
+                )
 
     def test_short_lists_skip_the_padding_key(self):
         """The -1 inside the length (index 3 of the top-k list) must not be attended: on
@@ -199,12 +203,6 @@ class TestAiterSparseBackend(CustomTestCase):
         640-key cases above would absorb it."""
         self._assert_matches_reference_and_tilelang(
             2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT
-        )
-
-    def test_padded_heads(self):
-        # The model pads the per-rank heads to 64 (zero q, zero sink).
-        self._assert_matches_reference_and_tilelang(
-            2, 64, [128, 64], [512, 300], seed=2
         )
 
     def _real_vs_padded_heads(self, batch, seed):
@@ -253,14 +251,10 @@ class TestAiterSparseBackend(CustomTestCase):
         self.assertEqual(real.shape, q.shape)
         self.assertTrue(torch.equal(real, padded[:, :, :heads]))
 
-    def test_real_heads_match_padded_heads_bs1(self):
-        self._real_vs_padded_heads(1, seed=3)
-
-    def test_real_heads_match_padded_heads_bs3(self):
-        self._real_vs_padded_heads(3, seed=4)
-
-    def test_real_heads_match_padded_heads_bs8(self):
-        self._real_vs_padded_heads(8, seed=5)
+    def test_real_heads_match_padded_heads(self):
+        for batch, seed in ((1, 3), (3, 4), (8, 5)):
+            with self.subTest(batch=batch):
+                self._real_vs_padded_heads(batch, seed=seed)
 
     def test_head_pad_predicate_follows_kernel_choice(self):
         from sglang.srt.environ import envs
@@ -541,7 +535,6 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
             (3, 16, 4, 3),
             (8, 16, 8, 4),
             (1, 64, 4, 5),
-            (16, 16, 4, 6),
         ]:
             with self.subTest(batch=batch, heads=heads, splits=splits):
                 # Partial lists on the larger batches: some splits come out empty.

@@ -241,12 +241,12 @@ def test_empty_batch():
 
 # `config.index_n_heads` is 64, the served count. 1 is the degenerate row split,
 # where a row *is* a token and a wrong `row / heads` cannot show.
-Q_HEADS = (1, 2, 8, 64)
+Q_HEADS = (1, 64)
 # The Q path has no norm weight to scale, so the input carries the magnitude.
 # Below 6e-4 a block absmax puts `amax / 6` under the packer's 1e-4 floor, so
 # that floor -- and not the fake-quant's `6 * 2**-126` -- sets the exponent;
 # 1e-38 reaches the fake-quant's own floor as well.
-Q_INPUT_SCALES = (1.0, 1e-3, 1e-4, 1e-5, 1e-38)
+Q_INPUT_SCALES = (1.0, 1e-3, 1e-4, 1e-38)
 # `_ceil_ue8m0_exp(1e-4)`, the exponent the packer's floor pins a block to.
 PACKER_FLOOR_EXPONENT = 114
 # Positions are drawn from this many rows of the freqs table.

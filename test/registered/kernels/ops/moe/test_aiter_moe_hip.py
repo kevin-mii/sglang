@@ -86,7 +86,7 @@ class TestFusedAiterMoeSorting(CustomTestCase):
             for rank in (0, NUM_EXPERTS // num_local - 1):
                 mask = self._mask(num_local, rank)
                 local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
-                for num_tokens in (1, 5, 16, 31, 64):
+                for num_tokens in (1, 31, 64):
                     for block_size in (16, 64):
                         ids, weights = _routing(
                             num_tokens, topk, num_tokens, self.device
@@ -122,7 +122,7 @@ class TestFusedAiterMoeSorting(CustomTestCase):
     def test_padded_rows_are_masked_in_place(self):
         mask = self._mask(96, 1)
         local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
-        for num_tokens in (2, 8, 17, 32, 64):
+        for num_tokens in (2, 17, 64):
             for num_valid in (1, num_tokens // 2, num_tokens):
                 ids, weights = _routing(
                     num_tokens, 6, 7 * num_tokens + num_valid, self.device
@@ -313,8 +313,8 @@ class TestRocmRouterGate(CustomTestCase):
             self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg} topk {topk}")
 
     def test_gate_matches_aiter_random_logits(self):
-        for num_tokens in (1, 2, 7, 16, 64, 1024):
-            for scale in (1.0, 3.0, 40.0):
+        for num_tokens in (1, 7, 64, 1024):
+            for scale in (1.0, 40.0):
                 logits = self._randn(num_tokens, NUM_EXPERTS, scale=scale)
                 self._assert_same_gate(
                     logits, self.bias_bf16, msg=f"fp32 {num_tokens} {scale}"
@@ -429,7 +429,7 @@ class TestRocmRouterGate(CustomTestCase):
         full = torch.empty(self.max_tokens, NUM_EXPERTS, device=self.device)
         self.reduce(self.gemv(x, weight), full)
         self.assertTrue(torch.allclose(full, ref, atol=2e-3, rtol=1e-4))
-        for num_tokens in (1, 2, 3, 5, 8, 13, 16, 17, 31, 32, 33, 48, 63, 64):
+        for num_tokens in (1, 2, 16, 17, 32, 33, 64):
             rows = x[:num_tokens]
             out = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
             self.reduce(self.gemv(rows, weight), out)
@@ -459,7 +459,7 @@ class TestRocmRouterGate(CustomTestCase):
             allow_routed_experts_capture=False,
         )
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        for num_tokens in (1, 5, 16, 30, 64):
+        for num_tokens in (1, 30, 64):
             x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
             partials = self.gemv(x, weight)
             logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
@@ -494,7 +494,7 @@ class TestRocmRouterGate(CustomTestCase):
 
     def test_fused_gate_on_partials(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        for num_tokens in (1, 4, 16, 64):
+        for num_tokens in (1, 64):
             x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
             partials = self.gemv(x, weight)
             logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)

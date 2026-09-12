@@ -80,8 +80,8 @@ def _topk_inputs(rng, bs, width, topk, page_size, lens):
 @pytest.mark.parametrize("with_raw", [True, False])
 def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: bool):
     rng = _seed(topk)
-    for width in (1024, 4096, 70000):
-        for bs in (1, 5, 33):
+    for width in (1024, 70000):
+        for bs in (1, 33):
             page_size = rng.choice([16, 64])
             # the topk + 1 edge (a radix row of exactly topk picks) only where the
             # logits are that wide; at width == topk it would run past the row

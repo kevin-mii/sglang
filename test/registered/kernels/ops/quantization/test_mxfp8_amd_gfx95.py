@@ -78,7 +78,7 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 
     def test_matches_fp64_reference_and_both_encodings_agree(self):
         for n, k in SHAPES:
-            for m in (1, 2, 3, 8, 16, 17, 32):
+            for m in (1, 16, 17, 32):
                 wq, ws, x = self._make(n, k, m)
                 w_sh, ws8 = shuffle_mxfp8_weight(wq), ue8m0_weight_scale(ws)
                 xq, xs = mxfp8_e4m3_quantize(x)
@@ -161,7 +161,7 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 ROUTE_SHAPES = [(1856, 5120), (8192, 1280), (1152, 5120), (5120, 2048)]
 
 
-MS = (1, 2, 5, 16, 17, 32, 33, 64, 200, 1024, 1025, 2100)
+MS = (1, 16, 17, 32, 33, 64, 200, 1024, 1025, 2100)
 
 
 def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

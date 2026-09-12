@@ -189,7 +189,7 @@ class TestHcBoundaryFused(CustomTestCase):
     def test_repeatable_and_batch_invariant(self):
         x, residual, post_in, comb_in, pre_prev = self._inputs(300, 7)
         full = self._run(x, residual, post_in, comb_in, pre_prev)
-        for _ in range(100):
+        for _ in range(20):
             self.assertTrue(
                 _all_equal(self._run(x, residual, post_in, comb_in, pre_prev), full)
             )

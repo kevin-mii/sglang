@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 EPS = 1e-6
 # The 584-byte FlashMLA layout fixes head_dim at 512:
 # 448 fp8 nope values plus 64 bf16 RoPE values.
-HEAD_DIMS = (512,)
+HEAD_DIM = 512
 BATCHES = (1, 8, 128)
 
 ROPE_DIM = 64
@@ -144,32 +144,30 @@ def _run(n, dim, seed, *, sentinel=None, **kw):
 # ------------------------------------------------------------------- the store
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
 @pytest.mark.parametrize("n", BATCHES)
-def test_store_is_bitwise_the_production_writer(n, dim):
+def test_store_is_bitwise_the_production_writer(n):
     """The hard gate on the write half. The reference is driven by the kernel's
     *own* latent, so the only thing under test is the RoPE tail, the fp4
     fake-quant and the 584-byte layout. No tolerance -- every byte of every
     slot, and every byte outside them."""
-    r = _run(n, dim, seed=1000 + n + dim)
+    r = _run(n, HEAD_DIM, seed=1000 + n)
     live = r["live"]
     ref_cache = torch.zeros_like(r["cache"])
     _torch_store(r["got"][live], r["freqs"][live], ref_cache, r["slots"][live])
     assert torch.equal(r["cache"], ref_cache), (
-        f"{n=} {dim=}: {int((r['cache'] != ref_cache).sum())} of "
+        f"{n=}: {int((r['cache'] != ref_cache).sum())} of "
         f"{r['cache'].numel()} cache bytes differ from the production writer"
     )
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
 @pytest.mark.parametrize("n", BATCHES)
-def test_store_accepts_the_pool_fp8_view(n, dim):
+def test_store_accepts_the_pool_fp8_view(n):
     """`get_extra_key_buffer` hands the compressed pool out viewed as
     `float8_e4m3fn`, not as the uint8 it was allocated as. The kernel must take
     that view and write the same bytes it writes through the uint8 buffer."""
-    seed = 5000 + n + dim
-    kv_input, positions, out_loc = _inputs(n, dim, seed)
-    norm = _norm(dim, seed + 1)
+    seed = 5000 + n
+    kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
+    norm = _norm(HEAD_DIM, seed + 1)
     _, freqs_cis = _freqs(int(positions.max()) + 2 if n else 2, seed + 2)
     slots_max = int(out_loc.max()) if n else 0
     cache_u8, cache_fp8 = _cache(slots_max), _cache(slots_max)
@@ -182,15 +180,14 @@ def test_store_accepts_the_pool_fp8_view(n, dim):
     assert torch.equal(cache_u8, cache_fp8), "cache bytes differ by cache dtype"
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
 @pytest.mark.parametrize("n", BATCHES)
-def test_out_loc_int64(n, dim):
+def test_out_loc_int64(n):
     """The fused decode path passes `raw_out_loc` -- the scheduler's int64
     `out_cache_loc` -- where the tests above hand int32. Either width must give
     the same latent and the same cache bytes."""
-    seed = 6000 + n + dim
-    kv_input, positions, out_loc = _inputs(n, dim, seed)
-    norm = _norm(dim, seed + 1)
+    seed = 6000 + n
+    kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
+    norm = _norm(HEAD_DIM, seed + 1)
     _, freqs_cis = _freqs(int(positions.max()) + 2 if n else 2, seed + 2)
     slots_max = int(out_loc.max()) if n else 0
     cache32, cache64 = _cache(slots_max), _cache(slots_max)
@@ -218,8 +215,7 @@ def test_out_loc_int64(n, dim):
     assert torch.equal(cache32, cache64), "cache bytes differ by loc dtype"
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
-def test_store_slot_is_out_loc(dim):
+def test_store_slot_is_out_loc():
     """At ratio 1 the compressed slot *is* `out_loc`: `c1_out_loc` comes out of
     `where(seq_lens % 1 == 0, raw_out_loc // 1, -1)`, which is `raw_out_loc`
     unconditionally. Scattered across a page boundary and beyond, the written
@@ -233,7 +229,7 @@ def test_store_slot_is_out_loc(dim):
         2 * PAGE_SIZE,
     ]
     out_loc = torch.tensor(want, device="cuda", dtype=torch.int32)
-    r = _run(len(want), dim, seed=3000 + dim, out_loc=out_loc)
+    r = _run(len(want), HEAD_DIM, seed=3000, out_loc=out_loc)
     assert r["live"].all()
     written = set()
     cache = r["cache"]
@@ -246,8 +242,7 @@ def test_store_slot_is_out_loc(dim):
     assert written == set(want), f"wrote slots {sorted(written)}, wanted {want}"
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
-def test_padded_rows_publish_nothing(dim):
+def test_padded_rows_publish_nothing():
     """Padded out_loc == 0 rows must not write any cache slot, including slot 0;
     their published latents are discarded by the caller.
     """
@@ -257,7 +252,7 @@ def test_padded_rows_publish_nothing(dim):
         [7, 9, 11, 13, 15, 0, 0, 0], device="cuda", dtype=torch.int32
     )
     r = _run(
-        n, dim, seed=4000 + dim, positions=positions, out_loc=out_loc, sentinel=-7.5
+        n, HEAD_DIM, seed=4000, positions=positions, out_loc=out_loc, sentinel=-7.5
     )
     live = r["live"]
     assert live.any() and not live.all(), "test needs both live and padded rows"
@@ -276,7 +271,7 @@ def test_padded_rows_publish_nothing(dim):
 
 def test_empty_batch():
     """An idle decode step launches nothing and must not fault."""
-    r = _run(0, 512, seed=6000)
+    r = _run(0, HEAD_DIM, seed=6000)
     assert r["got"].shape == (0, 512)
     assert not r["cache"].any()
 
@@ -330,12 +325,11 @@ def _latent_gate(r, ctx):
     )
 
 
-@pytest.mark.parametrize("dim", HEAD_DIMS)
 @pytest.mark.parametrize("n", BATCHES)
-def test_latent_is_the_torch_norm(n, dim):
+def test_latent_is_the_torch_norm(n):
     """The pre-RoPE latent is `finish`, and the index-K branch's `wk` projection
     reads it, so it is a published output and not an intermediate."""
-    _latent_gate(_run(n, dim, seed=7000 + n + dim), f"{n=} {dim=}")
+    _latent_gate(_run(n, HEAD_DIM, seed=7000 + n), f"{n=}")
 
 
 if __name__ == "__main__":

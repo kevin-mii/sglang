@@ -363,33 +363,26 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             )
             self._assert_logits_match_golden(case, logits)
 
-    def test_decode_ratio1_matches_golden(self):
+    def test_decode_matches_golden(self):
         """The decode logits and the paged transform must reproduce the reference
-        scores and slots through a permuted FULL page table at ratio 1."""
-        self._run_decode(ratio=1)
+        scores and slots through a permuted FULL page table at both ratios."""
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                self._run_decode(ratio=ratio)
 
-    def test_decode_ratio2_matches_golden(self):
-        """Ratio 2 halves the slots per FULL page; the expanded table must still
-        resolve every compressed position."""
-        self._run_decode(ratio=2)
-
-    def test_decode_body_on_target_verify_rows_ratio1(self):
+    def test_decode_body_on_target_verify_rows(self):
         """Verify rows (one per draft token) must route through the decode body with
-        per-row page tables."""
-        self._run_decode(ratio=1, verify_block=6)
+        per-row page tables; at ratio 2 neighbouring rows share a compressed slot."""
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                self._run_decode(ratio=ratio, verify_block=6)
 
-    def test_decode_body_on_target_verify_rows_ratio2(self):
-        """Verify rows at ratio 2, where neighbouring rows share a compressed slot."""
-        self._run_decode(ratio=2, verify_block=6)
-
-    def test_prefill_ratio1_matches_golden(self):
+    def test_prefill_matches_golden(self):
         """The row-wise prefill kernel must match the reference with and without a
         prepared workspace."""
-        self._run_prefill(ratio=1)
-
-    def test_prefill_ratio2_matches_golden(self):
-        """Prefill at ratio 2, with and without a prepared workspace."""
-        self._run_prefill(ratio=2)
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                self._run_prefill(ratio=ratio)
 
 
 # -- the backend entry points against the torch oracle -------------------------
