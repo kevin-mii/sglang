@@ -180,6 +180,7 @@ class TritonAttnBackend(AttentionBackend):
             can_use_dense_prefill_fp8,
             dense_prefill_attention_fwd,
             extend_attention_fwd,
+            extend_attention_fwd_long_prefix,
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
@@ -194,6 +195,16 @@ class TritonAttnBackend(AttentionBackend):
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        # Split-prefix extend for EXTEND rows over a long cached prefix
+        # (see extend_attention_fwd_long_prefix); gated per forward in
+        # _use_long_prefix_extend.
+        self.extend_attention_fwd_long_prefix = torch.compiler.disable(
+            extend_attention_fwd_long_prefix
+        )
+        self.long_prefix_extend_enabled = envs.SGLANG_TRITON_EXTEND_LONG_PREFIX.get()
+        self.long_prefix_extend_min_tokens = (
+            envs.SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS.get()
+        )
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -1545,6 +1556,23 @@ class TritonAttnBackend(AttentionBackend):
     # Largest per-request extend length routed to the verify kernels.
     SMALL_EXTEND_MAX_TOKENS = 8
 
+    def _use_long_prefix_extend(
+        self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Route a plain EXTEND / draft-extend over a long cached prefix to the
+        split-prefix kernel. Host-side shape checks only (no device sync): the
+        average prefix per request comes from the kv_indices length."""
+        if not self.long_prefix_extend_enabled or kv_indices is None:
+            return False
+        # EXTEND / MIXED / SPLIT_PREFILL / DRAFT_EXTEND_V2 only; TARGET_VERIFY
+        # keeps its own kernels (it may run inside a captured graph).
+        if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
+            return False
+        bs = forward_batch.batch_size
+        return bs > 0 and kv_indices.numel() >= bs * self.long_prefix_extend_min_tokens
+
     def _is_small_constant_extend(
         self, forward_batch: ForwardBatch, kv_indices: torch.Tensor
     ) -> bool:
@@ -1775,6 +1803,35 @@ class TritonAttnBackend(AttentionBackend):
                 max_bs=self.req_to_token_pool.size,
             )
         ):
+            return o
+
+        if (
+            self.forward_metadata.custom_mask is None
+            and sinks is None
+            and score_mod is None
+            and sliding_window_size <= 0
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and self._use_long_prefix_extend(forward_batch, kv_indices)
+        ):
+            self.extend_attention_fwd_long_prefix(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                causal,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                sm_scale=layer.scaling,
+                page_size=self.page_size,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
             return o
 
         self.extend_attention_fwd(

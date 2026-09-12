@@ -395,6 +395,14 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    # Prefix split-KV: grid axis 2 = q_tile * NUM_PREFIX_SPLITS + split. Each
+    # split sweeps one contiguous slice of the prefix and writes its partial
+    # O/LSE at ``split * stride_osplit`` / ``split * stride_lse_split`` (the
+    # caller combines the partials). NUM_PREFIX_SPLITS == 1 is byte-identical
+    # to the unsplit kernel.
+    NUM_PREFIX_SPLITS: tl.constexpr = 1,
+    stride_osplit=0,
+    stride_lse_split=0,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -423,6 +431,10 @@ def _fwd_kernel(
         cur_seq = tl.program_id(0)
         cur_head = tl.program_id(1)
         cur_block_m = tl.program_id(2)
+    cur_split = 0
+    if NUM_PREFIX_SPLITS > 1:
+        cur_split = cur_block_m % NUM_PREFIX_SPLITS
+        cur_block_m = cur_block_m // NUM_PREFIX_SPLITS
     cur_kv_head = cur_head // kv_group_num
     LOG2E: tl.constexpr = 1.4426950408889634
     LN2: tl.constexpr = 0.6931471805599453
@@ -492,7 +504,16 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N_PREFIX):
+    prefix_start = 0
+    if NUM_PREFIX_SPLITS > 1:
+        # Whole BLOCK_N_PREFIX tiles per split so the in-tile reduction order
+        # matches the unsplit sweep; trailing splits may be empty (LSE=-inf).
+        split_tiles = tl.cdiv(
+            tl.cdiv(cur_seq_len_prefix, BLOCK_N_PREFIX), NUM_PREFIX_SPLITS
+        )
+        prefix_start = cur_split * split_tiles * BLOCK_N_PREFIX
+        prefix_end = tl.minimum(prefix_start + split_tiles * BLOCK_N_PREFIX, prefix_end)
+    for start_n in range(prefix_start, prefix_end, BLOCK_N_PREFIX):
         start_n = tl.multiple_of(start_n, BLOCK_N_PREFIX)
         mask_n = (start_n + offs_n_prefix) < cur_seq_len_prefix
 
@@ -815,8 +836,11 @@ def _fwd_kernel(
 
     if STORE_LSE:
         offs_lse = (
-            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
-        ) * stride_lse_bs + cur_head * stride_lse_h
+            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)
+            * stride_lse_bs
+            + cur_head * stride_lse_h
+            + cur_split * stride_lse_split
+        )
         if USE_EXP2:
             lse = tl.log(deno) + e_max * LN2
         else:
@@ -829,6 +853,7 @@ def _fwd_kernel(
         * stride_obs
         + cur_head * stride_oh
         + offs_dv[None, :]
+        + cur_split * stride_osplit
     )
     deno_safe = tl.where(no_kv, 1.0, deno)
     if STORE_TRANSPOSE:
@@ -876,9 +901,19 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    prefix_splits: int = 1,
+    block_sizes=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
+
+    ``prefix_splits`` > 1 sweeps the prefix in that many contiguous slices
+    (grid axis 2 = q_tile * prefix_splits + split) and writes one partial
+    O / LSE per split: ``o_extend`` must then be [splits, tokens, heads, Dv]
+    and ``lse_extend`` [splits, tokens, heads]; ``skip_extend`` must be set
+    (the caller runs the current-chunk stage and combines the partials, see
+    ``extend_attention_fwd_long_prefix``). ``block_sizes`` overrides
+    (BLOCK_M, BLOCK_N, num_warps) for that path only.
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
 
@@ -945,6 +980,8 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if block_sizes is not None:
+        BLOCK_M, BLOCK_N, num_warps = block_sizes
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
@@ -982,13 +1019,35 @@ def extend_attention_fwd(
         and score_mod is None
     )
     STORE_LSE = lse_extend is not None
-    stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
-    stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
+    # Partial layout ([splits, tokens, heads, Dv] / [splits, tokens, heads]) is
+    # selected by the tensor rank so a single split still addresses it right.
+    split_layout = o_extend.dim() == 4
+    if split_layout or prefix_splits > 1:
+        assert (
+            split_layout and skip_extend and STORE_LSE and lse_extend.dim() == 3
+        ), "prefix splits need 4-D o_extend / 3-D lse_extend with skip_extend"
+        stride_osplit, stride_obs, stride_oh = (
+            o_extend.stride(0),
+            o_extend.stride(1),
+            o_extend.stride(2),
+        )
+        stride_lse_split, stride_lse_bs, stride_lse_h = (
+            lse_extend.stride(0),
+            lse_extend.stride(1),
+            lse_extend.stride(2),
+        )
+    else:
+        stride_osplit = stride_lse_split = 0
+        stride_obs, stride_oh = o_extend.stride(0), o_extend.stride(1)
+        stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
+        stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
     # launch). Explicitly check _is_hip and allow env var override.
     use_compact_tile_grid = (
-        _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
+        _is_hip
+        and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
+        and not split_layout
     )
     compact_q_tiles = None
     if use_compact_tile_grid:
@@ -1004,7 +1063,11 @@ def extend_attention_fwd(
     if use_compact_tile_grid:
         grid = (compact_q_tiles, head_num)
     else:
-        grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+        grid = (
+            batch_size,
+            head_num,
+            triton.cdiv(max_len_extend, BLOCK_M) * prefix_splits,
+        )
     num_stages = (
         _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
     )
@@ -1049,8 +1112,8 @@ def extend_attention_fwd(
         k_extend.stride(1),
         v_extend.stride(0),
         v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
+        stride_obs,
+        stride_oh,
         stride_lse_bs,
         stride_lse_h,
         k_slot_stride,
@@ -1097,8 +1160,184 @@ def extend_attention_fwd(
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
+        NUM_PREFIX_SPLITS=prefix_splits,
+        stride_osplit=stride_osplit,
+        stride_lse_split=stride_lse_split,
     )
 
+
+
+@triton.jit
+def _combine_prefix_splits_kernel(
+    O_Part,  # [NUM_PARTS, tokens, heads, Dv] fp32 partial outputs
+    LSE_Part,  # [NUM_PARTS, tokens, heads] fp32 natural-log LSE (-inf = empty)
+    O_Out,  # [tokens, heads, Dv]
+    stride_op_s,
+    stride_op_t,
+    stride_op_h,
+    stride_lp_s,
+    stride_lp_t,
+    stride_lp_h,
+    stride_o_t,
+    stride_o_h,
+    Lv: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    NUM_PARTS: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_dv = offs_dv < Lv
+    m = float("-inf")
+    for i in tl.static_range(NUM_PARTS):
+        lse = tl.load(LSE_Part + i * stride_lp_s + tok * stride_lp_t + head * stride_lp_h)
+        m = tl.maximum(m, lse)
+    m_safe = tl.where(m == float("-inf"), 0.0, m)
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+    den = 0.0
+    for i in tl.static_range(NUM_PARTS):
+        lse = tl.load(LSE_Part + i * stride_lp_s + tok * stride_lp_t + head * stride_lp_h)
+        w = tl.exp(lse - m_safe)
+        o = tl.load(
+            O_Part + i * stride_op_s + tok * stride_op_t + head * stride_op_h + offs_dv,
+            mask=mask_dv,
+            other=0.0,
+        )
+        acc += o * w
+        den += w
+    den = tl.where(den == 0.0, 1.0, den)
+    tl.store(
+        O_Out + tok * stride_o_t + head * stride_o_h + offs_dv,
+        (acc / den).to(O_Out.dtype.element_ty),
+        mask=mask_dv,
+    )
+
+
+# Long-prefix extend: query tile / KV tile / warps used for the prefix sweep.
+# Halves the KV bytes streamed per query row vs the (64, 64, 4) default at
+# head_dim 128 (each workgroup reads the whole prefix slice); measured on
+# MI350X at 198K prefix: 8192-row chunk 41 -> 26 ms, 3222 rows 20 -> 13 ms.
+LONG_PREFIX_BLOCK_SIZES = (128, 128, 8)
+# Aim for this many workgroups in the prefix sweep; splits fill the gap when
+# the query tiles alone cannot (few extend rows over a long cached prefix).
+LONG_PREFIX_TARGET_PROGRAMS = 1024
+LONG_PREFIX_MAX_SPLITS = 16
+
+
+def long_prefix_num_splits(batch_size: int, head_num: int, max_len_extend: int):
+    """How many prefix slices the long-prefix path should use (>= 1)."""
+    tiles = triton.cdiv(max_len_extend, LONG_PREFIX_BLOCK_SIZES[0])
+    programs = max(1, batch_size * head_num * tiles)
+    return max(1, min(LONG_PREFIX_MAX_SPLITS, triton.cdiv(LONG_PREFIX_TARGET_PROGRAMS, programs)))
+
+
+def extend_attention_fwd_long_prefix(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    is_causal,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale=None,
+    page_size: int = 1,
+    extend_seq_lens_cpu=None,
+    identity_kv_indices: bool = False,
+    num_splits: Optional[int] = None,
+):
+    """extend_attention_fwd for an EXTEND over a long cached prefix, without
+    the exotic features (custom mask, sinks, sliding window, logit cap, score
+    mod): the prefix is swept with larger query tiles and in ``num_splits``
+    parallel slices (one partial O/LSE each), the current chunk runs as its own
+    causal partial, and one combine launch normalizes into ``o_extend``.
+
+    Same math as extend_attention_fwd; only the order of the online-softmax
+    reduction over prefix slices differs (fp32 partials), so outputs agree to
+    bf16 rounding.
+    """
+    batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
+    tokens, Lv = q_extend.shape[0], v_extend.shape[-1]
+    if num_splits is None:
+        num_splits = long_prefix_num_splits(batch_size, head_num, max_len_extend)
+    num_parts = num_splits + 1
+    o_part = torch.empty(
+        (num_parts, tokens, head_num, Lv), dtype=torch.float32, device=q_extend.device
+    )
+    lse_part = torch.empty(
+        (num_parts, tokens, head_num), dtype=torch.float32, device=q_extend.device
+    )
+    # Prefix slices (skip the current chunk).
+    extend_attention_fwd(
+        q_extend,
+        k_extend,
+        v_extend,
+        o_part[:num_splits],
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        None,
+        is_causal,
+        None,
+        max_len_extend,
+        k_scale,
+        v_scale,
+        sm_scale=sm_scale,
+        lse_extend=lse_part[:num_splits],
+        skip_extend=True,
+        page_size=page_size,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        identity_kv_indices=identity_kv_indices,
+        prefix_splits=num_splits,
+        block_sizes=LONG_PREFIX_BLOCK_SIZES,
+    )
+    # Current chunk only (causal triangle), default tiles.
+    extend_attention_fwd(
+        q_extend,
+        k_extend,
+        v_extend,
+        o_part[num_splits],
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        None,
+        is_causal,
+        None,
+        max_len_extend,
+        k_scale,
+        v_scale,
+        sm_scale=sm_scale,
+        lse_extend=lse_part[num_splits],
+        skip_prefix=True,
+        page_size=page_size,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        identity_kv_indices=identity_kv_indices,
+    )
+    _combine_prefix_splits_kernel[(tokens, head_num)](
+        o_part,
+        lse_part,
+        o_extend,
+        o_part.stride(0),
+        o_part.stride(1),
+        o_part.stride(2),
+        lse_part.stride(0),
+        lse_part.stride(1),
+        lse_part.stride(2),
+        o_extend.stride(0),
+        o_extend.stride(1),
+        Lv=Lv,
+        BLOCK_DV=triton.next_power_of_2(Lv),
+        NUM_PARTS=num_parts,
+    )
 
 def redundant_attention(
     q_extend,
