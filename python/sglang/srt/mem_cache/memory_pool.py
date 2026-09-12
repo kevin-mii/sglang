@@ -5587,6 +5587,28 @@ class MiniMaxSparseKVPool(KVCache):
             and (main.head_dim * main.dtype.itemsize) % 16 == 0
         )
 
+    def _can_fuse_kv_index_store_quant(
+        self,
+        index_pool: MHATokenToKVPool,
+        cache_k: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+    ) -> bool:
+        """Precondition for the Triton scale+cast+scatter store: plain
+        token-major (NHD) main/index pools whose dtype differs from the input
+        (i.e. a cast is needed), no FP4 quant method, GPU."""
+        main = self.main_pool
+        return (
+            self.use_minimax_fused_kv_index_store
+            and (_is_cuda or _is_hip)
+            and not main.is_quantized_kv_cache
+            and not getattr(index_pool, "is_quantized_kv_cache", False)
+            and main.kv_cache_layout == "nhd"
+            and not main.use_hnd
+            and getattr(index_pool, "kv_cache_layout", "nhd") == "nhd"
+            and not getattr(index_pool, "use_hnd", False)
+            and (cache_k.dtype != main.dtype or cache_idx_k.dtype != index_pool.dtype)
+        )
+
     def set_fused_kv_index_buffer(
         self,
         layer: RadixAttention,
@@ -5633,6 +5655,44 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
+        # Quantizing pools (fp8 KV / fp8 index-K): one Triton launch does the
+        # scale + cast + scatter for all four caches instead of the 7-8
+        # elementwise/cast/scatter launches of the separate stores below.
+        if index_pool is not None and self._can_fuse_kv_index_store_quant(
+            index_pool, cache_k, cache_idx_k
+        ):
+            from sglang.kernels.ops.kvcache.minimax_store_kv_index_quant import (
+                can_store_kv_index_quant,
+                store_kv_index_quant,
+            )
+
+            main = self.main_pool
+            k_cache = main.get_key_buffer(layer.layer_id)
+            v_cache = main.get_value_buffer(layer.layer_id)
+            if disable_value:
+                idx_k_cache = self.get_index_k_buffer(layer.layer_id)
+                idx_v_cache = None
+            else:
+                idx_k_cache, idx_v_cache = self.get_index_kv_buffer(layer.layer_id)
+            if can_store_kv_index_quant(
+                cache_k, k_cache, cache_idx_k, idx_k_cache, idx_v_cache
+            ):
+                store_kv_index_quant(
+                    cache_k,
+                    cache_v,
+                    k_cache,
+                    v_cache,
+                    cache_idx_k,
+                    idx_k_cache,
+                    cache_idx_v,
+                    idx_v_cache,
+                    loc,
+                    k_scale,
+                    v_scale,
+                    idx_k_scale,
+                    idx_v_scale,
+                )
+                return
         # Fallback: separate stores (identical semantics; quantizes for fp8
         # pools — the fused raw-byte path is disqualified there by
         # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
