@@ -645,10 +645,9 @@ def low_ratio_decode_rows_fit_candidate_span(backend, forward_batch) -> bool:
 def low_ratio_index_topk_hip_decode(
     backend, layer, x, q_lora, pos, forward_batch: Optional[ForwardBatch] = None
 ) -> None:
-    """One token per request: paged fp4 logits over every visible compressed slot,
-    level-one candidate blocks where the layer publishes or consumes them (unless
-    the batch fits the candidate span, `low_ratio_decode_rows_fit_candidate_span`),
-    then the top-k transform writes the -1 padded page indices."""
+    """One token per request: paged fp4 logits over every visible compressed slot, level-one
+    candidate blocks where the layer publishes or consumes them, then the top-k transform
+    writes the -1 padded page indices."""
     pool = backend.token_to_kv_pool
     metadata = backend.forward_metadata
     core = metadata.core_metadata

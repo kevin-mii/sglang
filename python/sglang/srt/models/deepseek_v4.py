@@ -477,9 +477,8 @@ def _apply_wo_a_bf16_matmul(
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows write token-major output directly to avoid
-    the layout copy before wo_b. ROCm decode takes aiter's batched GEMM (on
-    gfx950 the fp8-grid fork; with ``fp8_grid`` it returns an ``Fp8GridActivation``
-    [T, G * R] already on wo_b's grid). Other cases use torch.einsum.
+    the layout copy before wo_b. ROCm decode can use aiter batched GEMM (with
+    ``fp8_grid`` an ``Fp8GridActivation`` on wo_b's grid); other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (

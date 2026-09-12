@@ -1737,10 +1737,9 @@ class DeepseekV4HipRadixBackend(
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
-        """Metadata for the layers after the last kv_source layer under decoder
-        SWA bounded replay: each request contributes only its last SWA_WINDOW
-        extend tokens, and their window is floored at the tail start because
-        window KV before it is never written at those layers."""
+        """Metadata for the layers after the last kv_source layer under decoder SWA bounded
+        replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
+        tail start since no window KV before it is written at those layers."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             LateLayerTail,
             _tail_rows,
@@ -1805,9 +1804,8 @@ class DeepseekV4HipRadixBackend(
         return metadata
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
-        """Switch the late layers onto the tail; hand the return value back to
-        exit_late_layer_tail. The candidate-source layer published its masks over
-        the full extend, so each request's mask is cut to its tail rows."""
+        """Switch the late layers onto the tail metadata; `exit_late_layer_tail` takes the
+        return value. Each request's candidate mask is cut to its tail rows."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)

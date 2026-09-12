@@ -37,9 +37,8 @@ def aiter_sparse_decode_fwd(
     **_unused,
 ):
     """aiter's gfx950 gluon sparse decode kernel (``pa_decode_sparse``) behind the
-    ``flash_mla_with_kvcache`` shapes. Only ``-1`` index entries are skipped, so callers fold
-    ``topk_length`` into the index lists; ``inv_rope = (freqs_real, positions)`` folds the
-    model's inverse RoPE of the last 64 dims of every head into the output. Returns ``(out, None)``."""
+    ``flash_mla_with_kvcache`` shapes. Only ``-1`` entries are skipped, so callers fold
+    ``topk_length`` into the index lists; ``inv_rope`` folds the model's inverse RoPE into the output."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
     from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
