@@ -276,24 +276,28 @@ def _build_gluon_prefill_meta(
     )
     abs_pos = (prefix_lens[req_id] + (pos - cu_seqlens[req_id])).to(torch.int32)
 
-    # Host-side page layout: each request's context span rounds up to whole
-    # sparse blocks so every emitted page id stays inside its own span.
-    lens = [int(l) for l in seq_lens_cpu.tolist()]
-    pages_per_req = [
-        ((l + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
-        for l in lens
-    ]
-    total_pages = int(sum(pages_per_req))
-    starts = []
-    acc = 0
-    for p in pages_per_req:
-        starts.append(acc)
-        acc += p
-    page_start = torch.tensor(starts, dtype=torch.int32, device=device)
-    repeats = torch.tensor(pages_per_req, dtype=torch.int64, device=device)
+    # Page layout: each request's context span rounds up to whole sparse
+    # blocks so every emitted page id stays inside its own span. The per-request
+    # page counts are derived on the device from ``seq_lens`` (the host copy
+    # only sizes the buffers): a ``torch.tensor(list, device=...)`` here is a
+    # pageable H2D copy that blocks the CPU until the GPU drains its queue,
+    # which cost ~35 ms of lost run-ahead per extend forward.
+    lens = seq_lens_cpu.tolist()
+    total_pages = int(
+        sum(
+            ((int(l) + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
+            for l in lens
+        )
+    )
+    pages_per_req_dev = (
+        (seq_lens.to(torch.int64) + (SPARSE_BLOCK_SIZE - 1)) // SPARSE_BLOCK_SIZE
+    ) * PAGES_PER_BLOCK
+    page_start = (
+        torch.cumsum(pages_per_req_dev, dim=0) - pages_per_req_dev
+    ).to(torch.int32)
     page_req = torch.repeat_interleave(
-        torch.arange(len(pages_per_req), dtype=torch.int32, device=device),
-        repeats,
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        pages_per_req_dev,
         output_size=total_pages,
     )
     page_pos = (
