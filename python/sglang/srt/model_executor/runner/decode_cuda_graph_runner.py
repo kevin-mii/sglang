@@ -613,9 +613,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _dp_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """The attention-DP group's longest sequence when the graph must match on every rank;
         the in-graph collectives pair the ranks' registered buffers by capture order."""
-        if not getattr(self, "require_mlp_tp_gather", False):
+        if not self.require_mlp_tp_gather:
             return None
-        return getattr(forward_batch, "dp_max_seq_len", None)
+        return forward_batch.dp_max_seq_len
 
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Select the indexer graph for the longest request, or None without variants."""
