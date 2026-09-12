@@ -149,9 +149,32 @@ class _StubIndexer:
     is_hip() and is_gfx95_supported(), "FlyDSL fp4 indexer kernels are gfx950 only"
 )
 class TestFp4PagedLogitsKernels(CustomTestCase):
-    def _setup(self, ratio):
+    @staticmethod
+    def _queries_and_golden(rows, full_page_table, seq_lens, k_all, ratio, max_slots):
+        """Random fp4-grid queries and head weights per row, packed for FlyDSL, with
+        the fp32 golden scores over `max_slots` and each row's visible mask."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             pack_fp4_query_flydsl,
+        )
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+
+        q = fake_quant_fp4(
+            torch.randn(rows, N_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        )
+        weights = torch.rand(rows, N_HEADS, device="cuda", dtype=torch.bfloat16)
+        q_fp4, q_scale = pack_fp4_query_flydsl(q)
+        j = torch.arange(max_slots, device="cuda")
+        slots = compressed_slot(full_page_table, ratio, j.expand(rows, -1))
+        return dict(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            weights=weights,
+            ref=golden_scores(q, k_all[slots], weights),
+            visible=j[None, :] < seq_lens[:, None],
+        )
+
+    def _setup(self, ratio):
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             store_fp4_index_k_cache_split,
         )
         from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
@@ -177,14 +200,9 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        q = fake_quant_fp4(
-            torch.randn(bs, N_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-        )
         k_all = fake_quant_fp4(
             torch.randn(total_slots, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
         )
-        weights = torch.rand(bs, N_HEADS, device="cuda", dtype=torch.bfloat16)
-
         payload = torch.zeros(
             n_index_pages, 1, 4, INDEX_PAGE_SIZE, 16, dtype=torch.uint8, device="cuda"
         ).view(torch.float4_e2m1fn_x2)
@@ -201,12 +219,6 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             compress_ratio=ratio,
             index_page_size=INDEX_PAGE_SIZE,
         )
-        q_fp4, q_scale = pack_fp4_query_flydsl(q)
-
-        j = torch.arange(max_slots, device="cuda")
-        slots = compressed_slot(full_page_table, ratio, j.expand(bs, -1))
-        ref = golden_scores(q, k_all[slots], weights)
-        visible = j[None, :] < seq_lens[:, None]
         return SimpleNamespace(
             bs=bs,
             max_slots=max_slots,
@@ -216,11 +228,9 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             payload=payload,
             scale=scale,
             page_table=page_table,
-            q_fp4=q_fp4,
-            q_scale=q_scale,
-            weights=weights,
-            ref=ref,
-            visible=visible,
+            **self._queries_and_golden(
+                bs, full_page_table, seq_lens, k_all, ratio, max_slots
+            ),
         )
 
     def _assert_logits_match_golden(self, case, logits):
@@ -258,13 +268,9 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
     def _expand_to_verify_rows(self, case, ratio, block):
         """Target-verify rows: each request repeated `block` times, row j seeing one
         more compressed slot than row j - 1 (clamped to 1), with its own query."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            pack_fp4_query_flydsl,
-        )
         from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
             _expand_index_page_table,
         )
-        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(100 + ratio)
         bs = case.bs
@@ -278,26 +284,18 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
             compress_ratio=ratio,
             index_page_size=INDEX_PAGE_SIZE,
         )
-        q = fake_quant_fp4(
-            torch.randn(rows, N_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        return SimpleNamespace(
+            **vars(case)
+            | dict(
+                bs=rows,
+                full_page_table=full_page_table,
+                seq_lens=seq_lens,
+                page_table=page_table,
+            )
+            | self._queries_and_golden(
+                rows, full_page_table, seq_lens, case.k_all, ratio, case.max_slots
+            )
         )
-        weights = torch.rand(rows, N_HEADS, device="cuda", dtype=torch.bfloat16)
-        q_fp4, q_scale = pack_fp4_query_flydsl(q)
-        j = torch.arange(case.max_slots, device="cuda")
-        slots = compressed_slot(full_page_table, ratio, j.expand(rows, -1))
-        ref = golden_scores(q, case.k_all[slots], weights)
-        visible = j[None, :] < seq_lens[:, None]
-        verify = SimpleNamespace(**vars(case))
-        verify.bs = rows
-        verify.full_page_table = full_page_table
-        verify.seq_lens = seq_lens
-        verify.page_table = page_table
-        verify.q_fp4 = q_fp4
-        verify.q_scale = q_scale
-        verify.weights = weights
-        verify.ref = ref
-        verify.visible = visible
-        return verify
 
     def _run_decode(self, ratio, verify_block=None):
         from sglang.kernels.ops.attention.dsv4 import topk_transform_paged

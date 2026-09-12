@@ -59,6 +59,17 @@ def _all_equal(a, b):
     return all((u is None and v is None) or torch.equal(u, v) for u, v in zip(a, b))
 
 
+def _boundary_inputs(m, seed, hc_fn, hc_scale, hc_base):
+    """A sublayer's x and residual with the coefficients the previous sinkhorn produced."""
+    torch.manual_seed(seed)
+    residual = torch.randn(m, HC, H, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(m, H, device="cuda", dtype=torch.bfloat16)
+    pre_prev, post_in, comb_in = hc_mix_stats_sinkhorn(
+        residual.flatten(1), hc_fn, hc_scale, hc_base, HC, ITERS, RMS_EPS, HC_EPS
+    )
+    return x, residual, post_in, comb_in, pre_prev
+
+
 class TestHcMixStatsSinkhorn(CustomTestCase):
     def test_matches_reference_and_is_invariant(self):
         hc_fn, hc_scale, hc_base = _params("cuda")
@@ -123,21 +134,7 @@ class TestHcBoundaryFused(CustomTestCase):
         )
 
     def _inputs(self, m, seed):
-        torch.manual_seed(seed)
-        residual = torch.randn(m, HC, H, device="cuda", dtype=torch.bfloat16)
-        x = torch.randn(m, H, device="cuda", dtype=torch.bfloat16)
-        # Coefficients as the previous sublayer's sinkhorn produces them.
-        pre_prev, post_in, comb_in = hc_mix_stats_sinkhorn(
-            residual.flatten(1),
-            self.hc_fn,
-            self.hc_scale,
-            self.hc_base,
-            HC,
-            ITERS,
-            RMS_EPS,
-            HC_EPS,
-        )
-        return x, residual, post_in, comb_in, pre_prev
+        return _boundary_inputs(m, seed, self.hc_fn, self.hc_scale, self.hc_base)
 
     def test_matches_torch_forms(self):
         for m in (1, 7, 16, 33, 300):
@@ -241,18 +238,8 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
         self.weight = (torch.rand(H, device="cuda") + 0.5).to(torch.bfloat16)
 
     def _boundary(self, fn, m, seed):
-        torch.manual_seed(seed)
-        residual = torch.randn(m, HC, H, device="cuda", dtype=torch.bfloat16)
-        x = torch.randn(m, H, device="cuda", dtype=torch.bfloat16)
-        pre_prev, post_in, comb_in = hc_mix_stats_sinkhorn(
-            residual.flatten(1),
-            self.hc_fn,
-            self.hc_scale,
-            self.hc_base,
-            HC,
-            ITERS,
-            RMS_EPS,
-            HC_EPS,
+        x, residual, post_in, comb_in, pre_prev = _boundary_inputs(
+            m, seed, self.hc_fn, self.hc_scale, self.hc_base
         )
         return fn(
             x,
@@ -343,20 +330,7 @@ class TestHcBoundaryPrefill(CustomTestCase):
         self.hc_fn, self.hc_scale, self.hc_base = _params("cuda")
 
     def _inputs(self, m, seed):
-        torch.manual_seed(seed)
-        residual = torch.randn(m, HC, H, device="cuda", dtype=torch.bfloat16)
-        x = torch.randn(m, H, device="cuda", dtype=torch.bfloat16)
-        pre_prev, post_in, comb_in = hc_mix_stats_sinkhorn(
-            residual.flatten(1),
-            self.hc_fn,
-            self.hc_scale,
-            self.hc_base,
-            HC,
-            ITERS,
-            RMS_EPS,
-            HC_EPS,
-        )
-        return x, residual, post_in, comb_in, pre_prev
+        return _boundary_inputs(m, seed, self.hc_fn, self.hc_scale, self.hc_base)
 
     def _raw(self, x, residual, post_in, comb_in, pre_prev, prefill):
         """Both launches' raw outputs: (residual_out, y, part_mix, part_sq)."""

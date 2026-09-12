@@ -4,6 +4,7 @@ the served DeepSeek-V4 packed fp8 KV layout, bitwise repeatable and batch-invari
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -64,24 +65,39 @@ def _masked(indices, lengths):
     return _fold_lengths_into_index_lists(indices, lengths)[0]
 
 
+def _decode_case(batch, heads, gen, dev):
+    """Two SWA and five top-k pages of packed keys, a query per row, the sink, and one
+    random 128-slot SWA list plus one 512-slot top-k list per row ([b, 1, w] int32)."""
+    swa_cache, swa_deq = _pack_cache(2, dev, gen)
+    topk_cache, topk_deq = _pack_cache(5, dev, gen)
+    q = (torch.randn(batch, 1, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
+    sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
+    swa_idx = torch.stack(
+        [torch.randperm(2 * PAGE, generator=gen)[:128] for _ in range(batch)]
+    )
+    topk_idx = torch.stack(
+        [torch.randperm(5 * PAGE, generator=gen)[:512] for _ in range(batch)]
+    )
+    return SimpleNamespace(
+        swa_cache=swa_cache,
+        swa_deq=swa_deq,
+        topk_cache=topk_cache,
+        topk_deq=topk_deq,
+        q=q.to(dev),
+        sink=sink,
+        swa_idx=swa_idx.to(torch.int32).unsqueeze(1).to(dev),
+        topk_idx=topk_idx.to(torch.int32).unsqueeze(1).to(dev),
+    )
+
+
 def _reference(q, sink, sets):
-    """q [b, 1, h, D] bf16; sets = [(deq_keys [slots, D], indices [b, 1, w], lengths [b])].
-    Softmax over the valid gathered keys plus the sink logit; V is the full key."""
-    b, _, h, _ = q.shape
-    out = torch.zeros(b, 1, h, D, device=q.device)
-    for i in range(b):
-        keys = []
-        for deq, idx, length in sets:
-            sel = idx[i, 0]
-            pos = torch.arange(sel.numel(), device=sel.device)
-            valid = (sel >= 0) & (pos < length[i])
-            keys.append(deq[sel[valid].long()])
-        k = torch.cat(keys, dim=0)  # [n, D]
-        s = q[i, 0].float() @ k.T * SCALE  # [h, n]
-        logits = torch.cat([s, sink[:, None].float()], dim=1)
-        p = torch.softmax(logits, dim=1)[:, :-1]
-        out[i, 0] = p @ k
-    return out
+    """Decode form of `_reference_prefill`: sets = [(deq_keys, indices [b, 1, w], lengths [b])],
+    a slot at or past its row's length being padding."""
+    folded = []
+    for deq, idx, length in sets:
+        pos = torch.arange(idx.shape[-1], device=idx.device)
+        folded.append((deq, torch.where(pos < length[:, None, None], idx, -1)))
+    return _reference_prefill(q, sink, folded)
 
 
 @unittest.skipUnless(
@@ -97,29 +113,13 @@ class TestAiterSparseBackend(CustomTestCase):
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, swa_deq = _pack_cache(2, dev, gen)
-        topk_cache, topk_deq = _pack_cache(5, dev, gen)
-        q = (
-            (torch.randn(batch, 1, heads, D, generator=gen) * 0.5)
-            .to(torch.bfloat16)
-            .to(dev)
-        )
-        sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
-        swa_idx = (
-            torch.stack(
-                [torch.randperm(2 * PAGE, generator=gen)[:128] for _ in range(batch)]
-            )
-            .to(torch.int32)
-            .unsqueeze(1)
-            .to(dev)
-        )
-        topk_idx = (
-            torch.stack(
-                [torch.randperm(5 * PAGE, generator=gen)[:512] for _ in range(batch)]
-            )
-            .to(torch.int32)
-            .unsqueeze(1)
-            .to(dev)
+        c = _decode_case(batch, heads, gen, dev)
+        q, sink, swa_idx, topk_idx = c.q, c.sink, c.swa_idx, c.topk_idx
+        swa_cache, swa_deq, topk_cache, topk_deq = (
+            c.swa_cache,
+            c.swa_deq,
+            c.topk_cache,
+            c.topk_deq,
         )
         swa_len = torch.tensor(swa_lengths, dtype=torch.int32, device=dev)
         topk_len = torch.tensor(topk_lengths, dtype=torch.int32, device=dev)
@@ -214,33 +214,22 @@ class TestAiterSparseBackend(CustomTestCase):
         heads = 16
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, _ = _pack_cache(2, dev, gen)
-        topk_cache, _ = _pack_cache(5, dev, gen)
-        q = (torch.randn(batch, 1, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
-        q = q.to(dev)
-        sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
-        swa_idx = torch.stack(
-            [torch.randperm(2 * PAGE, generator=gen)[:128] for _ in range(batch)]
-        )
-        topk_idx = torch.stack(
-            [torch.randperm(5 * PAGE, generator=gen)[:512] for _ in range(batch)]
-        )
-        swa_idx = swa_idx.to(torch.int32).unsqueeze(1).to(dev)
-        topk_idx = topk_idx.to(torch.int32).unsqueeze(1).to(dev)
+        c = _decode_case(batch, heads, gen, dev)
+        q, sink = c.q, c.sink
         swa_len = torch.randint(1, 129, (batch,), generator=gen).to(torch.int32)
         topk_len = torch.randint(1, 513, (batch,), generator=gen).to(torch.int32)
         kwargs = dict(
             backend="aiter_sparse",
-            k_cache=swa_cache,
+            k_cache=c.swa_cache,
             head_dim_v=D,
             block_table=None,
             cache_seqlens=None,
             tile_scheduler_metadata=None,
             softmax_scale=SCALE,
             is_fp8_kvcache=True,
-            extra_k_cache=topk_cache,
-            indices=_masked(swa_idx, swa_len.to(dev)),
-            extra_indices_in_kvcache=_masked(topk_idx, topk_len.to(dev)),
+            extra_k_cache=c.topk_cache,
+            indices=_masked(c.swa_idx, swa_len.to(dev)),
+            extra_indices_in_kvcache=_masked(c.topk_idx, topk_len.to(dev)),
         )
         q_pad = torch.nn.functional.pad(q, (0, 0, 0, 64 - heads))
         sink_pad = torch.nn.functional.pad(sink, (0, 64 - heads))
@@ -473,32 +462,21 @@ def _model_inverse_rope(x, freqs_real, positions):
 )
 class TestAiterSparseDecodeReduce(CustomTestCase):
     def _inputs(self, batch, heads, seed, swa_len=128, topk_len=512):
-
+        """The kernel's own shapes: q [b, h, D], uint8 caches, flat length-folded lists."""
         gen = torch.Generator(device="cpu").manual_seed(seed)
         dev = torch.device("cuda")
-        swa_cache, _ = _pack_cache(2, dev, gen)
-        topk_cache, _ = _pack_cache(5, dev, gen)
-        q = (torch.randn(batch, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
-        sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
-        swa_idx = torch.stack(
-            [torch.randperm(2 * PAGE, generator=gen)[:128] for _ in range(batch)]
-        )
-        topk_idx = torch.stack(
-            [torch.randperm(5 * PAGE, generator=gen)[:512] for _ in range(batch)]
-        )
-        swa_idx = swa_idx.to(torch.int32).unsqueeze(1).to(dev)
-        topk_idx = topk_idx.to(torch.int32).unsqueeze(1).to(dev)
+        c = _decode_case(batch, heads, gen, dev)
 
         def lengths(n):
             return torch.full((batch,), n, dtype=torch.int32, device=dev)
 
         return dict(
-            q=q.to(dev),
-            sink=sink,
-            swa_cache=swa_cache.view(torch.uint8).squeeze(2),
-            topk_cache=topk_cache.view(torch.uint8).squeeze(2),
-            swa_idx=_masked(swa_idx, lengths(swa_len)).reshape(-1),
-            topk_idx=_masked(topk_idx, lengths(topk_len)).reshape(-1),
+            q=c.q.squeeze(1),
+            sink=c.sink,
+            swa_cache=c.swa_cache.view(torch.uint8).squeeze(2),
+            topk_cache=c.topk_cache.view(torch.uint8).squeeze(2),
+            swa_idx=_masked(c.swa_idx, lengths(swa_len)).reshape(-1),
+            topk_idx=_masked(c.topk_idx, lengths(topk_len)).reshape(-1),
         )
 
     @staticmethod
