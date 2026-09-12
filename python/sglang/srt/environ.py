@@ -1082,6 +1082,11 @@ class Envs:
     # at few extend rows and halved KV traffic at many rows.
     SGLANG_TRITON_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS = EnvInt(8192)
+    # Decode attention for grouped-head shapes with one TP-local KV head (EAGLE3
+    # Llama draft, MiniMax-M3 dense layers): serve it with the split-KV
+    # grouped-head verify kernel (one extend row per request) instead of the
+    # per-head decode kernel; ~3x higher KV bandwidth at 100K+ contexts.
+    SGLANG_DISABLE_TRITON_DECODE_SHARED_KV = EnvBool(False)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
