@@ -17,6 +17,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -31,6 +32,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -50,21 +52,34 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
+    IndexerInputs,
     make_candidate_indexer,
 )
-from sglang.srt.layers.attention.dsv4.candidate_torch import CandidateMasks
+from sglang.srt.layers.attention.dsv4.candidate_torch import (
+    CandidateMasks,
+    mask_topk_scores,
+    published_masks,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    fp4_paged_mqa_logits,
+    fp32_jit_paged_topk,
+    select_candidate_blocks,
+)
 from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
+    _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     PAGE_INDEX_ALIGNED_SIZE,
     LowRatioBackendMixin,
     _as_int_list,
     _expand_index_page_table,
+    _has_dense_fp4_indexer,
+    _is_sm100_or_newer,
     _low_ratio_compression_metadata,
     _low_ratio_sparse_buffers,
     _pad_last_dim,
@@ -108,7 +123,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -165,6 +180,37 @@ def _create_flashmla_metadata():
     import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
+
+
+def _every_request_fits() -> bool:
+    """The captured decode variants where every request's positions fit the
+    candidate block budget (decode_cuda_graph_runner): the plain top-k is the
+    whole selection, and the candidate layers behave like any index source."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_dsa_variant,
+    )
+
+    return get_capture_dsa_variant() in (
+        "candidate_all",
+        "candidate_c2_all",
+        "candidate_unfiltered",
+    )
+
+
+def _dense_fp4_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    kv_fp4: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    from deep_gemm import fp8_fp4_mqa_logits as fn
+
+    # q (int8 [T, H, 64], int32 [T, H]) x kv (int8 [L, 64], int32 [L]) -> fp32
+    # [T, max_seqlen_k]; row t's column j is k[ks_t + j], valid for j < ke_t - ks_t
+    # (the rest is garbage: the kernel rejects clean_logits).
+    return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -2415,6 +2461,422 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = current_raw
 
     # ---- DeepSeek V4.1 ratio 1/2 compressor and indexer, torch bring-up path ----
+
+    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
+        is_decode_or_verify = (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        if is_decode_or_verify:
+            if _is_sm100_or_newer():
+                # verify rows of one request share a request id (DeepGEMM pairs
+                # them); decode has one row per request, nothing to pair
+                req_ids = None if forward_batch.forward_mode.is_decode() else req
+                self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
+            else:
+                self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+        elif (
+            self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
+        ):
+            self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
+        else:
+            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+
+    @staticmethod
+    def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
+        return (
+            not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            and _has_dense_fp4_indexer()
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+
+    def _low_ratio_index_topk_extend(
+        self, layer, x, q_lora, pos, forward_batch
+    ) -> None:
+        tail = self.forward_metadata.late_layer_tail
+        if tail is not None:
+            q_lens, q_lens_cpu = tail.extend_seq_lens, tail.extend_seq_lens_cpu
+        else:
+            q_lens = forward_batch.extend_seq_lens
+            q_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+        assert q_lens_cpu is not None
+        self._low_ratio_index_topk_dense(
+            layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+        )
+
+    def _low_ratio_index_topk_dense(
+        self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+    ) -> None:
+        """Dense fp4 indexer over rows laid out request after request, `q_lens[b]` each."""
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            quantize_fp4_indexer_tensor,
+        )
+
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        page_indices.fill_(-1)
+        if raw_indices is not None:
+            raw_indices.fill_(-1)
+
+        seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
+        assert seq_lens_cpu is not None
+        device = pos.device
+        # Visible compressed positions per request at its newest token; the
+        # per-token count (pos + 1) // ratio bounds each row below.
+        lc_per_req = [s // ratio for s in seq_lens_cpu]
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
+        slot_chunks, starts = self._low_ratio_extend_k_slots(
+            ratio=ratio,
+            lc_per_req=lc_per_req,
+            req_pool_indices=req_pool_indices,
+            device=device,
+        )
+        empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=device)
+        num_tokens = pos.shape[0]
+        # TODO: move this to candidate indexer
+        if not slot_chunks or num_tokens == 0:
+            if indexer.is_candidate_source:
+                self.forward_metadata.candidate_metadata = CandidateMasks(
+                    request_masks=[empty_mask for _ in lc_per_req]
+                )
+            return
+        k_slots = torch.cat(slot_chunks)
+        k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
+
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
+        num_heads = q.shape[1]
+        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+        q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
+        q_sf = q_sf.view(num_tokens, num_heads)
+        weights = indexer.head_weights(x).float()
+        compress_lens = ((pos + 1) // ratio).to(torch.int32)
+        ks = torch.repeat_interleave(
+            torch.tensor(starts, dtype=torch.int32, device=device),
+            q_lens.to(torch.int64),
+            output_size=num_tokens,
+        )
+        logits = _dense_fp4_mqa_logits(
+            (q_fp4, q_sf),
+            (k_fp4, k_sf),
+            weights,
+            ks,
+            ks + compress_lens,
+            # the fused top-k reads score rows through 16-byte vectors
+            ceil_align(max(lc_per_req), 4),
+        )
+        if indexer.is_candidate_source or indexer.uses_candidates:
+            self._publish_or_consume_candidates(
+                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+            )
+        topk = indexer.index_topk
+        selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+        topk_transform_ragged_v2(
+            logits, compress_lens, out_offsets=ks, out_indices=selected
+        )
+        if indexer.uses_candidates and not indexer.is_candidate_source:
+            selected = mask_topk_scores(logits, selected, ks)
+        # ascending positions, padding last: the layout the consumers expect
+        unselected = torch.iinfo(torch.int32).max
+        selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+        chosen = selected != unselected
+        page_indices[:num_tokens, :topk] = torch.where(
+            chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
+        ).to(torch.int32)
+        if raw_indices is not None:
+            raw_indices[:num_tokens, :topk] = torch.where(
+                chosen, selected - ks[:, None], -1
+            )
+
+    # TODO(candidate): dense-prefill level one / level two inline with masks; move
+    # into the candidate indexer as publish_prefill / select_prefill.
+    def _publish_or_consume_candidates(
+        self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+    ) -> None:
+        """Level one of the two-level top-k: publish block masks, or sink non-candidates."""
+        publish = [] if indexer.is_candidate_source else None
+        consume = (
+            None
+            if publish is not None
+            else published_masks(self.forward_metadata.candidate_metadata)
+        )
+        j = torch.arange(logits.shape[1], device=logits.device)
+        tok_start = 0
+        for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
+            rows = slice(tok_start, tok_start + t_len)
+            tok_start += t_len
+            if lc == 0 or t_len == 0:
+                if publish is not None:
+                    publish.append(empty_mask)
+                continue
+            scores = logits[rows, :lc]
+            if publish is None:
+                scores.masked_fill_(~consume.request_masks[b], -torch.inf)
+                continue
+            lens = compress_lens[rows, None]
+            # the block selection tells unreachable positions apart by -inf
+            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
+            # the block selection pads and pools a copy of its rows; bound that copy
+            step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            masks = [
+                select_candidate_blocks(
+                    scores[start : start + step],
+                    lens[start : start + step],
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                )
+                for start in range(0, t_len, step)
+            ]
+            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
+        if publish is not None:
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                request_masks=publish
+            )
+
+    def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
+        """q/w come from live rows; metadata fixes the graph's context width."""
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            quantize_fp4_indexer_tensor,
+        )
+
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
+        assert indexer.n_local_heads == indexer.n_heads
+        width = metadata.max_c4_seq_len
+        if indexer.uses_candidates or indexer.is_candidate_source:
+            # Every reachable block is a candidate inside the window, so the
+            # two-level selection collapses to the plain top-k below.
+            assert (
+                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
+            ), f"prefill graph indexer width {width} exceeds the candidate window"
+
+        num_tokens, num_heads = q.shape[0], q.shape[1]
+        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+        q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
+        q_sf = q_sf.view(num_tokens, 1, num_heads)
+        weights = w.float()
+
+        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        assert k_cache.dim() == 2
+        page_size = metadata.c4_page_size
+        k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+
+        lens = metadata.c4_seq_lens
+        page_table = metadata.page_table
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        topk = min(indexer.index_topk, width)
+        columns = torch.arange(width, device=lens.device)
+        for rows, plan in metadata.row_chunks():
+            logits = fp4_paged_mqa_logits(
+                (q_fp4[rows], q_sf[rows]),
+                k_cache,
+                weights[rows],
+                lens[rows],
+                page_table[rows],
+                plan,
+                width,
+            )
+            lens_c = lens[rows].unsqueeze(-1)
+            # Columns past a row's length hold garbage.
+            s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
+            idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            reach = idx < lens_c
+            slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
+                idx % page_size
+            )
+            page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
+            if raw_indices is not None:
+                raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
+
+    def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos, req=None) -> None:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        if skip_low_ratio_indexer(layer.compress_ratio):
+            # The compressor still writes index K for later, longer contexts.
+            return
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            quantize_fp4_indexer_tensor,
+        )
+
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+
+        # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
+        # kernel sums head scores locally, so the indexer heads must be replicated.
+        assert indexer.n_local_heads == indexer.n_heads
+        if (
+            x.is_cuda
+            and torch.version.cuda is not None
+            and x.dtype == torch.bfloat16
+            and indexer.index_head_dim == 128
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_rope import (
+                index_q_rope_pack_weights,
+            )
+
+            q, _ = indexer.wq_b(q_lora)
+            q = q.view(q.shape[0], indexer.n_local_heads, indexer.index_head_dim)
+            # The fused query pack also computes head_weights(x).float(), preserving
+            # the fp32 multiply and bf16 rounding. freqs_cis stays a real/imag view.
+            q_fp4, q_sf, weights = index_q_rope_pack_weights(
+                q,
+                torch.view_as_real(layer.freqs_cis).flatten(-2),
+                pos,
+                indexer.head_weights_raw(x),  # [bs, n_local] bf16, n32k5120
+                indexer.head_weight_scale,
+            )
+        else:
+            q = indexer.queries(q_lora, layer.freqs_cis[pos])
+            q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+            weights = indexer.head_weights(x).float()  # [bs, n_local]
+        bs = q.shape[0]
+        q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
+        q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
+
+        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        assert k_cache.dim() == 2
+        # Index pool page (64 slots); metadata.page_table is expanded to match.
+        page_size = metadata.c4_page_size
+        k_cache = k_cache.view(
+            k_cache.shape[0], page_size, 1, 68
+        )  # fp4: 64 payload + 4 scale
+
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        inputs = IndexerInputs(
+            q_fp4,
+            q_sf,
+            k_cache,
+            weights,
+            metadata,
+            request_ids=req,  # one per query row; verify rows of a request share one
+        )
+        candidate_layer = not _every_request_fits()
+        # use special selection for candidate layers
+        if indexer.uses_candidates and candidate_layer:
+            return self.candidate_indexer.select_decode(
+                self.forward_metadata.candidate_metadata,
+                inputs,
+                page_indices,
+                raw_indices,
+            )
+        if indexer.is_candidate_source and candidate_layer:
+            self.forward_metadata.candidate_metadata = (
+                self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
+            )
+            return
+        logits = fp4_paged_mqa_logits(
+            (q_fp4, q_sf),
+            k_cache,
+            weights,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            metadata.deep_gemm_metadata,
+            metadata.max_c4_seq_len,
+        )
+        # TODO(dark): add bf16 topk
+        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
+
+    # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
+    # top-k); move into the candidate indexer with the prefill paths.
+    def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        """Hopper decode indexer: one token per request, every request scored at
+        once against its visible compressed positions straight off the fp4 page
+        table (Triton), then the same candidate / top-k contract as the DeepGEMM
+        path: level-one candidate blocks where the layer publishes or consumes them,
+        and -1 padded slots with the valid prefix first."""
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        page_indices.fill_(-1)
+        if raw_indices is not None:
+            raw_indices.fill_(-1)
+        bs = req.shape[0]
+        assert pos.shape[0] == bs, (
+            f"decode expects one token per request, {pos.shape=} {bs=}"
+        )
+        if bs == 0:
+            return
+        lens = (pos + 1) // ratio
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None
+        # V4 reserves the replay bound in metadata; visibility stays on device.
+        # A capture-time length read would both synchronize and truncate replay.
+        lmax = min(metadata.max_c4_seq_len, self.req_to_token.shape[1] // ratio)
+        if lmax == 0:
+            return
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        j = torch.arange(lmax, device=pos.device)
+        valid = j[None, :] < lens[:, None]
+        slots = (
+            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
+            // ratio
+        )
+        slots = slots.masked_fill(~valid, 0)
+        table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        s = fp4_index_logits_decode(
+            q, weights, slots, lens, table, table.shape[1] // 68
+        )
+        if indexer.is_candidate_source:
+            mask = select_candidate_blocks(
+                s,
+                lens[:, None],
+                topk_blocks=indexer.candidate_topk_blocks,
+                block_size=indexer.candidate_block_size,
+            )
+            self.forward_metadata.candidate_metadata = CandidateMasks(mask=mask)
+        elif indexer.uses_candidates:
+            # Published this step by the candidate-source layer's decode pass above.
+            consume = published_masks(self.forward_metadata.candidate_metadata).mask
+            assert torch.is_tensor(consume) and consume.shape[0] == bs, (
+                "candidate mask missing for decode"
+            )
+            s = s.masked_fill(~consume[:, :lmax], -torch.inf)
+        k = min(indexer.index_topk, lmax)
+        idx = s.topk(k, dim=-1, sorted=False).indices
+        if indexer.uses_candidates and not indexer.is_candidate_source:
+            idx = mask_topk_scores(s, idx)
+            idx = idx.masked_fill(idx < 0, lmax)
+        idx = idx.sort(dim=-1).values
+        reach = idx < lens[:, None]
+        page_indices[:bs, :k] = torch.where(
+            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
+        ).to(torch.int32)
+        if raw_indices is not None:
+            raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
