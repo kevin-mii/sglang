@@ -1659,6 +1659,9 @@ class OpenAIServingChat(OpenAIServingBase):
         try:
             first_chunk = await generator.__anext__()
         except ValueError as e:
+            logger.warning(
+                "Streaming chat request rejected before the first chunk: %s", e
+            )
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
