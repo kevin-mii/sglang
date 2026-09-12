@@ -397,8 +397,6 @@ class TestTwoLevelDecodeHip(CustomTestCase):
                     raw, seq, cands, page_table, "consumer"
                 )
 
-    # -- the candidate span: both levels skipped when the batch fits it --------
-
 
 # -- the head weights: split-K Triton GEMV route --------------------------------
 

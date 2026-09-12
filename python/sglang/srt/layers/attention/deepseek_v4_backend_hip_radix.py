@@ -579,7 +579,7 @@ class DSV4Metadata:
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
-    # Hoisted per-step inputs of forward_low_ratio_sources (decode only).
+    # per-step inputs of forward_low_ratio_sources, hoisted for one-token rows and the replay tail
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
