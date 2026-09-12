@@ -172,8 +172,3 @@ def disable_pending_sort(topk_ids: torch.Tensor) -> None:
     pending = _pop_pending(topk_ids)
     if pending is not None:
         _sort_configs[pending.key] = None
-
-
-def reset_for_tests() -> None:
-    _sort_configs.clear()
-    _pending_sorts.clear()

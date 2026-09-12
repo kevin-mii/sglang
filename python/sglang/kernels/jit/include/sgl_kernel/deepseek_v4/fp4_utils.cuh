@@ -7,8 +7,6 @@
 
 #ifndef USE_ROCM
 #include <cuda_fp4.h>
-#else
-#include <bit>
 #endif
 
 // FP4 (e2m1) helpers: per-32 UE8M0 for the indexer, per-16 E4M3 for compressed KV.
