@@ -38,9 +38,7 @@ RATIOS = (1, 2)
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Use explicit torch RMSNorm so the oracle stays independent of fused kernels;
-    RMSNorm.forward can change implementation with batch size.
-    """
+    """Explicit torch RMSNorm: `RMSNorm.forward` may switch kernels with the batch size."""
     dtype = x.dtype
     x = x.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -64,9 +62,8 @@ def _norm(seed: int, weight_scale: float = 1.0) -> RMSNorm:
 
 def _inputs(n, ratio, seed, *, pad=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    # Magnitudes from {0.5, 1, 2}: the squares are exact multiples of 0.25
-    # and 128 of them sum to at most 512, so every partial sum is exact in
-    # fp32 whatever the order and both norms agree bitwise.
+    # magnitudes from {0.5, 1, 2}: the squares sum exactly in fp32 in any order, so
+    # both norms agree bitwise
     mag = torch.tensor([0.5, 1.0, 2.0], device="cuda")[
         torch.randint(3, (n, HEAD_DIM), generator=g, device="cuda")
     ]
@@ -122,9 +119,8 @@ def _run(n, ratio, seed, *, pad=0, weight_scale=1.0):
 @pytest.mark.parametrize("ratio", RATIOS)
 @pytest.mark.parametrize("n", BATCHES)
 def test_matches_the_triton_writer_exactly(n, ratio):
-    """No tolerance: every byte of the buffer, on input whose norm statistic is
-    order-independent. This is the gate on the write half -- both quantization
-    stages, the nibble order, the block-exponent bytes and the slot address."""
+    """Every byte, on input whose norm statistic is order-independent: both
+    quantization stages, the nibble order, the block exponents and the slot address."""
     got, ref, _ = _run(n, ratio, seed=1000 + n * 7 + ratio)
     assert torch.equal(got, ref), (
         f"{n=} {ratio=}: {int((got != ref).sum())} of {got.numel()} cache bytes "
@@ -132,22 +128,18 @@ def test_matches_the_triton_writer_exactly(n, ratio):
     )
 
 
-# RMSNorm divides the overall input scale out, so the magnitude the quantizers
-# see is set by `k_norm.weight`. These three place the block absmax on either
-# side of both amax floors: 1.0 clears them, 1e-5 puts `amax / 6` under the
-# packer's 1e-4 (so its floor decides the exponent while the fake-quant's does
-# not), and 1e-38 reaches the fake-quant's own `6 * 2**-126`.
+# RMSNorm divides the input scale out, so `k_norm.weight` sets the block absmax: 1.0
+# clears both amax floors, 1e-5 puts `amax / 6` under the packer's 1e-4, 1e-38 reaches
+# the fake-quant's `6 * 2**-126`
 WEIGHT_SCALES = (1.0, 1e-5, 1e-38)
 
 
 @pytest.mark.parametrize("weight_scale", WEIGHT_SCALES)
 @pytest.mark.parametrize("ratio", RATIOS)
 def test_matches_across_the_amax_floors(ratio, weight_scale):
-    """The two quantization stages take their amax floors on opposite sides of
-    the divide by 6 -- `max(amax, 6 * 2**-126) * (1 / 6)` against
-    `max(amax / 6, 1e-4)` -- so they are genuinely different scales and neither
-    stage can be dropped. Nothing separates them until a block's absmax lands
-    below `6e-4`, which is what the small weights here arrange."""
+    """The two stages floor their amax on opposite sides of the divide by 6
+    (`max(amax, 6 * 2**-126) / 6` against `max(amax / 6, 1e-4)`), which only
+    separates them below a block absmax of 6e-4."""
     got, ref, _ = _run(64, ratio, seed=8000 + ratio, weight_scale=weight_scale)
     assert got.any(), "the input degenerated to an all-zero payload"
     assert torch.equal(got, ref), (
@@ -158,9 +150,8 @@ def test_matches_across_the_amax_floors(ratio, weight_scale):
 
 @pytest.mark.parametrize("ratio", RATIOS)
 def test_padded_rows_publish_nothing(ratio):
-    """A padded graph row carries `loc == 0`, the reserved dummy slot, and must
-    leave the cache alone -- slot 0 of page 0 included, which is exactly where
-    it would land if the check were missing."""
+    """A padded graph row carries `loc == 0` and must leave the cache alone, slot 0 of
+    page 0 included."""
     n, pad = 16, 5
     got, ref, loc = _run(ratio=ratio, n=n, seed=3000 + ratio, pad=pad)
     assert int((loc == 0).sum()) == pad
@@ -210,9 +201,8 @@ def test_slot_is_loc_across_a_page_boundary(ratio):
 
 
 def test_positions_select_the_group_freqs():
-    """The group position is masked out of the token position in-kernel. At
-    ratio 2 a token at an odd position must rotate by the *even* one, so the
-    same row fed as ratio 1 at that even position must produce the same bytes."""
+    """At ratio 2 an odd position rotates by the even one below it, so the same row fed
+    as ratio 1 at that even position gives the same bytes."""
     n = 8
     x, _, loc, freqs = _inputs(n, 2, seed=6000)
     norm = _norm(6001)
@@ -242,10 +232,8 @@ def test_empty_batch():
 # `config.index_n_heads` is 64, the served count. 1 is the degenerate row split,
 # where a row *is* a token and a wrong `row / heads` cannot show.
 Q_HEADS = (1, 64)
-# The Q path has no norm weight to scale, so the input carries the magnitude.
-# Below 6e-4 a block absmax puts `amax / 6` under the packer's 1e-4 floor, so
-# that floor -- and not the fake-quant's `6 * 2**-126` -- sets the exponent;
-# 1e-38 reaches the fake-quant's own floor as well.
+# the Q path has no norm weight, so the input sets the block absmax: below 6e-4 the
+# packer's 1e-4 floor pins the exponent, 1e-38 reaches the fake-quant's own floor
 Q_INPUT_SCALES = (1.0, 1e-3, 1e-4, 1e-38)
 # `_ceil_ue8m0_exp(1e-4)`, the exponent the packer's floor pins a block to.
 PACKER_FLOOR_EXPONENT = 114
@@ -309,11 +297,9 @@ def test_q_matches_the_triton_packer_exactly(n, heads):
 @pytest.mark.parametrize("heads", (1, Q_HEADS[-1]))
 @pytest.mark.parametrize("input_scale", Q_INPUT_SCALES)
 def test_q_matches_across_the_amax_floors(input_scale, heads):
-    """The two quantization stages take their amax floors on opposite sides of
-    the divide by 6 -- `max(amax, 6 * 2**-126) * (1 / 6)` against
-    `max(amax / 6, 1e-4)` -- so they are genuinely different scales and neither
-    stage can be dropped. Nothing separates them until a block's absmax lands
-    below 6e-4, which is what the small input scales here arrange."""
+    """The two stages floor their amax on opposite sides of the divide by 6
+    (`max(amax, 6 * 2**-126) / 6` against `max(amax / 6, 1e-4)`), which only
+    separates them below a block absmax of 6e-4."""
     got, ref = _run_q(64, heads, seed=11000 + heads, input_scale=input_scale)
     _assert_q_equal(got, ref, f"{input_scale=:g} {heads=}")
     # Pin the premise, so a case cannot silently stop exercising the floor.
@@ -337,12 +323,8 @@ Q_WEIGHT_SCALE = 128**-0.5 * 64**-0.5
 @pytest.mark.parametrize("heads", Q_HEADS)
 @pytest.mark.parametrize("n", BATCHES)
 def test_q_weights_epilogue_is_bitwise_head_weights(n, heads):
-    """`index_q_rope_pack_weights` must return the packed query of
-    `index_q_rope_pack` unchanged and, for the weights, exactly what the torch
-    chain `(w * scale).float()` produces on the raw `weights_proj` output: an
-    fp32 multiply by the fp32-rounded scalar, round-to-nearest-even to bf16,
-    widened to fp32. Random bf16 weights over several magnitudes so the bf16
-    rounding is exercised at every exponent."""
+    """The packed query is `index_q_rope_pack`'s unchanged, and the weights are the
+    torch chain `(w * scale).float()`: fp32 multiply, RNE to bf16, widened to fp32."""
     x, positions, freqs = _q_inputs(n, heads, seed=20000 + n * 7 + heads)
     freqs_cis = torch.view_as_real(freqs).flatten(-2).contiguous().float()
     g = torch.Generator(device="cuda").manual_seed(20001 + n * 7 + heads)

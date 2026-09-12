@@ -1,10 +1,4 @@
-"""Pin the e2m1 tie rounding of every HIP FP4 indexer quantizer.
-
-The low-ratio Triton paths round ties to even like CUDA; both AITER ratio-4 kernels quantize
-through gfx950 `v_cvt_scalef32_pk_fp4_f32`, also ties-to-even, where CUDA's ratio-4 kernels
-send the odd ties 0.75 / 1.75 / 3.5 toward zero. Exact ties (power-of-two block scales) are
-fed to each path and the convention asserted.
-"""
+"""Pin the e2m1 tie rounding of every HIP FP4 indexer quantizer: ties to even on every path, where CUDA's ratio-4 kernels send the odd ties 0.75 / 1.75 / 3.5 toward zero."""
 
 import unittest
 

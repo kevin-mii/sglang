@@ -144,10 +144,8 @@ class TestHcBoundaryFused(CustomTestCase):
             )
             self.assertEqual(res_out.shape, residual.shape)
             self.assertEqual(y.shape, (m, H))
-            # the new residual is a differently contracted fp32 chain rounded to bf16: at
-            # most one bf16 ulp of each element, with an absolute floor for the elements
-            # the sum cancelled to near zero (fp32 error of O(1) terms, far under a bf16
-            # ulp at unit scale)
+            # a differently contracted fp32 chain rounded to bf16: one bf16 ulp, with an
+            # absolute floor where the sum cancelled to near zero
             ref_res = _ref_post(x, residual, post_in, comb_in)
             self.assertEqual(res_out.dtype, ref_res.dtype)
             ulp = (

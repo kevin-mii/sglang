@@ -22,9 +22,7 @@ TOPK = 512
 TOPK_BLOCKS, BLOCK_SIZE = 2048, 8
 SPAN = TOPK_BLOCKS * BLOCK_SIZE
 
-# Head-weights route: the released checkpoint's hidden size and
-# softmax_scale * n_heads ** -0.5 = 128 ** -0.5 * 32 ** -0.5, 2 ** -6 once rounded
-# to fp32, so the aten multiply is an exact exponent shift.
+# the released hidden size; the scale is 2 ** -6 in fp32, so the aten multiply is exact
 HIDDEN = 5120
 SCALE = 128**-0.5 * 32**-0.5
 
@@ -387,9 +385,8 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
 
 
 class _LowRatioBackendCase(CustomTestCase):
-    """Shared fixture: a pool of fp4 indexer K behind a permuted FULL page table, one
-    batch of requests, and the backend entry points run on a bare
-    `DeepseekV4HipRadixBackend` with a stub indexer."""
+    """fp4 indexer K behind a permuted FULL page table, one batch, and the backend entry
+    points on a bare `DeepseekV4HipRadixBackend` with a stub indexer."""
 
     # (candidate_topk_blocks, candidate_block_size) of the stub indexer.
     CANDIDATE_BLOCKS = (TOPK_BLOCKS, BLOCK_SIZE)
@@ -581,9 +578,7 @@ class _LowRatioBackendCase(CustomTestCase):
         forward_batch=None,
     ):
         """Run one indexer layer through `path` ("extend", "decode" or "torch") on a
-        bare backend; returns (page_indices, raw_indices, published candidate masks).
-        `inputs` overrides the layer's (queries, head weights); `forward_batch`
-        overrides the fixture's batch on the decode path."""
+        bare backend; returns (page_indices, raw_indices, published candidate masks)."""
         from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
             DeepseekV4HipRadixBackend,
         )
@@ -665,9 +660,8 @@ class _LowRatioBackendCase(CustomTestCase):
         return out
 
     def _assert_candidates_equal(self, a_masks, b_masks, msg):
-        """Two HIP publications keep the same blocks per row (ids are unordered). None
-        stands for every reachable block, which a scored publication spells out as the
-        blocks 0..n-1 of each row."""
+        """Two HIP publications keep the same blocks per row; None stands for every
+        reachable block, which a scored publication spells out as blocks 0..n-1."""
 
         def keeps_every_block(cb):
             n = (cb.compact_lens // cb.block_size)[:, None]
@@ -689,9 +683,8 @@ class _LowRatioBackendCase(CustomTestCase):
             )
 
     def _assert_selection(self, a, b, msg, *, exact_rows=None, masks=True):
-        """Two (page_indices, raw_indices, masks) results agree: `exact_rows` (default
-        all) exactly; the other rows by their -1 pattern and tie-robust selected
-        positions (torch.topk breaks ties in no fixed order)."""
+        """`exact_rows` (default all) agree exactly, the other rows by -1 pattern and 95%
+        of the selected positions, since torch.topk breaks ties in no fixed order."""
         a_pi, a_ri, a_masks = a
         b_pi, b_ri, b_masks = b
         if exact_rows is None:
@@ -1335,9 +1328,8 @@ class TestLowRatioIndexerIdentitySkip(_LowRatioBackendCase):
                 case, fast[1], fast[0], case.pos.numel(), f"{ratio=}"
             )
 
-            # Candidate masks are published per request with a visible position
-            # (only ratio-1 layers use candidates in the model, where every
-            # request has one); keep such requests out of the mask cases.
+            # a request with no visible position publishes no mask: keep the
+            # 1-token request out of the mask cases
             seq_lens = [300, 45, 512 * ratio, 2 * ratio + 1]
             case = self._setup(ratio, seq_lens=seq_lens, extend_lens=seq_lens)
             full = self._run(case, "extend", skip=False)

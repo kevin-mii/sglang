@@ -1,9 +1,4 @@
-"""``DeepseekV2MoE._fuse_shared_into_reduce`` on a layer without ``shared_experts``.
-
-The module creates ``shared_experts`` only when the checkpoint's shared expert is
-not fused into the routed kernel, so the aiter reduce-add gate must treat a
-missing attribute as "no shared expert" instead of raising on the first prefill.
-"""
+"""``DeepseekV2MoE._fuse_shared_into_reduce`` must treat a missing ``shared_experts`` (the shared expert fused into the routed kernel) as no shared expert instead of raising on the first prefill."""
 
 import unittest
 from types import SimpleNamespace

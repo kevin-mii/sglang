@@ -54,13 +54,11 @@ def _seed(seed: int) -> random.Random:
 
 
 def _topk_inputs(rng, bs, width, topk, page_size, lens):
-    # a row is at most as long as its logits: the kernel reads scores[0, len) and
-    # page_table[0, len // page_size], so a longer row reads memory past the tensor
-    # end, and what it selects there (a stale word as the page) differs by launch
+    # a row longer than its logits reads past the tensor (scores[0, len) and
+    # page_table[0, len // page_size]), and what it selects there differs by launch
     assert max(lens, default=0) <= width, (lens, width)
     # distinct scores per row: the radix top-k breaks a tie at the threshold in
-    # atomic-counter order, so two launches over tied scores can select different
-    # sets, and this compares two launches
+    # atomic-counter order, so two launches over ties can select different sets
     scores = (
         torch.stack([torch.randperm(width, device=DEVICE).float() for _ in range(bs)])
         * 0.37
@@ -94,9 +92,8 @@ def test_sorted_topk_epilogue_matches_transform_then_sort(topk: int, with_raw: b
             scores, seq_lens, page_table = _topk_inputs(
                 rng, bs, width, topk, page_size, lens
             )
-            # the unsorted transform, then the order sort_selection_rows gives it: by
-            # position with raw indices, by slot without (the served decode shape);
-            # the Triton sort for a power-of-two k, a torch stable sort otherwise
+            # the unsorted transform, then sort_selection_rows' order (by position with
+            # raw indices, by slot without); the Triton sort for a power-of-two k
             ref = torch.empty(bs, topk, dtype=torch.int32, device=DEVICE)
             ref_raw = torch.empty_like(ref) if with_raw else None
             torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(

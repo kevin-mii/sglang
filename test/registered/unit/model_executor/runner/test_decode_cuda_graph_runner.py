@@ -296,10 +296,9 @@ class TestOriginalTraceExport(CustomTestCase):
 
 
 class TestDsaVariantIsDpGlobal(CustomTestCase):
-    """Every attention-DP rank must replay the same captured decode graph: the
-    in-graph DP collectives pair the ranks' registered buffers by capture order.
-    An idle rank (no lengths) or a rank whose longest request falls in another
-    length class must therefore resolve the variant from the group-wide max."""
+    """Every attention-DP rank must replay the same captured graph (the in-graph
+    collectives pair buffers by capture order), so an idle rank or one in another
+    length class resolves the variant from the group-wide max."""
 
     _LIMITS = [("candidate_all", 2048), ("candidate_unfiltered", 4096)]
 

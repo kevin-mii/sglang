@@ -340,9 +340,8 @@ def _tensor_fields(obj):
             yield f.name, value
 
 
-# Allocated with torch.empty_like by init_flashmla_related: the index-source layer
-# writes every row before a consumer reads one, so a fresh build holds whatever the
-# allocator hands back. Two builds agree on shape, not on contents.
+# torch.empty_like scratch: the index source writes every row before a consumer reads
+# one, so two builds agree on shape, not contents
 _UNINITIALIZED_SCRATCH_FIELDS = frozenset(
     {"c1_sparse_raw_indices", "c2_sparse_raw_indices", "c4_sparse_raw_indices"}
 )

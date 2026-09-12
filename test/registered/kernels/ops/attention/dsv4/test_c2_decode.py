@@ -33,15 +33,13 @@ EPS = 1e-6
 # 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIM = 512
 BATCHES = (1, 8, 64)
-# `CompressStatePool.ring_size`, positions per request slot in the pair state.
-# Two values, because the addressing is modular and a wrong wrap only shows on
-# one of them: the served size is `next_power_of_2(draft + 1)`.
+# `CompressStatePool.ring_size`; two values because a wrong modular wrap shows on only
+# one of them (served: `next_power_of_2(draft + 1)`)
 RING_SIZES = (2, 8)
 
 ROPE_DIM = 64
 RATIO = 2
-# Slots per page of the *compressed* pool, i.e. the FULL page size over the
-# ratio. 128 // 2 as served.
+# compressed-pool slots per page: the FULL page size over the ratio, 128 // 2 as served
 PAGE_SIZE = 64
 SLOT_BYTES = 584
 PAGE_BYTES = -(-SLOT_BYTES * PAGE_SIZE // 576) * 576
@@ -53,9 +51,7 @@ POOL_ATOL = 2**-20
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Use explicit torch RMSNorm so the oracle stays independent of fused kernels;
-    RMSNorm.forward can change implementation with batch size.
-    """
+    """Explicit torch RMSNorm: `RMSNorm.forward` may switch kernels with the batch size."""
     dtype = x.dtype
     x = x.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -86,9 +82,8 @@ def _inputs(
     num_state_rows=None,
     ring_size=RING_SIZES[-1],
 ):
-    """Inputs exercise distinct partner rows and alternating parity without padding;
-    a separate case covers the scheduler's int64 output locations.
-    """
+    """Distinct partner rows, alternating parity, no padding; `test_raw_out_loc_int64`
+    covers the int64 locations."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     num_state_rows = num_state_rows if num_state_rows is not None else n + 2
     kv_input = torch.randn(n, 2 * dim, generator=g, device="cuda", dtype=torch.float32)
@@ -126,13 +121,11 @@ def _torch_reference(kv_input, kv_state, norm, positions, req, raw_out_loc, ring
     state_kv, state_score = kv_state[:, :dim], kv_state[:, dim:]
     odd = (positions.to(torch.int64) % 2) == 1
     read, write = _state_rows(req, positions, ring_size)
-    # The ring separates the two: a completing row reads what `pos - 1` left, a
-    # pending one writes its own slot, so there is no read-modify-write of one
-    # row and no ordering to respect between them.
+    # a completing row reads what `pos - 1` left and a pending one writes its own
+    # slot, so there is no read-modify-write between them
     partner_kv, partner_score = state_kv[read], state_score[read]
-    # Only an even *live* row writes. Scattering the others as no-ops would not
-    # be equivalent: padded rows share a `req_pool_idx` with a live request, and
-    # a duplicated index makes the scatter pick a winner rather than skip.
+    # only an even live row writes: padded rows alias a live `req_pool_idx`, and a
+    # duplicated scatter index picks a winner instead of skipping
     parks = (~odd) & (raw_out_loc != 0)
     w = write[parks]
     assert w.unique().numel() == w.numel(), "a decode step parks once per request"
@@ -194,9 +187,8 @@ def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
 @pytest.mark.parametrize("ring_size", RING_SIZES)
 @pytest.mark.parametrize("n", BATCHES)
 def test_mixed_parity(n, ring_size):
-    """Both parities in one batch: the odd rows complete a group against the
-    state, the even rows park themselves in it. Both ring sizes, because the
-    slot arithmetic is modular and a wrong wrap shows on only one of them."""
+    """Odd rows complete a group against the state while even rows park in it; both
+    ring sizes, since a wrong modular wrap shows on only one."""
     *_, got_state, ref_state = _run(n, HEAD_DIM, seed=1000 + n, ring_size=ring_size)
     # Pure copy on the even rows, untouched on the odd ones -- no arithmetic, so
     # nothing here is allowed to differ by even one bit.
@@ -205,9 +197,8 @@ def test_mixed_parity(n, ring_size):
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_raw_out_loc_int64(n):
-    """`raw_out_loc` arrives as the scheduler's int64 `out_cache_loc` in the
-    served model (the unit tests above hand int32). The kernel indexes either
-    width and must produce the same bytes: same latent, same pair state."""
+    """The served model hands the scheduler's int64 `out_cache_loc`; either width must
+    give the same latent and pair state."""
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(
         n, HEAD_DIM, seed=7000 + n
     )
@@ -225,9 +216,8 @@ def test_raw_out_loc_int64(n):
 
 
 def test_pair_state_carried_across_two_steps():
-    """The load-bearing property: a group spans two decode steps. Step one is
-    all-even, so every row only parks; step two is all-odd and must pool
-    against exactly what step one left behind."""
+    """A group spans two decode steps: an all-even step only parks, and the all-odd
+    step after it must pool against exactly what it left."""
     n = 8
     g = torch.Generator(device="cuda").manual_seed(3000)
     first = torch.randn(
@@ -274,9 +264,8 @@ def test_pair_state_carried_across_two_steps():
 
 
 def test_padded_rows_publish_nothing():
-    """Graph-padding rows with raw_out_loc == 0 must not write cache or state,
-    even when their req_pool_idx aliases a live request.
-    """
+    """Padding rows with `raw_out_loc == 0` write neither cache nor state, even when
+    their `req_pool_idx` aliases a live request."""
     n = 8
     num_state_rows = 5
     req = torch.tensor([0, 1, 2, 3, 4, 0, 0, 0], device="cuda", dtype=torch.int64)
@@ -308,9 +297,8 @@ def test_saturated_and_tied_scores():
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(n, HEAD_DIM, seed=6000)
     positions = torch.arange(1, 2 * n + 1, 2, device="cuda", dtype=torch.int32)
     ring = RING_SIZES[-1]
-    # Row 0 ties with its partner; the odd rows sit 200 above theirs and rows
-    # 2 and 4 sit 200 below, so `exp(-|delta|)` underflows in fp32 from either
-    # side. The partner is the state row the kernel reads, not row `req`.
+    # row 0 ties its partner; odd rows sit 200 above theirs and rows 2 and 4 200
+    # below, so `exp(-|delta|)` underflows in fp32 from either side
     read, _ = _state_rows(req, positions, ring)
     kv_input[:, HEAD_DIM:] = 0.0
     kv_state[:, HEAD_DIM:] = 0.0
@@ -377,9 +365,7 @@ def _cache(max_slot):
 
 
 def _torch_store(latent, freqs, cache, slots):
-    """Use torch arithmetic as an independent RoPE/fake-quant oracle;
-    use the production writer for the shared 584-byte FlashMLA layout.
-    """
+    """Torch RoPE and fake-quant, then the production writer for the 584-byte layout."""
     fq4 = fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM))
     fused_store_cache(
         input=fq4, cache=cache, indices=slots, page_size=PAGE_SIZE, type="flashmla"
@@ -416,18 +402,16 @@ def _run_fusion(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
         live=live,
         cache=cache,
         slots=slots,
-        # Per row, the way `_low_ratio_write_group` gathers `freqs_cis[group_pos]`.
-        # The kernel indexes `positions - 1` itself; only completing rows are
-        # compared, and those are all at an odd position, so the clamp is dead.
+        # `freqs_cis[group_pos]` as `_low_ratio_write_group` gathers it; only odd
+        # (completing) rows are compared, so the clamp is dead
         freqs=freqs[(positions.to(torch.int64) - 1).clamp_min(0)],
     )
 
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_store_accepts_the_pool_fp8_view(n):
-    """`get_extra_key_buffer` hands the compressed pool out viewed as
-    `float8_e4m3fn`, not as the uint8 it was allocated as. The kernel must take
-    that view and write the same bytes it writes through the uint8 buffer."""
+    """`get_extra_key_buffer` hands the pool out as `float8_e4m3fn`; the kernel must
+    write the same bytes through that view as through the uint8 buffer."""
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(
         n, HEAD_DIM, seed=8000 + n
     )
@@ -459,10 +443,8 @@ def test_store_accepts_the_pool_fp8_view(n):
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_store_is_bitwise_the_production_writer(n):
-    """The hard gate on the write half, with the pooling residual factored out:
-    the reference is driven by the kernel's *own* latent, so the only thing
-    under test is RoPE, the fp4 fake-quant and the 584-byte layout. No
-    tolerance -- every byte of every slot, and every byte outside them."""
+    """Byte for byte, driven by the kernel's own latent so the pooling residual is
+    factored out and only RoPE, the fp4 fake-quant and the 584-byte layout remain."""
     r = _run_fusion(n, HEAD_DIM, seed=10000 + n)
     live = r["live"]
     ref_cache = torch.zeros_like(r["cache"])
@@ -475,10 +457,8 @@ def test_store_is_bitwise_the_production_writer(n):
 
 
 def test_store_skips_even_and_padded_rows():
-    """Nothing but a live completing row may reach the cache. Every row here is
-    either at an even position or padded, so the buffer must come back exactly
-    as it went in -- including compressed slot 0, which is what `raw_out_loc == 0`
-    would land on if the pad check were missing."""
+    """Every row is even or padded, so the buffer comes back untouched -- slot 0
+    included, where a `raw_out_loc == 0` row lands if the pad check is missing."""
     n = 8
     positions = torch.tensor([0, 2, 4, 6, 8, 1, 3, 5], device="cuda", dtype=torch.int32)
     # The live rows are all even; the padded ones cover both parities.
@@ -501,9 +481,8 @@ def test_store_skips_even_and_padded_rows():
 
 
 def test_store_slot_is_raw_out_loc_over_ratio():
-    """The kernel derives its slot in-kernel as `raw_out_loc >> 1` rather than
-    reading `c2_out_loc`. Scattered across a page boundary and beyond, the
-    written slots must be exactly that set and nothing else."""
+    """The slot is `raw_out_loc >> 1` in-kernel, not `c2_out_loc`; scattered across a
+    page boundary, exactly those slots and no others are written."""
     n = 6
     want = [
         1,

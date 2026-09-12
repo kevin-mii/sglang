@@ -34,16 +34,13 @@ PAGE_SIZE = 128
 SLOT_BYTES = 584
 PAGE_BYTES = -(-SLOT_BYTES * PAGE_SIZE // 576) * 576
 
-# How close to a bf16 rounding boundary an exact value has to be before which
-# side fp32 arithmetic lands on stops being decided by the formula. In units of
-# the bf16 ulp: 2^-16 is one fp32 ulp, so this is eight of them.
+# within this many bf16 ulps of a rounding boundary (eight fp32 ulps) fp32 arithmetic
+# may land on either side
 MIDPOINT_SLACK = 8 * 2**-16
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Use explicit torch RMSNorm so the oracle stays independent of fused kernels;
-    RMSNorm.forward can change implementation with batch size.
-    """
+    """Explicit torch RMSNorm: `RMSNorm.forward` may switch kernels with the batch size."""
     dtype = x.dtype
     x = x.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -64,9 +61,7 @@ def _norm(dim: int, seed: int) -> RMSNorm:
 
 
 def _inputs(n, dim, seed, *, positions=None, out_loc=None):
-    """Projection inputs use int64 positions and int32 output locations;
-    a separate case covers the scheduler's int64 output locations.
-    """
+    """int64 positions, int32 out_loc; `test_out_loc_int64` covers the int64 out_loc."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     kv_input = torch.randn(n, dim, generator=g, device="cuda", dtype=torch.bfloat16)
     if positions is None:
@@ -95,9 +90,7 @@ def _cache(max_slot):
 
 
 def _torch_store(latent, freqs, cache, slots):
-    """Use torch arithmetic as an independent RoPE/fake-quant oracle;
-    use the production writer for the shared 584-byte FlashMLA layout.
-    """
+    """Torch RoPE and fake-quant, then the production writer for the 584-byte layout."""
     fq4 = fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM))
     fused_store_cache(
         input=fq4, cache=cache, indices=slots, page_size=PAGE_SIZE, type="flashmla"
@@ -146,10 +139,8 @@ def _run(n, dim, seed, *, sentinel=None, **kw):
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_store_is_bitwise_the_production_writer(n):
-    """The hard gate on the write half. The reference is driven by the kernel's
-    *own* latent, so the only thing under test is the RoPE tail, the fp4
-    fake-quant and the 584-byte layout. No tolerance -- every byte of every
-    slot, and every byte outside them."""
+    """Byte for byte, driven by the kernel's own latent so only the RoPE tail, the fp4
+    fake-quant and the 584-byte layout are under test."""
     r = _run(n, HEAD_DIM, seed=1000 + n)
     live = r["live"]
     ref_cache = torch.zeros_like(r["cache"])
@@ -162,9 +153,8 @@ def test_store_is_bitwise_the_production_writer(n):
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_store_accepts_the_pool_fp8_view(n):
-    """`get_extra_key_buffer` hands the compressed pool out viewed as
-    `float8_e4m3fn`, not as the uint8 it was allocated as. The kernel must take
-    that view and write the same bytes it writes through the uint8 buffer."""
+    """`get_extra_key_buffer` hands the pool out as `float8_e4m3fn`; the kernel must
+    write the same bytes through that view as through the uint8 buffer."""
     seed = 5000 + n
     kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
     norm = _norm(HEAD_DIM, seed + 1)
@@ -182,9 +172,8 @@ def test_store_accepts_the_pool_fp8_view(n):
 
 @pytest.mark.parametrize("n", BATCHES)
 def test_out_loc_int64(n):
-    """The fused decode path passes `raw_out_loc` -- the scheduler's int64
-    `out_cache_loc` -- where the tests above hand int32. Either width must give
-    the same latent and the same cache bytes."""
+    """The fused decode path passes the scheduler's int64 `out_cache_loc`; either
+    width must give the same latent and cache bytes."""
     seed = 6000 + n
     kv_input, positions, out_loc = _inputs(n, HEAD_DIM, seed)
     norm = _norm(HEAD_DIM, seed + 1)
@@ -216,10 +205,8 @@ def test_out_loc_int64(n):
 
 
 def test_store_slot_is_out_loc():
-    """At ratio 1 the compressed slot *is* `out_loc`: `c1_out_loc` comes out of
-    `where(seq_lens % 1 == 0, raw_out_loc // 1, -1)`, which is `raw_out_loc`
-    unconditionally. Scattered across a page boundary and beyond, the written
-    slots must be exactly that set and nothing else."""
+    """At ratio 1 the compressed slot is `out_loc` itself; scattered across a page
+    boundary, exactly those slots and no others are written."""
     want = [
         1,
         PAGE_SIZE - 1,
@@ -243,9 +230,8 @@ def test_store_slot_is_out_loc():
 
 
 def test_padded_rows_publish_nothing():
-    """Padded out_loc == 0 rows must not write any cache slot, including slot 0;
-    their published latents are discarded by the caller.
-    """
+    """Padded `out_loc == 0` rows write no slot, slot 0 included; the caller discards
+    their latents."""
     n = 8
     positions = torch.tensor([2, 3, 4, 5, 6, 0, 0, 0], device="cuda", dtype=torch.int64)
     out_loc = torch.tensor(
@@ -280,9 +266,7 @@ def test_empty_batch():
 
 
 def _exact_norm(kv_input, weight):
-    """`DeepseekV41Compressor.finish` in float64, where the bf16 result of the
-    RMSNorm is unambiguous: the sum of squares no longer depends on the order it
-    was taken in."""
+    """`finish` in float64, where the bf16 result no longer depends on the sum order."""
     x = kv_input.double()
     scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
     return weight.double() * x * scale

@@ -1,6 +1,4 @@
-"""The ``aiter_sparse`` ROCm attention backend (aiter's gluon ``pa_decode_sparse``) and its Triton
-split-KV combine must match the torch reference, the kernels they replace and aiter's own reduce on
-the served DeepSeek-V4 packed fp8 KV layout, bitwise repeatable and batch-invariant."""
+"""The ``aiter_sparse`` ROCm attention backend and its split-KV combine must match the torch reference, the kernels they replace and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
 
 import math
 import unittest
@@ -197,10 +195,9 @@ class TestAiterSparseBackend(CustomTestCase):
                 )
 
     def test_short_lists_skip_the_padding_key(self):
-        """The -1 inside the length (index 3 of the top-k list) must not be attended: on
-        lists this short every key carries a visible share of the softmax mass, so a stray
-        key -- wrapped to the last slot or otherwise -- fails at this tolerance where the
-        640-key cases above would absorb it."""
+        """The -1 inside the length (index 3 of the top-k list) must not be attended: on a
+        5-key list a stray key moves the softmax mass past this tolerance, where the
+        640-key cases absorb it."""
         self._assert_matches_reference_and_tilelang(
             2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT
         )
@@ -634,9 +631,8 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
     is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
 )
 class TestAiterSparseDecodeSplitPin(CustomTestCase):
-    """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count of the decode rows: with it
-    a row's output is bitwise the same at every batch size; without it aiter's cost model
-    changes the count (hence the fp32 combine order) with the batch size past 64 rows."""
+    """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output is bitwise
+    the same at every batch size; aiter's cost model changes the count past 64 rows."""
 
     ROWS = 96  # aiter picks 2 splits here, 4 at 1..64 rows
 

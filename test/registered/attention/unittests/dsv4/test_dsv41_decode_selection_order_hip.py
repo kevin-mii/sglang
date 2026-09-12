@@ -1,6 +1,4 @@
-"""The HIP radix backend's decode top-k must be ordered by position, not by slot: the aiter
-sparse kernel sums in list order, so a slot-ordered row makes the attention bits depend on
-the physical pages a request landed on (a radix prefix hit moves them between requests)."""
+"""The HIP decode top-k must be ordered by position, not slot: the aiter sparse kernel sums in list order, so a slot-ordered row makes the attention bits depend on which pages a request landed on."""
 
 import unittest
 

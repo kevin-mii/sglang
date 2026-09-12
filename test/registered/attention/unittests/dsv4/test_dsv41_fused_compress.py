@@ -433,10 +433,9 @@ class TestFusedLowRatioCompress(CustomTestCase):
             )
 
     def test_padded_rows_publish_nothing(self):
-        """A padded CUDA-graph suffix carries `raw_out_loc == 0` and `out_loc == 0`.
-        Neither may reach either cache -- both kernels derive that from the arrays
-        themselves, so the caller passes no mask. (The other suppressed sentinel,
-        the ratio-2 `c2_out_loc == -1`, is `test_open_group_rows_publish_nothing`.)"""
+        """A padded graph suffix carries `raw_out_loc == 0` and `out_loc == 0`, which
+        both kernels must read off the arrays (the caller passes no mask); the ratio-2
+        `-1` sentinel is `test_open_group_rows_publish_nothing`."""
         n, pad = 8, 3
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
@@ -471,11 +470,9 @@ class TestFusedLowRatioCompress(CustomTestCase):
                     )
 
     def test_open_group_rows_publish_nothing(self):
-        """A live ratio-2 token at an even position completes no group: the
-        metadata gives it `c2_out_loc == -1`, the compressor only parks it in the
-        pair state, and neither cache may see it. The index-K writer takes the -1
-        straight from the array, so a store through it (wrapping to the last
-        slot) is what the byte-for-byte comparison must catch."""
+        """A live ratio-2 token at an even position completes no group, so the metadata
+        gives it `c2_out_loc == -1`; an index-K writer taking that -1 straight from
+        the array would wrap to the last slot."""
         from sglang.srt.layers.attention.dsv4.low_ratio_backend import (
             _low_ratio_compression_metadata,
         )

@@ -27,9 +27,7 @@ RATIOS = (1, 2)
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Use explicit torch RMSNorm so the oracle stays independent of fused kernels;
-    RMSNorm.forward can change implementation with batch size.
-    """
+    """Explicit torch RMSNorm: `RMSNorm.forward` may switch kernels with the batch size."""
     dtype = x.dtype
     x = x.float()
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -51,9 +49,8 @@ def _norm(seed: int) -> RMSNorm:
 
 def _inputs(n, ratio, seed, *, pad=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    # Magnitudes from {0.5, 1, 2}: the squares are exact multiples of 0.25
-    # and 128 of them sum to at most 512, so every partial sum is exact in
-    # fp32 whatever the order and both norms agree bitwise.
+    # magnitudes from {0.5, 1, 2}: the squares sum exactly in fp32 in any order, so
+    # both norms agree bitwise
     mag = torch.tensor([0.5, 1.0, 2.0], device="cuda")[
         torch.randint(3, (n, HEAD_DIM), generator=g, device="cuda")
     ]

@@ -1,6 +1,4 @@
-"""Decoder SWA bounded replay on the HIP radix backend: the late-layer tail metadata
-(each request's last SWA_WINDOW extend rows, windows floored at the tail start) and
-the switch onto it, checked against the flag-off build of the same batch."""
+"""Decoder SWA bounded replay on the HIP radix backend: the late-layer tail metadata (each request's last SWA_WINDOW extend rows, windows floored at the tail start) and the switch onto it, against the flag-off build."""
 
 import unittest
 from types import SimpleNamespace
@@ -22,9 +20,8 @@ MAX_CONTEXT = 1024
 NUM_FULL_SLOTS = NUM_REQ_SLOTS * MAX_CONTEXT + 1
 TOPK_BLOCKS, BLOCK_SIZE = 16, 8
 
-# (extend_len, cached_prefix_len, request slot): a request longer than the window,
-# one shorter than the window behind a cached prefix (its floor still cuts the
-# prefix off), one exactly the window, and a one-token extend.
+# (extend_len, cached_prefix_len, slot): longer than the window; shorter, behind a
+# cached prefix the floor still cuts off; exactly the window; a one-token extend
 REQUESTS = [(300, 0, 5), (37, 40, 2), (128, 0, 0), (1, 500, 4)]
 
 
