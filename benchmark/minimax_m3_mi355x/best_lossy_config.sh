@@ -1,0 +1,19 @@
+# Track J: ATOM-parity PERFORMANCE-ONLY config for MiniMax-M3 on 4x MI350X (TP4), MXFP4 quark target + EAGLE3.
+# Source /scratch/run/best_config.sh first (this file does that), then run /scratch/run/launch_v2.sh.
+#
+# *** OUTPUTS ARE NOT THE MODEL'S REAL OUTPUT. ***  SGLANG_SIMULATE_ACC_LEN forces which draft tokens commit
+# (mean acceptance length 2.78 = 1 + 0.5933 x 3, the same floor/ceil schedule ATOM's --spec-decode-acceptance-rate 0.5933
+# resolves to with 3 draft tokens); draft and verify still run, but accepted tokens are never checked against the target.
+# Never run GSM8K or any accuracy evaluation with this file sourced. Report numbers from it as "synthetic acceptance".
+#
+# Measured on GPUs 4-7 at ~195K-token contexts (steady.py 60 s): forced 2.78 with STEPS=2/DRAFT=3 -> N=16 2175 tok/s, N=24 2704 tok/s
+# vs the real-acceptance best_config (STEPS=3/DRAFT=4, accept 2.3-2.4 on this workload) 1610 / 1990 tok/s (+35% at N=24).
+# CHUNK=16384 (ATOM's prefill chunk): fresh 197K prefill 5.75 -> 5.5 s; MEMFRAC=0.9 (ATOM gpu-mem 0.9): KV pool 7.9M -> 8.9M tokens, no OOM.
+# Rejected: PTPC-FP8 dense (SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED, no gain), --max-running-requests 64 (neutral; keep 48).
+source /scratch/run/best_config.sh
+export STEPS=2 DRAFT=3
+export MEMFRAC=0.9 CHUNK=16384
+export ENVS2="$ENVS2 SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token"
+# Launch example (coordinator GPUs 0-3):
+#   source /scratch/run/best_lossy_config.sh; TAG=v9_lossy GPUS=0,1,2,3 PORT=30000 SPEC_ATTN=decode \
+#     EXTRA2="--max-running-requests 48 $EXTRA2" ENVS2="NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1 $ENVS2" bash /scratch/run/launch_v2.sh
