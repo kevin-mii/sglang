@@ -1457,6 +1457,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         max_seqlen: int,
         layer,
         disable_value: bool,
+        packed_queries: int,
         allocate_topk_buf: bool,
     ):
         """Run the GPU sparse decode kernels over flattened per-row queries.
@@ -1504,6 +1505,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_v_scale=layer.idx_v_scale_float,
             cached_topk_idx=cached_topk,
             topk_out=topk_out,
+            # Score a request's rows in one index pass (score-only layers).
+            packed_queries=int(packed_queries) if disable_value else 1,
         )
 
     def _forward_gpu_triton_verify(
@@ -1564,6 +1567,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             int(self._max_seqlen_k) + int(ndt),
             layer,
             disable_value,
+            ndt,
             allocate_topk_buf=False,
         )
 
