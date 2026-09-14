@@ -69,6 +69,17 @@ def should_ignore_layer(
         ]
 
         # Layer should be ignored if shards are ignored.
+        ignore = list(ignore)
+        # a shard the exclude list never names is not in the checkpoint, so it cannot veto siblings
+        described_projs = {target.split(".")[-1] for target in ignore}
+        known_shards = [
+            shard_name
+            for shard_proj_name, shard_name in zip(shard_proj_names, shard_names)
+            if shard_proj_name in described_projs
+        ]
+        if known_shards:
+            shard_names = known_shards
+
         should_ignore_layer = None
         for shard_name in shard_names:
             should_ignore_shard = check_equal_or_regex_match(
