@@ -1590,11 +1590,10 @@ class PrefillAdder:
                     compute_charge=trunc_len,
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
+            elif has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
+                # only whole extends take the reserve: one chunked request is tracked at a time
+                return AddReqResult.CONTINUE
             else:
-                if has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
-                    # only whole extends take the reserve: one chunked request is tracked at a time
-                    return AddReqResult.CONTINUE
-
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
