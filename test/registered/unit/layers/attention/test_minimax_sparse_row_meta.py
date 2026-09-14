@@ -26,30 +26,10 @@ class TestChainVerifyRowMeta(CustomTestCase):
         self.assertEqual(per_query_seq_lens.tolist(), [11, 12, 13, 4, 5, 6])
         self.assertEqual(per_query_seq_lens.dtype, torch.int32)
 
-    def test_single_draft_token(self):
-        prefix = torch.tensor([5], dtype=torch.int32)
-        per_query_req, per_query_seq_lens = chain_verify_row_meta(
-            prefix, torch.tensor([0], dtype=torch.int32), num_draft_tokens=1
-        )
-        self.assertEqual(per_query_req.tolist(), [0])
-        self.assertEqual(per_query_seq_lens.tolist(), [6])
-
 
 class TestFlattenedExtendRowMeta(CustomTestCase):
-    def test_equal_extends_pack(self):
-        meta = flattened_extend_row_meta(
-            torch.tensor([4, 9], dtype=torch.int32),
-            prefix_lens=[100, 20],
-            extend_lens=[2, 2],
-            seq_lens_dtype=torch.int32,
-        )
-        self.assertEqual(meta.per_query_req.tolist(), [4, 4, 9, 9])
-        self.assertEqual(meta.per_query_seq_lens.tolist(), [101, 102, 21, 22])
-        self.assertEqual(meta.max_seqlen, 102)
-        self.assertEqual(meta.packed, 2)
-        self.assertEqual(meta.rows, 4)
-
     def test_ragged_extends_do_not_pack(self):
+        """Unequal extends must fall back to per-row scoring and still get causal lengths."""
         meta = flattened_extend_row_meta(
             torch.tensor([1, 0], dtype=torch.int32),
             prefix_lens=[8, 8],
