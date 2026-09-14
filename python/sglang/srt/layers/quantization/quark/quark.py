@@ -378,10 +378,7 @@ class QuarkConfig(QuantizationConfig):
         self.exclude_layers = list(dict.fromkeys(expanded))
 
     def _online_fp8_for_excluded(self, prefix: str) -> bool:
-        """Excluded (bf16) linear layers can be quantized to FP8 at load
-        time (dynamic per-token activations, per-channel weights) instead of
-        running bf16 GEMMs. Module names listed in
-        SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES (router gate, lm_head, ...) stay bf16."""
+        """Whether the excluded layer at `prefix` is served as load-time FP8."""
         if not envs.SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED.get():
             return False
         skip = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())
@@ -389,9 +386,7 @@ class QuarkConfig(QuantizationConfig):
 
     @functools.cached_property
     def _online_fp8_config(self) -> "Fp8Config":
-        """The Fp8Config shared by every excluded layer served online: weights
-        quantized per-channel at load (unserialized checkpoint mode), dynamic
-        per-token activations. Built once; logs once."""
+        """The `Fp8Config` shared by the excluded layers served online, built and logged once."""
         log_info_on_rank0(
             logger,
             "Quark: SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1, excluded linear "

@@ -1,8 +1,4 @@
-"""Quark: excluded (bf16) linear layers can opt into load-time FP8 quantization.
-
-Checks the module-name gate and the config used for those layers; no model or GPU
-needed.
-"""
+"""The online-FP8 skip list must match whole module names."""
 
 import unittest
 
@@ -16,7 +12,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _bare_config() -> QuarkConfig:
-    # Minimal quark config: no quantized groups, nothing excluded by name.
+    # no quantized groups, nothing excluded by name
     return QuarkConfig(quant_config={"packed_modules_mapping": {}, "exclude": []})
 
 

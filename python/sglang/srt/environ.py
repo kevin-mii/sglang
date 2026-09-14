@@ -982,13 +982,9 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
-    # Quark checkpoints keep their excluded linear layers (e.g. every attention
-    # projection of a MoE model) in bf16. With this on, those layers are
-    # quantized to FP8 at load time and served by the dynamic per-token /
-    # per-channel FP8 GEMM (on ROCm together with SGLANG_USE_AITER_FP8_PER_TOKEN=1
-    # this is the aiter preshuffled a8w8 GEMM). Layers whose module name is in
-    # SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES stay bf16.
+    # serve quark-excluded bf16 linear layers as per-token FP8 quantized at load
     SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED = EnvBool(False)
+    # module names (whole path components) kept bf16 under the knob above
     SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES = EnvTuple(("gate", "lm_head"))
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
