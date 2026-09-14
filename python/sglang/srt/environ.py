@@ -996,6 +996,10 @@ class Envs:
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # max rows for which the fused add-RMSNorm also emits its fp8 pair; None = MXFP8 decode bound
     SGLANG_FUSED_NORM_FP8_QUANT_MAX_M = EnvInt(None)
+    # serve quark-excluded bf16 linear layers as per-token FP8 quantized at load
+    SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED = EnvBool(False)
+    # module names (whole path components) kept bf16 under the knob above
+    SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES = EnvTuple(("gate", "lm_head"))
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /

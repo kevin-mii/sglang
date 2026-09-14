@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import fnmatch
+import functools
 import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (  # noqa: E501
@@ -33,7 +35,7 @@ from sglang.srt.layers.quantization.quark.utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_device_capability, log_info_on_rank0
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -375,6 +377,27 @@ class QuarkConfig(QuantizationConfig):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
 
+    def _serves_excluded_as_online_fp8(self, prefix: str) -> bool:
+        """Whether the excluded layer at `prefix` is served as load-time FP8."""
+        if not envs.SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED.get():
+            return False
+        kept_bf16 = set(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())
+        return not (kept_bf16 & set(prefix.split(".")))
+
+    @functools.cached_property
+    def _excluded_online_fp8_config(self) -> "Fp8Config":
+        """The `Fp8Config` shared by the excluded layers served online, built and logged once."""
+        log_info_on_rank0(
+            logger,
+            "Quark: SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1, excluded linear "
+            "layers are quantized to FP8 at load (kept bf16 via "
+            "SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES: "
+            f"{sorted(envs.SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES.get())})",
+        )
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
@@ -391,6 +414,10 @@ class QuarkConfig(QuantizationConfig):
                 # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
+                if self._serves_excluded_as_online_fp8(prefix):
+                    return Fp8LinearMethod(
+                        quant_config=self._excluded_online_fp8_config
+                    )
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
