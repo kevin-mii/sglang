@@ -1,12 +1,4 @@
-"""Correctness for the fused quantizing MiniMax-M3 KV + index cache store.
-
-The Triton kernel writes the main K/V heads, the index-K head and the optional
-index-V head into their token-major caches in one launch, applying the
-per-tensor KV scale and the cache-dtype cast in registers. It must match the
-unfused stores (``MHATokenToKVPool.set_kv_buffer`` and the index-cache
-``set_k_buffer``): ``cache[loc] = (x / scale).to(cache.dtype)`` when a cast is
-needed, a verbatim copy when the cache already has the input dtype.
-"""
+"""`store_kv_index_quant` must write exactly what the unfused stores write."""
 
 from types import SimpleNamespace
 
@@ -30,8 +22,7 @@ SCALES = (0.5, 2.0, 0.25, 4.0)
 
 
 def _reference_store(x, cache, loc, scale):
-    # Mirrors MHATokenToKVPool.set_kv_buffer: the scale applies only when the
-    # store needs a cast.
+    # as in set_kv_buffer, the scale applies only where the store casts
     y = x
     if x.dtype != cache.dtype and scale is not None:
         y = x / scale
@@ -41,9 +32,7 @@ def _reference_store(x, cache, loc, scale):
 def _assert_close(fused, ref, cache_dtype, scaled, name):
     diff = (fused.float() - ref.float()).abs()
     if cache_dtype.itemsize == 1 and scaled:
-        # fp8 with a scale: the fused kernel divides in fp32, the reference
-        # divides in bf16 before the cast, so a small fraction of elements may
-        # land one fp8 ulp apart.
+        # fp32 vs bf16 division before the fp8 cast lands a few elements one ulp apart
         mismatched = (diff > 1e-6).sum().item()
         assert mismatched <= int(0.02 * diff.numel()), (name, mismatched)
     else:
@@ -60,8 +49,7 @@ def _assert_close(fused, ref, cache_dtype, scaled, name):
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
 def test_store_kv_index_quant(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype):
     torch.manual_seed(T * 31 + H * 7 + Di)
-    # Inputs are views of one wide row buffer, like the qkv/index projection
-    # splits the kernel sees in the model (non-unit row stride).
+    # views of one wide row buffer, like the qkv/index projection splits in the model
     row = torch.randn(T, 3 * H * D + 2 * Di, dtype=torch.bfloat16, device=dev) * 20
     k = row[:, : H * D].view(T, H, D)
     v = row[:, H * D : 2 * H * D].view(T, H, D)
@@ -95,7 +83,7 @@ def test_store_kv_index_quant(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype
     _assert_close(idx_k_cache, refs[2], cache_dtype, scaled, "idx_k")
     if has_v:
         _assert_close(idx_v_cache, ref_idx_v, cache_dtype, scaled, "idx_v")
-    # Rows that were not addressed stay untouched.
+    # unaddressed rows stay untouched
     mask = torch.ones(SLOTS, dtype=torch.bool, device=dev)
     mask[loc.long()] = False
     assert k_cache[mask].float().abs().max().item() == 0

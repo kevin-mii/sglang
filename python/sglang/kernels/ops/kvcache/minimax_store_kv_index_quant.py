@@ -1,14 +1,9 @@
-"""Fused MiniMax-M3 sparse-cache store with on-the-fly (fp8) quantization.
+"""Fused MiniMax-M3 sparse-cache store with the fp8 cast folded in.
 
-One Triton launch per layer writes the main K/V heads, the index-K head and the
-optional index-V head into their token-major caches, applying the per-tensor
-KV scales and the cache dtype cast in registers. It replaces the unfused
-sequence used when the pools are fp8 (``x.div_(scale)`` + ``.to(fp8)`` for K
-and V, the index ``k / scale`` + ``.to(fp8)`` and the index scatter, plus the
-main store kernel): 7-8 small launches per layer -> 1.
-
-Triton, so it runs on CUDA and ROCm alike; the CUDA raw-byte JIT kernel
-(``minimax_store_kv_index``) stays the fast path when no cast is needed.
+One Triton launch per layer scales, casts and scatters the main K/V heads, the
+index-K head and the optional index-V head into their token-major caches; it
+serves the fp8-pool case that the raw-byte CUDA store (`minimax_store_kv_index`)
+cannot, on CUDA and ROCm alike.
 """
 
 from __future__ import annotations
@@ -96,10 +91,7 @@ def can_store_kv_index_quant(
     idx_v: Optional[torch.Tensor],
     idx_v_cache: Optional[torch.Tensor],
 ) -> bool:
-    """Shapes/dtypes this kernel serves: token-major ``[slots, heads, dim]``
-    caches in a bf16/fp16/fp8 dtype, bf16/fp16 inputs, power-of-2 head dims and
-    a unit stride along the head dim on both sides, for K, V, index-K and (when
-    present) index-V alike."""
+    """Whether every (input, cache) pair has a layout the kernel can address."""
 
     def _row_ok(x: torch.Tensor, cache: torch.Tensor) -> bool:
         return (
@@ -125,26 +117,26 @@ def can_store_kv_index_quant(
 
 
 def store_kv_index_quant(
-    k: torch.Tensor,  # [T, H, D] bf16/fp16
-    v: torch.Tensor,  # [T, H, Dv]
-    k_cache: torch.Tensor,  # [slots, H, D] cache dtype
-    v_cache: torch.Tensor,  # [slots, H, Dv]
-    idx_k: torch.Tensor,  # [T, 1, Di]
-    idx_k_cache: torch.Tensor,  # [slots, 1, Di]
-    idx_v: Optional[torch.Tensor],  # [T, 1, Di] or None
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    idx_k: torch.Tensor,
+    idx_k_cache: torch.Tensor,
+    idx_v: Optional[torch.Tensor],
     idx_v_cache: Optional[torch.Tensor],
-    loc: torch.Tensor,  # [T] int32/int64 slot ids
+    loc: torch.Tensor,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
 ) -> None:
-    """``cache[loc] = (x / scale).to(cache.dtype)`` for K, V, index-K (and
-    index-V), one launch. ``None`` scale means unit scale.
+    """`cache[loc] = (x / scale).to(cache.dtype)` for K, V, index-K and index-V in one launch.
 
-    As in ``MHATokenToKVPool.set_kv_buffer``, a scale is applied only when the
-    cache dtype differs from the input dtype (a cast is needed); a cache that
-    already matches the input dtype is stored verbatim.
+    Inputs are `[tokens, heads, dim]` (index tensors have one head), caches
+    `[slots, heads, dim]`, `loc` one slot per token. As in
+    `MHATokenToKVPool.set_kv_buffer`, a scale applies only where the store
+    casts; a `None` scale is unit.
     """
     T, H, D = k.shape
     Dv = v.shape[2]
@@ -195,8 +187,6 @@ def store_kv_index_quant(
         V_HEAD_DIM=Dv,
         IDX_DIM=Di,
         HAS_IDX_V=has_iv,
-        # One program per token with a static loop over the rank's KV heads:
-        # sized for the small per-rank head counts of the MiniMax-M3 sparse
-        # layers (1-4 heads of 128). Correct, but not tuned, for wide pools.
+        # one program per token with a static head loop: sized for the few KV heads per rank
         num_warps=1,
     )
