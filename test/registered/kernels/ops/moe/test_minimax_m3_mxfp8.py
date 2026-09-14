@@ -32,6 +32,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize,
 )
 from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
     mxfp8_group_quantize,
@@ -82,6 +83,23 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     deq_t = dequant_mxfp8_to_bf16(xq_t, s_t)
     deq_k = dequant_mxfp8_to_bf16(xq_k, s_k)
     assert _relerr(deq_k, deq_t) < 1e-2
+
+
+@pytest.mark.parametrize("m", [1, 3, 32, 33, 100, 129])
+@pytest.mark.parametrize("k", [2048, 6144])
+@torch.inference_mode()
+def test_mxfp8_quant_row_padding_matches_unpadded(m, k):
+    """A padded quant that alters a data row or leaves a pad row non-zero corrupts the GEMM."""
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16) * 3
+    xq, s = mxfp8_e4m3_quantize(x)
+    xq_p, s_p = mxfp8_e4m3_quantize(x, pad_rows_to=32, scale_pad_rows_to=128)
+    assert xq_p.shape == ((m + 31) // 32 * 32, k)
+    assert s_p.shape == ((m + 127) // 128 * 128, k // 32)
+    assert torch.equal(xq_p[:m].view(torch.uint8), xq.view(torch.uint8))
+    assert torch.equal(s_p[:m], s)
+    assert (xq_p[m:].view(torch.uint8) == 0).all()
+    assert (s_p[m:] == 0).all()
 
 
 @requires_gfx950
