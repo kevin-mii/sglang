@@ -1217,7 +1217,7 @@ LONG_PREFIX_MAX_SPLITS = 16
 
 
 def long_prefix_num_splits(batch_size: int, head_num: int, max_len_extend: int):
-    """How many prefix slices the long-prefix path should use (>= 1)."""
+    """Return how many prefix slices the long-prefix sweep should use, at least one."""
     tiles = triton.cdiv(max_len_extend, LONG_PREFIX_BLOCK_SIZES[0])
     programs = max(1, batch_size * head_num * tiles)
     return max(
@@ -1246,15 +1246,13 @@ def extend_attention_fwd_long_prefix(
     identity_kv_indices: bool = False,
     num_splits: Optional[int] = None,
 ):
-    """extend_attention_fwd for an EXTEND over a long cached prefix, without
-    the exotic features (custom mask, sinks, sliding window, logit cap, score
-    mod): the prefix is swept with larger query tiles and in ``num_splits``
-    parallel slices (one partial O/LSE each), the current chunk runs as its own
-    causal partial, and one combine launch normalizes into ``o_extend``.
+    """`extend_attention_fwd` for an EXTEND over a long cached prefix, without
+    custom mask, sinks, sliding window, logit cap or score mod.
 
-    Same math as extend_attention_fwd; only the order of the online-softmax
-    reduction over prefix slices differs (fp32 partials), so outputs agree to
-    bf16 rounding.
+    The prefix is swept in `num_splits` parallel slices with larger query tiles,
+    the current chunk runs as its own causal partial, and one combine launch
+    normalizes the fp32 partials into `o_extend`; only the reduction order over
+    slices differs from the single-pass kernel.
     """
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     tokens, Lv = q_extend.shape[0], v_extend.shape[-1]

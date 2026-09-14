@@ -1,13 +1,4 @@
-"""Parity tests for the aiter CK paged batch-prefill route of the long-prefix
-EXTEND path (``extend_attention_fwd_aiter_paged``): the chunk's causal
-attention over prefix + chunk is one paged-prefill call with page indices =
-prefix indices followed by the chunk's cache locations. Both it and
-``extend_attention_fwd`` are checked against an fp32 reference (on the last
-rows of each request) on ragged batches, fp8 KV with per-tensor scales, and
-bf16 KV, for the one-TP-local-KV-head shape the backend routes to it.
-
-ROCm + aiter required. Runs on the AMD MI35x lane.
-"""
+"""aiter's paged batch-prefill over prefix + chunk must match an fp32 reference."""
 
 import unittest
 
@@ -63,6 +54,8 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
 @unittest.skipIf(not torch.cuda.is_available() or not is_hip(), "ROCm GPU required")
 @unittest.skipIf(not _AITER_OK, "aiter mha_batch_prefill required")
 class TestExtendLongPrefixAiter(CustomTestCase):
+    """A wrong page table, descale or causal offset shows as a mismatch on the last rows."""
+
     def _run(self, prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, kv_scale):
         device = "cuda"
         torch.manual_seed(0)

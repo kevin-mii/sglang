@@ -1554,9 +1554,8 @@ class TritonAttnBackend(AttentionBackend):
     def _use_long_prefix_extend(
         self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
     ) -> bool:
-        """Route an eager EXTEND / draft-extend over a long cached prefix to the
-        split-prefix kernel. Host-side shape checks only (no device sync): the
-        average prefix per request comes from the kv_indices length."""
+        """Should this eager EXTEND / draft-extend take the split-prefix kernel?
+        Decided from host-side shapes: the average cached prefix per request."""
         if not self.long_prefix_extend_enabled or kv_indices is None:
             return False
         # target verify keeps its own kernels
@@ -1577,10 +1576,8 @@ class TritonAttnBackend(AttentionBackend):
     def _use_aiter_long_prefix_extend(
         self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
     ) -> bool:
-        """Within the long-prefix route: batches whose largest request has at
-        least ``aiter_long_prefix_min_rows`` extend rows go to aiter's CK
-        paged batch-prefill (page size 1, fp8 or bf16 KV). Host-side checks
-        only."""
+        """Within the long-prefix route, should the batch take aiter's CK paged
+        batch-prefill? True once its largest request extends by `aiter_long_prefix_min_rows`."""
         if (
             self.aiter_long_prefix_extend is None
             or self.page_size != 1
