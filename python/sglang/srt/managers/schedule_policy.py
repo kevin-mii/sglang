@@ -1512,7 +1512,7 @@ class PrefillAdder:
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
                 if has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
-                    # only whole extends may take the reserve: one chunked request is tracked at a time
+                    # only whole extends take the reserve: one chunked request is tracked at a time
                     return AddReqResult.CONTINUE
 
                 # Make sure at least one page is available

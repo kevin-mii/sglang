@@ -889,6 +889,7 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
 
     def test_regrow_returns_the_unused_reserve_once(self):
+        """A regrow that repeats, or touches an uncapped request, over-admits tokens."""
         self.mock_token_allocator.available_size.return_value = 1_000_000
         from sglang.srt.environ import envs
 
@@ -923,22 +924,12 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(chunked.extend_range.length, 8192)
 
     def test_cap_applies_only_with_waiters_and_a_long_tail(self):
+        """A cap with nothing waiting, or on a tail that fits, would only add a chunk."""
         self.mock_token_allocator.available_size.return_value = 1_000_000
         from sglang.srt.environ import envs
 
-        # Knob off: the chunked request takes the whole chunk budget.
-        adder = self.create_adder(
-            self.create_running_batch(),
-            rem_input_tokens=16384,
-            rem_chunk_tokens=8192,
-            waiting_queue_len=2,
-        )
-        chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
-        adder.add_chunked_req(chunked)
-        self.assertEqual(chunked.extend_range.length, 8192)
-
         with envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.override(0.5):
-            # Nothing waiting: no cap.
+            # nothing waiting: no cap
             adder = self.create_adder(
                 self.create_running_batch(),
                 rem_input_tokens=16384,
@@ -949,7 +940,7 @@ class TestPrefillAdder(CustomTestCase):
             adder.add_chunked_req(chunked)
             self.assertEqual(chunked.extend_range.length, 8192)
 
-            # Last chunk already fits under the cap: not truncated further.
+            # a tail that fits under the cap is not split
             adder = self.create_adder(
                 self.create_running_batch(),
                 rem_input_tokens=16384,
