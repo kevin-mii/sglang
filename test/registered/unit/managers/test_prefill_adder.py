@@ -834,6 +834,123 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
+    def _chunkable_req(self, rid, prefix_len, total_len, max_new_tokens=64):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
+        req.prefix_indices = list(range(prefix_len))
+        req.full_untruncated_fill_ids = list(range(total_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_fitting_waiters_ride_along_and_chunk_needing_waiters_wait(self):
+        """A waiter that fits must ride along; one that needs chunking must wait."""
+        self.mock_token_allocator.available_size.return_value = 1_000_000
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.override(0.5):
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=16384,
+                rem_chunk_tokens=8192,
+                waiting_queue_len=2,
+            )
+            chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
+            self.assertIs(adder.add_chunked_req(chunked), chunked)
+            self.assertEqual(chunked.extend_range.length, 4096)
+            self.assertEqual(adder.rem_chunk_tokens, 4096)
+            self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
+
+            big = self._chunkable_req("big", prefix_len=100_000, total_len=110_000)
+            res = adder.add_one_req(
+                big, has_chunked_req=True, truncation_align_size=None
+            )
+            self.assertEqual(res, AddReqResult.CONTINUE)
+            self.assertNotIn(big, adder.can_run_list)
+            self.assertIsNone(adder.new_chunked_req)
+
+            small = self._chunkable_req("small", prefix_len=150_000, total_len=151_500)
+            res = adder.add_one_req(
+                small, has_chunked_req=True, truncation_align_size=None
+            )
+            self.assertEqual(res, AddReqResult.CONTINUE)
+            self.assertIn(small, adder.can_run_list)
+            self.assertEqual(small.extend_range.length, 1500)
+            self.assertEqual(adder.rem_chunk_tokens, 4096 - 1500)
+
+            # the unused reserve goes back to the chunked request
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+            self.assertEqual(chunked.extend_range, Range(8192, 8192 + 4096 + 2596))
+            self.assertEqual(adder.rem_chunk_tokens, 0)
+            self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
+
+    def test_regrow_returns_the_unused_reserve_once(self):
+        """A regrow that repeats, or touches an uncapped request, over-admits tokens."""
+        self.mock_token_allocator.available_size.return_value = 1_000_000
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.override(0.5):
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=16384,
+                rem_chunk_tokens=8192,
+                waiting_queue_len=1,
+            )
+            # nothing admitted, so the regrow finishes the request
+            chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=14192)
+            self.assertIs(adder.add_chunked_req(chunked), chunked)
+            self.assertEqual(chunked.extend_range.length, 4096)
+            self.assertIsNone(adder.regrow_capped_chunked_req(chunked))
+            self.assertEqual(chunked.extend_range.length, 6000)
+            self.assertEqual(adder.rem_chunk_tokens, 8192 - 6000)
+            # a second regrow must not grow again
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+            self.assertEqual(chunked.extend_range.length, 6000)
+
+            # an uncapped chunked request is untouched
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=16384,
+                rem_chunk_tokens=8192,
+                waiting_queue_len=0,
+            )
+            chunked = self._chunkable_req("chunked2", prefix_len=0, total_len=30000)
+            self.assertIs(adder.add_chunked_req(chunked), chunked)
+            self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+            self.assertEqual(chunked.extend_range.length, 8192)
+
+    def test_cap_applies_only_with_waiters_and_a_long_tail(self):
+        """A cap with nothing waiting, or on a tail that fits, would only add a chunk."""
+        self.mock_token_allocator.available_size.return_value = 1_000_000
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.override(0.5):
+            # nothing waiting: no cap
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=16384,
+                rem_chunk_tokens=8192,
+                waiting_queue_len=0,
+            )
+            chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
+            adder.add_chunked_req(chunked)
+            self.assertEqual(chunked.extend_range.length, 8192)
+
+            # a tail that fits under the cap is not split
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=16384,
+                rem_chunk_tokens=8192,
+                waiting_queue_len=2,
+            )
+            tail = self._chunkable_req("tail", prefix_len=8192, total_len=8192 + 3000)
+            self.assertIsNone(adder.add_chunked_req(tail))
+            self.assertEqual(tail.extend_range.length, 3000)
+
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.can_run_list = [

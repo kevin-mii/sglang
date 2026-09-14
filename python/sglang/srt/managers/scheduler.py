@@ -3939,6 +3939,9 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        if self.chunked_req is not None:
+            self.chunked_req = adder.regrow_capped_chunked_req(self.chunked_req)
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
