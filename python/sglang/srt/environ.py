@@ -992,6 +992,8 @@ class Envs:
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # max rows for which the fused add-RMSNorm also emits its fp8 pair; None = MXFP8 decode bound
+    SGLANG_FUSED_NORM_FP8_QUANT_MAX_M = EnvInt(None)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /

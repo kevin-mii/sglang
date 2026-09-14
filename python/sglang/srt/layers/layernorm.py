@@ -154,6 +154,9 @@ if _is_hip:
 def _fuse_norm_fp8_max_m() -> int:
     if not is_gfx95_supported():
         return 0
+    override = envs.SGLANG_FUSED_NORM_FP8_QUANT_MAX_M.get()
+    if override is not None:
+        return override
     from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
 
     return MXFP8_DENSE_PTPC_DECODE_MAX_M
@@ -424,6 +427,8 @@ def _forward_with_allreduce_fusion_quant_per_token(
         return None
     fp8_out, residual_out, scale_out, bf16_out = fused_result
     bf16_out._fp8_qinput = (fp8_out, scale_out)
+    # consumers compare with the live _version, so an in-place write invalidates the pair
+    bf16_out._fp8_qinput_version = bf16_out._version
     return bf16_out, residual_out
 
 
