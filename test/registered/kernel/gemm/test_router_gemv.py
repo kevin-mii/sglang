@@ -1,9 +1,4 @@
-"""Parity test for the gfx950 skinny router GEMV (bf16 x bf16 -> fp32 logits).
-
-Covers every M bucket, including the 65..128-row bucket that EAGLE
-target-verify batches use (bs x num_draft_tokens rows), against a fp32
-torch.mm reference.
-"""
+"""The gfx950 router GEMV must match fp32 `torch.mm` on every M bucket."""
 
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -33,10 +28,9 @@ class TestRouterGemv(CustomTestCase):
             ref = torch.mm(x.float(), w.float().t())
             out = rg.router_gemv(x, w)
             self.assertEqual(out.dtype, torch.float32)
-            # fp32 logits from bf16 inputs; split-K accumulation order differs
-            # from torch.mm, so allow 1e-3 rather than fp32 round-off.
+            # split-K accumulation order differs from torch.mm, so 1e-3 not fp32 round-off
             torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3, msg=f"m={m}")
-            # Second call reuses the self-cleaning split-K counter.
+            # a second call reuses the self-cleaning split-K counter
             torch.testing.assert_close(rg.router_gemv(x, w), ref, rtol=1e-3, atol=1e-3)
         x = torch.randn(rg._MAX_M + 1, self.K, device="cuda").to(torch.bfloat16)
         self.assertFalse(rg.router_gemv_supported(x, w))
