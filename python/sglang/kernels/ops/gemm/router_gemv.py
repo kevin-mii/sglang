@@ -22,14 +22,17 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 _is_hip = is_hip()
 _is_gfx95_supported = _is_hip and is_gfx95_supported()
 
-_MAX_M = 64
+_MAX_M = 128
 
-# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket.
+# (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps) per M bucket. The 128 bucket
+# covers EAGLE target-verify batches (bs x num_draft_tokens rows, e.g. 24 x 4):
+# hipblaslt/aiter split-K GEMMs take ~18us there, this kernel ~10us.
 _CONFIGS = (
     (8, (1, 16, 512, 4, 16)),
     (16, (16, 16, 512, 8, 4)),
     (32, (16, 32, 512, 8, 4)),
-    (_MAX_M, (32, 32, 512, 8, 4)),
+    (64, (32, 32, 512, 8, 4)),
+    (_MAX_M, (32, 32, 256, 8, 4)),
 )
 
 
