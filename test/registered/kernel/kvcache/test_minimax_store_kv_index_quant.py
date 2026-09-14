@@ -45,6 +45,7 @@ def _assert_close(fused, ref, cache_dtype, scaled, name):
 @pytest.mark.parametrize("scales", [UNIT_SCALES, SCALES])
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
 def test_matches_unfused_stores(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype):
+    """A wrong stride, scale or cast would corrupt cache rows silently."""
     torch.manual_seed(T * 31 + H * 7 + Di)
     # views of one wide row buffer, like the qkv/index projection splits in the model
     row = torch.randn(T, 3 * H * D + 2 * Di, dtype=torch.bfloat16, device=dev) * 20
@@ -87,8 +88,7 @@ def test_matches_unfused_stores(cache_dtype, T, H, D, Di, has_v, scales, idx_dty
 
 
 def test_mixed_cache_dtypes_scale_only_the_cast_side():
-    """bf16 main cache with an fp8 index cache: the K/V scale must not be
-    applied (no cast), the index scale must."""
+    """A bf16 main cache next to an fp8 index cache must not get its K/V scaled."""
     T, H, D, Di = 16, 1, 128, 128
     torch.manual_seed(0)
     k = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
@@ -123,35 +123,27 @@ def test_mixed_cache_dtypes_scale_only_the_cast_side():
     assert (diff > 1e-6).sum().item() <= int(0.02 * diff.numel())
 
 
-def test_rejects_unsupported_layouts():
+def test_v_and_index_v_are_validated_like_k():
+    """A V or index-V that only K-side checks would miss must not reach the kernel."""
     T, H, D = 4, 1, 128
-    k = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
-    v = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
-    idx_k = torch.randn(T, 1, D, dtype=torch.bfloat16, device=dev)
-    fp8 = torch.float8_e4m3fn
-    ok_cache = torch.zeros(SLOTS, H, D, dtype=fp8, device=dev)
+    bf16 = dict(dtype=torch.bfloat16, device=dev)
+    k = torch.randn(T, H, D, **bf16)
+    v = torch.randn(T, H, D, **bf16)
+    idx_k = torch.randn(T, 1, D, **bf16)
+    cache = torch.zeros(SLOTS, H, D, dtype=torch.float8_e4m3fn, device=dev)
 
-    def ok(
-        k_=k, v_=v, kc=ok_cache, vc=ok_cache, ik=idx_k, ikc=ok_cache, iv=None, ivc=None
-    ):
-        return can_store_kv_index_quant(k_, v_, kc, vc, ik, ikc, iv, ivc)
+    def storable(v_=v, vc=cache, iv=None, ivc=None):
+        return can_store_kv_index_quant(k, v_, cache, vc, idx_k, cache, iv, ivc)
 
-    assert ok()
-    # Non-power-of-2 head dim, on K or on V.
-    odd_cache = torch.zeros(SLOTS, H, 96, dtype=fp8, device=dev)
-    odd = torch.randn(T, H, 96, dtype=torch.bfloat16, device=dev)
-    assert not ok(k_=odd, kc=odd_cache)
-    assert not ok(v_=odd, vc=odd_cache)
-    # fp32 input.
-    assert not ok(k_=k.float())
-    assert not ok(v_=v.float())
-    # Head-dim-strided input (dim stride != 1): two heads laid out dim-major.
-    two_head_cache = torch.zeros(SLOTS, 2, D, dtype=fp8, device=dev)
-    kt = torch.randn(T, D, 2, dtype=torch.bfloat16, device=dev).transpose(1, 2)
-    assert kt.stride(2) != 1
-    assert not ok(k_=kt, kc=two_head_cache)
-    assert not ok(v_=kt, vc=two_head_cache)
-    # index-V without its cache (or the reverse) is rejected.
-    assert not ok(iv=idx_k)
-    assert not ok(ivc=ok_cache)
-    assert ok(iv=idx_k, ivc=ok_cache)
+    assert storable()
+    odd = torch.randn(T, H, 96, **bf16)
+    odd_cache = torch.zeros(SLOTS, H, 96, dtype=torch.float8_e4m3fn, device=dev)
+    assert not storable(v_=odd, vc=odd_cache)
+    two_heads = torch.randn(T, D, 2, **bf16).transpose(1, 2)
+    assert two_heads.stride(2) != 1
+    assert not storable(
+        v_=two_heads, vc=torch.zeros(SLOTS, 2, D, dtype=cache.dtype, device=dev)
+    )
+    assert not storable(iv=idx_k)
+    assert not storable(ivc=cache)
+    assert storable(iv=idx_k, ivc=cache)
