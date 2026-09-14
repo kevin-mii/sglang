@@ -16,6 +16,8 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_llama_eagle3_draft,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -85,6 +87,10 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+# head dims whose verify_mla block/split config was measured on the one-row decode shape
+_DECODE_SHARED_KV_HEAD_DIMS = (128,)
+
+
 def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
@@ -92,9 +98,15 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
+    # per-head split-KV re-reads the prefix once per query head, so grouped shapes use this
+    if not (
+        is_qwen3_5(model_config.hf_config)
+        or is_minimax_sparse(model_config.hf_config)
+        or is_llama_eagle3_draft(model_config.hf_config)
+    ):
+        return False
     return (
         use_verify_splitkv
-        and is_qwen3_5(model_config.hf_config)
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -231,6 +243,16 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # decode is a one-row verify whose token is already in the page table
+        self.use_decode_shared_kv = (
+            self.use_verify_shared_kv
+            and not envs.SGLANG_DISABLE_TRITON_DECODE_SHARED_KV.get()
+        )
+        self._decode_shared_kv_qo_indptr = (
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+            if self.use_decode_shared_kv
+            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1530,6 +1552,28 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    SMALL_EXTEND_MAX_TOKENS = 8
+
+    def _is_small_constant_extend(
+        self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Is this EXTEND verify-shaped: equal per-request extend lengths of at most
+        `SMALL_EXTEND_MAX_TOKENS` tokens, each over a non-empty cached prefix?"""
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        return (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and extend_lens[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(n == extend_lens[0] for n in extend_lens)
+            and prefix_lens is not None
+            and len(prefix_lens) == len(extend_lens)
+            and all(n > 0 for n in prefix_lens)
+            and kv_indices is not None
+            and kv_indices.numel() > 0
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1704,10 +1748,15 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
+        # draft-extend and small constant extends are verify-shaped, so they skip the serial one
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+                or self._is_small_constant_extend(forward_batch, kv_indices)
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -2297,6 +2346,42 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        if (
+            self.use_decode_shared_kv
+            and not self.use_mla
+            and layer.qk_head_dim in _DECODE_SHARED_KV_HEAD_DIMS
+            and layer.qk_head_dim == layer.v_head_dim
+            and score_mod is None
+            and sinks is None
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= 0)
+            and k is not None
+            and v is not None
+            and q.shape[0] + 1 <= self._decode_shared_kv_qo_indptr.shape[0]
+            and self.verify_shared_kv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                1,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                max_bs=self.req_to_token_pool.size,
+                kv_len_adjust=-1,
+            )
+        ):
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

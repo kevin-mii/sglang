@@ -1093,6 +1093,8 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # kill switch: grouped-head decode otherwise runs on the shared-KV verify kernel
+    SGLANG_DISABLE_TRITON_DECODE_SHARED_KV = EnvBool(False)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
