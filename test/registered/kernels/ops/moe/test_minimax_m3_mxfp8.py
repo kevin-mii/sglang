@@ -89,10 +89,7 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
 @pytest.mark.parametrize("k", [2048, 6144])
 @torch.inference_mode()
 def test_mxfp8_quant_row_padding_matches_unpadded(m, k):
-    """pad_rows_to / scale_pad_rows_to emit the row-aligned operands that
-    torch._scaled_mm MX needs (fp8 rows %32, E8M0 scale rows %128) straight
-    from the quant launch: data rows are bit-identical to the unpadded quant
-    and the pad rows are zero."""
+    """A padded quant that alters a data row or leaves a pad row non-zero corrupts the GEMM."""
     torch.manual_seed(0)
     x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16) * 3
     xq, s = mxfp8_e4m3_quantize(x)
