@@ -9,22 +9,26 @@ context is gathered into persistent SHUFFLE 5D scratch pages:
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize``. Each request occupies a contiguous,
+with ``x = 16 // dtype.itemsize`` (8 for bf16, 16 for fp8). Each request occupies a contiguous,
 position-ordered page range rounded up to whole sparse blocks.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
 )
+
+logger = logging.getLogger(__name__)
 
 SPARSE_BLOCK_SIZE = 128
 # Gluon PS kernel supports kv_block_size in {16, 64}; 64 halves the block-table
@@ -36,11 +40,13 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# Hard cap on the gathered context span per forward (K and V buffers each):
-# 512 MiB per buffer at bf16 = 32768 pages = ~2.1M context tokens across the
-# batch; beyond that the entry point raises and the caller falls back to the
-# Triton kernel (which reads the pool in place).
-_MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
+# scratch is grow-only, so the env cap bounds it; over the cap the caller falls back
+_LEGACY_SCRATCH_BYTES = 512 * 1024 * 1024
+
+
+def _max_scratch_pages(dtype: torch.dtype) -> int:
+    cap_bytes = int(envs.SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB.get()) << 20
+    return cap_bytes // (_PAGE_ELEMS * dtype.itemsize)
 
 
 @triton.jit
@@ -276,24 +282,24 @@ def _build_gluon_prefill_meta(
     )
     abs_pos = (prefix_lens[req_id] + (pos - cu_seqlens[req_id])).to(torch.int32)
 
-    # Host-side page layout: each request's context span rounds up to whole
-    # sparse blocks so every emitted page id stays inside its own span.
-    lens = [int(l) for l in seq_lens_cpu.tolist()]
-    pages_per_req = [
-        ((l + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
-        for l in lens
-    ]
-    total_pages = int(sum(pages_per_req))
-    starts = []
-    acc = 0
-    for p in pages_per_req:
-        starts.append(acc)
-        acc += p
-    page_start = torch.tensor(starts, dtype=torch.int32, device=device)
-    repeats = torch.tensor(pages_per_req, dtype=torch.int64, device=device)
+    # spans round up to whole sparse blocks so every page id stays inside its own span
+    lens = seq_lens_cpu.tolist()
+    total_pages = int(
+        sum(
+            ((int(l) + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
+            for l in lens
+        )
+    )
+    # device-side counts: a torch.tensor(list, device=) here is a blocking H2D copy
+    pages_per_req_dev = (
+        (seq_lens.to(torch.int64) + (SPARSE_BLOCK_SIZE - 1)) // SPARSE_BLOCK_SIZE
+    ) * PAGES_PER_BLOCK
+    page_start = (torch.cumsum(pages_per_req_dev, dim=0) - pages_per_req_dev).to(
+        torch.int32
+    )
     page_req = torch.repeat_interleave(
-        torch.arange(len(pages_per_req), dtype=torch.int32, device=device),
-        repeats,
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        pages_per_req_dev,
         output_size=total_pages,
     )
     page_pos = (
@@ -361,6 +367,37 @@ def _unit_or_none(scale) -> bool:
     return scale is None or scale == 1.0
 
 
+def _aiter_fp8_dtype() -> Optional[torch.dtype]:
+    """The fp8 storage dtype AITER's Gluon kernel accepts on this arch, or None without aiter."""
+    try:
+        import aiter
+    except ImportError:
+        return None
+    return aiter.dtypes.fp8
+
+
+def _kv_dtype_supported(
+    q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> bool:
+    if k_cache.dtype != v_cache.dtype:
+        return False
+    if k_cache.dtype == q.dtype:
+        return True
+    # an fp8 pool with a bf16 q: the kernel dequantizes in-register with per-tensor scales
+    return k_cache.dtype == _aiter_fp8_dtype()
+
+
+def _pool_scale_tensor(cache: torch.Tensor, value: Optional[float]) -> torch.Tensor:
+    """fp32 ``[1]`` per-tensor scale of an fp8 pool, memoized on the pool tensor."""
+    scale = 1.0 if value is None else float(value)
+    memo = getattr(cache, "_gluon_scale", None)
+    if memo is not None and memo[0] == scale:
+        return memo[1]
+    scale_tensor = torch.full((1,), scale, dtype=torch.float32, device=cache.device)
+    cache._gluon_scale = (scale, scale_tensor)
+    return scale_tensor
+
+
 def can_use_gluon_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -393,13 +430,15 @@ def can_use_gluon_prefill(
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k_cache.dtype == q.dtype
-        and v_cache.dtype == q.dtype
+        and _kv_dtype_supported(q, k_cache, v_cache)
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
-        and _unit_or_none(k_scale)
-        and _unit_or_none(v_scale)
+        # a same-dtype pool takes no scales, so they must be unit; an fp8 pool forwards its own
+        and (
+            k_cache.dtype != q.dtype
+            or (_unit_or_none(k_scale) and _unit_or_none(v_scale))
+        )
     )
 
 
@@ -417,6 +456,8 @@ def gluon_sparse_prefill(
     seq_lens_cpu: torch.Tensor,
     block_size_k: int,
     sm_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Run per-page Gluon sparse prefill over the NHD KV pool.
 
@@ -449,10 +490,18 @@ def gluon_sparse_prefill(
             cu_seqlens, prefix_lens, seq_lens, seq_lens_cpu, total_q
         )
     )
-    if total_pages > _MAX_SCRATCH_PAGES:
+    max_pages = _max_scratch_pages(k_cache.dtype)
+    if total_pages > max_pages:
         raise ValueError(
             f"gluon prefill context span too large for scratch: {total_pages} pages "
-            f"> cap {_MAX_SCRATCH_PAGES}"
+            f"> cap {max_pages}"
+        )
+    if total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize > _LEGACY_SCRATCH_BYTES:
+        # spans above the former fixed cap used to fall back, so leave a trace of them
+        logger.debug(
+            "gluon prefill span %d pages (%d MiB per buffer) above the former 512 MiB cap",
+            total_pages,
+            (total_pages * _PAGE_ELEMS * k_cache.dtype.itemsize) >> 20,
         )
 
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
@@ -470,6 +519,10 @@ def gluon_sparse_prefill(
     sparse_bt, sparse_ctx = _build_gluon_sparse_bt_prefill(
         topk_idx, req_id, abs_pos, page_start, block_size_k
     )
+
+    kv_is_fp8 = k_cache.dtype != q.dtype
+    key_scale = _pool_scale_tensor(k_cache, k_scale) if kv_is_fp8 else None
+    value_scale = _pool_scale_tensor(v_cache, v_scale) if kv_is_fp8 else None
 
     out = torch.empty_like(q)
     num_seqs = total_q
@@ -494,8 +547,8 @@ def gluon_sparse_prefill(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
