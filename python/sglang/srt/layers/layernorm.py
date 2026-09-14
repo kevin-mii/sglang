@@ -427,8 +427,7 @@ def _forward_with_allreduce_fusion_quant_per_token(
         return None
     fp8_out, residual_out, scale_out, bf16_out = fused_result
     bf16_out._fp8_qinput = (fp8_out, scale_out)
-    # Consumers compare this against the tensor's live _version so an in-place
-    # write between the norm and the linear invalidates the cached quant.
+    # consumers compare with the live _version, so an in-place write invalidates the pair
     bf16_out._fp8_qinput_version = bf16_out._version
     return bf16_out, residual_out
 

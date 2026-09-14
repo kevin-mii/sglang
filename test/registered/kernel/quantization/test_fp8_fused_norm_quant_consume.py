@@ -1,10 +1,4 @@
-"""Per-token FP8 linear consumes the fused add-RMSNorm's pre-quantized activation.
-
-On ROCm gfx95 the Gemma fused add-RMSNorm kernel can emit ``out._fp8_qinput``
-(fp8 tensor, per-token scale). ``apply_fp8_linear`` with a per-channel fp8
-weight and dynamic per-token activations must use that pair instead of
-re-quantizing, and produce the same result as the separate quant path.
-"""
+"""`apply_fp8_linear` must consume the fused norm's fp8 pair and match the re-quant path."""
 
 import unittest
 
@@ -12,7 +6,7 @@ import torch
 
 from sglang.srt.environ import envs
 
-# The aiter per-token FP8 GEMM path is selected at import time.
+# the aiter per-token FP8 GEMM path is selected at import time
 if not envs.SGLANG_USE_AITER.is_set():
     envs.SGLANG_USE_AITER.set(True)
 
@@ -39,7 +33,7 @@ def _fp8_per_channel_weight(n: int, k: int, device: torch.device):
     w = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.02
     scale = (w.float().abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
     wq = (w.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    # Layer storage: shuffled (N, K) stored transposed; apply_fp8_linear passes weight.T
+    # layer storage: shuffled (N, K) kept transposed, apply_fp8_linear passes weight.T
     return shuffle_weight(wq, (16, 16)).t(), scale.float(), w
 
 
@@ -69,7 +63,7 @@ class TestFusedNormQuantConsume(CustomTestCase):
             cutlass_fp8_supported=False,
             use_per_token_if_dynamic=True,
         )
-        plain_in = normed.clone()  # drops the _fp8_qinput attribute
+        plain_in = normed.clone()  # clone drops the _fp8_qinput attribute
         self.assertFalse(hasattr(plain_in, "_fp8_qinput"))
         separate = apply_fp8_linear(
             input=plain_in,
@@ -80,8 +74,7 @@ class TestFusedNormQuantConsume(CustomTestCase):
             use_per_token_if_dynamic=True,
         )
         ref = torch.nn.functional.linear(normed, w_bf16)
-        # Both fp8 paths quantize per token with the same absmax scale; they
-        # should agree closely with each other and be within fp8 error of bf16.
+        # both paths use the same per-token absmax scale, so they agree to fp8 rounding
         rel_fused_vs_sep = (fused - separate).abs().max() / separate.abs().max()
         rel_fused_vs_ref = (fused.float() - ref.float()).abs().mean() / ref.abs().mean()
         self.assertLess(rel_fused_vs_sep.item(), 2e-2)
