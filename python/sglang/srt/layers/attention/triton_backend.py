@@ -1587,8 +1587,8 @@ class TritonAttnBackend(AttentionBackend):
             or forward_batch.seq_lens_cpu is None
         ):
             return False
-        ext = forward_batch.extend_seq_lens_cpu
-        if not ext or max(ext) < self.aiter_long_prefix_min_rows:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if not extend_lens or max(extend_lens) < self.aiter_long_prefix_min_rows:
             return False
         return self._use_long_prefix_extend(forward_batch, kv_indices)
 
