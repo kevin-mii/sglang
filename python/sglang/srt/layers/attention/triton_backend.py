@@ -86,11 +86,7 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-# Decode steps go through the grouped-head verify kernel only for head dims
-# whose block / split configuration was validated on the one-row decode shape
-# (verify_mla._BLOCK_CONFIG / _SPLIT_CONFIG, MiniMax-M3 dense layers and its
-# EAGLE3 draft). Other grouped-head models (e.g. Qwen3.5, head_dim 256) keep
-# the per-head decode kernel until measured.
+# head dims whose verify_mla block/split config was measured on the one-row decode shape
 _DECODE_SHARED_KV_HEAD_DIMS = (128,)
 
 
@@ -101,11 +97,7 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
-    # Grouped-head verify needs every local query head to share one TP-local
-    # KV head. Qwen3.5 at TP>=2, the MiniMax-M3 dense layers (4 KV heads, TP4/8)
-    # and its Llama-arch EAGLE3 draft all have that shape; the per-head
-    # split-KV kernel re-reads the prefix KV once per query head there (16x
-    # the traffic at 16 local heads: 0.56 ms vs ~0.1 ms per layer at 100K).
+    # per-head split-KV re-reads the prefix once per query head, so grouped shapes use this
     if not (
         is_qwen3_5(model_config.hf_config)
         or is_minimax_sparse(model_config.hf_config)
@@ -251,9 +243,7 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # Decode steps of the same shapes (draft decode at topk 1, dense
-        # layers) reuse that kernel with one extend row per request; the page
-        # table already holds the new token, so the prefix is trimmed by one.
+        # decode is a one-row verify whose token is already in the page table
         self.use_decode_shared_kv = (
             self.use_verify_shared_kv
             and not envs.SGLANG_DISABLE_TRITON_DECODE_SHARED_KV.get()
@@ -1561,7 +1551,6 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
-    # Largest per-request extend length routed to the verify kernels.
     SMALL_EXTEND_MAX_TOKENS = 8
 
     def _is_small_constant_extend(
@@ -1760,15 +1749,7 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
-        # The EAGLE v2 draft-extend (DRAFT_EXTEND_V2) has the same shape: a
-        # constant num_draft_tokens-row causal chain per request over a
-        # prefix-only kv_indices, so it takes the same split-KV path. The
-        # serial-prefix extend kernel launches only bs*heads work-groups and
-        # costs O(context) per step at long prefix (2.2 ms at 100K for the
-        # MiniMax-M3 EAGLE3 draft vs ~0.3 ms split-KV).
-        # A small constant-length EXTEND over a cached prefix (a new turn) has
-        # the same shape too; the serial extend kernel costs 6 ms per dense
-        # layer at 195K context there.
+        # draft-extend and small constant extends are verify-shaped, so they skip the serial one
         if (
             verify_fwd is not None
             and score_mod is None
