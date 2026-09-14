@@ -180,6 +180,7 @@ class TritonAttnBackend(AttentionBackend):
             can_use_dense_prefill_fp8,
             dense_prefill_attention_fwd,
             extend_attention_fwd,
+            extend_attention_fwd_long_prefix,
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
@@ -194,6 +195,40 @@ class TritonAttnBackend(AttentionBackend):
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        # Split-prefix extend for EXTEND rows over a long cached prefix
+        # (see extend_attention_fwd_long_prefix); gated per forward in
+        # _use_long_prefix_extend.
+        self.extend_attention_fwd_long_prefix = torch.compiler.disable(
+            extend_attention_fwd_long_prefix
+        )
+        self.long_prefix_extend_enabled = (
+            envs.SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX.get()
+        )
+        self.long_prefix_extend_min_tokens = (
+            envs.SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS.get()
+        )
+        # aiter CK paged batch-prefill for large EXTEND chunks over a long
+        # prefix (see aiter_extend_long_prefix); gated per forward in
+        # _use_aiter_long_prefix_extend.
+        self.aiter_long_prefix_extend_enabled = False
+        if _is_hip and envs.SGLANG_USE_AITER_EXTEND_LONG_PREFIX.get():
+            from sglang.srt.layers.attention.aiter_extend_long_prefix import (
+                aiter_batch_prefill_available,
+                build_paged_kv_indices,
+                extend_attention_fwd_aiter_paged,
+            )
+
+            if aiter_batch_prefill_available():
+                self.aiter_long_prefix_extend_enabled = True
+                self.aiter_long_prefix_min_rows = (
+                    envs.SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS.get()
+                )
+                self.build_paged_kv_indices = torch.compiler.disable(
+                    build_paged_kv_indices
+                )
+                self.extend_attention_fwd_aiter_paged = torch.compiler.disable(
+                    extend_attention_fwd_aiter_paged
+                )
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -1571,6 +1606,44 @@ class TritonAttnBackend(AttentionBackend):
             and kv_indices.numel() > 0
         )
 
+    def _use_long_prefix_extend(
+        self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Route a plain EXTEND / draft-extend over a long cached prefix to the
+        split-prefix kernel. Host-side shape checks only (no device sync): the
+        average prefix per request comes from the kv_indices length."""
+        if not self.long_prefix_extend_enabled or kv_indices is None:
+            return False
+        # EXTEND / MIXED / SPLIT_PREFILL / DRAFT_EXTEND_V2 only; TARGET_VERIFY
+        # keeps its own kernels (it may run inside a captured graph).
+        if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
+            return False
+        bs = forward_batch.batch_size
+        return bs > 0 and kv_indices.numel() >= bs * self.long_prefix_extend_min_tokens
+
+    def _use_aiter_long_prefix_extend(
+        self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Within the long-prefix route: batches whose largest request has at
+        least ``aiter_long_prefix_min_rows`` extend rows go to aiter's CK
+        paged batch-prefill (page size 1, fp8 or bf16 KV). Host-side checks
+        only."""
+        if (
+            not self.aiter_long_prefix_extend_enabled
+            or self.page_size != 1
+            or forward_batch.out_cache_loc is None
+            or forward_batch.extend_seq_lens is None
+            or forward_batch.extend_start_loc is None
+            or forward_batch.seq_lens_cpu is None
+        ):
+            return False
+        ext = forward_batch.extend_seq_lens_cpu
+        if not ext or max(ext) < self.aiter_long_prefix_min_rows:
+            return False
+        return self._use_long_prefix_extend(forward_batch, kv_indices)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1787,6 +1860,71 @@ class TritonAttnBackend(AttentionBackend):
                 max_bs=self.req_to_token_pool.size,
             )
         ):
+            return o
+
+        if (
+            self.forward_metadata.custom_mask is None
+            and sinks is None
+            and score_mod is None
+            and sliding_window_size <= 0
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and self._use_long_prefix_extend(forward_batch, kv_indices)
+        ):
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if (
+                causal
+                and k_buffer.dim() == 3
+                and k_buffer.shape[1] == 1  # one TP-local KV head (validated shape)
+                and k_buffer.dtype
+                in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.bfloat16)
+                and layer.qk_head_dim == layer.v_head_dim
+                and layer.qk_head_dim % 16 == 0
+                and self._use_aiter_long_prefix_extend(forward_batch, kv_indices)
+            ):
+                bs = forward_batch.batch_size
+                paged_indptr, page_indices = self.build_paged_kv_indices(
+                    kv_indptr,
+                    kv_indices,
+                    forward_batch.extend_start_loc,
+                    forward_batch.extend_seq_lens,
+                    forward_batch.out_cache_loc,
+                    bs,
+                )
+                self.extend_attention_fwd_aiter_paged(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_buffer,
+                    v_buffer,
+                    self.forward_metadata.qo_indptr,
+                    paged_indptr,
+                    page_indices,
+                    self.forward_metadata.max_extend_len,
+                    int(forward_batch.seq_lens_cpu.max().item()),
+                    layer.scaling,
+                    k_scale=layer.k_scale_float if layer.k_scale is not None else None,
+                    v_scale=layer.v_scale_float if layer.v_scale is not None else None,
+                )
+                return o
+            self.extend_attention_fwd_long_prefix(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                causal,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                sm_scale=layer.scaling,
+                page_size=self.page_size,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
             return o
 
         self.extend_attention_fwd(

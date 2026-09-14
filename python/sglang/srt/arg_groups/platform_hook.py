@@ -63,11 +63,32 @@ def handle_mps_backends(server_args: Any):
             )
 
 
+def _triton_kv_splits_default() -> int:
+    """Declared default of --triton-attention-num-kv-splits (the CUDA value)."""
+    import msgspec
+
+    from sglang.srt.arg_groups.fields.exec_ import ExecKernel
+
+    return next(
+        f.default
+        for f in msgspec.structs.fields(ExecKernel)
+        if f.name == "triton_attention_num_kv_splits"
+    )
+
+
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
-        declare_resolution(
-            server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
-        )
+        # Raise the Triton flash-decoding split count from the field default
+        # to 16 on AMD, but keep an explicit --triton-attention-num-kv-splits:
+        # long-context decode (e.g. 24 x 195K tokens on one KV head) wants
+        # more splits than either default.
+        kv_splits = getattr(server_args, "triton_attention_num_kv_splits", None)
+        if kv_splits == _triton_kv_splits_default():
+            declare_resolution(
+                server_args,
+                "_handle_amd_specifics",
+                triton_attention_num_kv_splits=16,
+            )
         # Above this the HIP runtime registers a pageable H2D source with the
         # GPU rather than staging it, and the MMU notifier on that registration
         # evicts our KFD queues once per tensor while weights load. In KB.
