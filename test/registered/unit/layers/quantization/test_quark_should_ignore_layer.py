@@ -1,12 +1,4 @@
-"""Unit tests for quark's should_ignore_layer on packed (fused) layers.
-
-Quark checkpoints list excluded layers per unfused projection name. For a
-fused layer (qkv_proj -> [q_proj, k_proj, v_proj]) every shard must agree on
-the scheme, but a shard whose projection name never appears in the exclude
-list is one the checkpoint does not carry at all (MiniMax-M3's
-``index_v_proj`` on value-disabled indexer layers). Such a shard must not
-veto its excluded siblings.
-"""
+"""`should_ignore_layer` must let the shards the checkpoint describes decide a fused layer's scheme."""
 
 import unittest
 from types import MappingProxyType
@@ -46,8 +38,7 @@ class TestQuarkShouldIgnoreLayer(CustomTestCase):
         )
 
     def test_fused_layer_mixed_schemes_raise(self):
-        # k_proj appears in the exclude list for another layer, so the shard
-        # projection is known to the checkpoint: a real scheme mismatch.
+        """A shard the checkpoint does describe still raises on a real mismatch."""
         ignore = [
             "model.layers.0.self_attn.q_proj",
             "model.layers.0.self_attn.v_proj",
@@ -57,9 +48,7 @@ class TestQuarkShouldIgnoreLayer(CustomTestCase):
             should_ignore_layer("model.layers.0.self_attn.qkv_proj", ignore, FUSED)
 
     def test_absent_shard_does_not_veto_excluded_siblings(self):
-        # index_v_proj never appears in the exclude list: the checkpoint has
-        # no such weight (value-disabled indexer layers). The fused layer
-        # follows its excluded siblings instead of raising.
+        """An absent `index_v_proj` used to read as quantized and fail the load."""
         ignore = [
             "model.layers.3.self_attn.indexer.index_q_proj",
             "model.layers.3.self_attn.indexer.index_k_proj",
@@ -71,7 +60,7 @@ class TestQuarkShouldIgnoreLayer(CustomTestCase):
         )
 
     def test_absent_shard_first_still_follows_siblings(self):
-        # Same case with the absent projection listed first in the mapping.
+        """The first fix only worked when the absent shard came after an excluded one."""
         fused = MappingProxyType({"index_qkv_proj": ["index_v_proj", "index_q_proj"]})
         ignore = ["model.layers.3.self_attn.indexer.index_q_proj"]
         self.assertTrue(

@@ -70,11 +70,7 @@ def should_ignore_layer(
 
         # Layer should be ignored if shards are ignored.
         ignore = list(ignore)
-        # A packed shard whose projection name never appears in the producer's
-        # exclude list is one the checkpoint does not carry at all (e.g.
-        # MiniMax-M3 `index_v_proj` on value-disabled indexer layers). Its
-        # "not excluded" verdict says nothing about the fused layer's scheme,
-        # so it must not veto the siblings the checkpoint does describe.
+        # a shard the exclude list never names is not in the checkpoint, so it cannot veto siblings
         described_projs = {target.split(".")[-1] for target in ignore}
         known_shards = [
             shard_name
