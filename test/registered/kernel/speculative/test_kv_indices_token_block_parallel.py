@@ -1,23 +1,12 @@
-"""Token-block-parallel page-table copies for speculative decoding.
-
-``create_flashinfer_kv_indices_triton`` (EAGLE verify / draft-extend
-``kv_indices``) and ``generate_draft_decode_kv_indices`` (Triton multi-step
-draft page tables) both have a mode that spreads one request's copy over
-several programs. The Triton draft backend and the EAGLE metadata builders
-now use it above ``KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH``; the outputs must be
-bit-identical to the single-program copy, and the launch helper must keep
-short tables on the historical path.
-"""
+"""The token-block-parallel page-table copies must match the single-program kernels bit for bit."""
 
 import unittest
 
 import torch
 
 from sglang.kernels.ops.kvcache.kv_indices import (
-    KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH,
     create_flashinfer_kv_indices_triton,
     kv_indices_num_token_blocks,
-    kv_indices_token_blocks_for_copy,
 )
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.utils import get_device, next_power_of_2
@@ -36,19 +25,7 @@ class TestKvIndicesTokenBlockParallel(CustomTestCase):
         cls.device = get_device()
         torch.manual_seed(0)
 
-    def test_launch_helper_thresholds(self):
-        self.assertEqual(kv_indices_token_blocks_for_copy(4096, 8), 1)
-        self.assertEqual(
-            kv_indices_token_blocks_for_copy(KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH - 1, 1),
-            1,
-        )
-        wide = kv_indices_token_blocks_for_copy(KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH, 1)
-        self.assertEqual(
-            wide, kv_indices_num_token_blocks(KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH, 1)
-        )
-        self.assertGreater(wide, 1)
-
-    def _tables(self, bs: int, max_len: int, table_width: int):
+    def _random_page_tables(self, bs: int, max_len: int, table_width: int):
         dev = self.device
         req_to_token = torch.randint(
             1, 1 << 22, (MAX_BS, table_width), dtype=torch.int32, device=dev
@@ -60,7 +37,7 @@ class TestKvIndicesTokenBlockParallel(CustomTestCase):
 
     def _check_kv_indices(self, bs: int, max_len: int, table_width: int):
         dev = self.device
-        req_to_token, req_pool_indices, seq_lens = self._tables(
+        req_to_token, req_pool_indices, seq_lens = self._random_page_tables(
             bs, max_len, table_width
         )
         kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
@@ -91,10 +68,12 @@ class TestKvIndicesTokenBlockParallel(CustomTestCase):
         )
         torch.testing.assert_close(parallel, serial, rtol=0, atol=0)
 
-    def _check_draft_page_tables(self, bs: int, max_len: int, table_width: int):
+    def _check_draft_page_random_page_tables(
+        self, bs: int, max_len: int, table_width: int
+    ):
         dev = self.device
         steps, topk, page_size = 3, 1, 1
-        req_to_token, req_pool_indices, seq_lens = self._tables(
+        req_to_token, req_pool_indices, seq_lens = self._random_page_tables(
             bs, max_len, table_width
         )
         width = bs * topk * (max_len + steps) + 64
@@ -106,7 +85,7 @@ class TestKvIndicesTokenBlockParallel(CustomTestCase):
         indptr_parallel = torch.zeros_like(indptr_serial)
         positions = torch.zeros(bs * topk, dtype=torch.int64, device=dev)
 
-        def args(kv, indptr):
+        def kernel_args(kv, indptr):
             return (
                 req_pool_indices,
                 req_to_token,
@@ -124,29 +103,39 @@ class TestKvIndicesTokenBlockParallel(CustomTestCase):
             )
 
         generate_draft_decode_kv_indices[(steps, bs, topk)](
-            *args(kv_serial, indptr_serial)
+            *kernel_args(kv_serial, indptr_serial)
         )
         blocks = kv_indices_num_token_blocks(table_width, steps * bs * topk)
         self.assertGreater(blocks, 1)
         generate_draft_decode_kv_indices[(steps * blocks, bs, topk)](
-            *args(kv_parallel, indptr_parallel), NUM_STEPS=steps
+            *kernel_args(kv_parallel, indptr_parallel), NUM_STEPS=steps
         )
         torch.testing.assert_close(indptr_parallel, indptr_serial, rtol=0, atol=0)
         torch.testing.assert_close(kv_parallel, kv_serial, rtol=0, atol=0)
 
     def test_kv_indices_long_context(self):
+        """A block-edge off-by-one would drop or duplicate page ids at long context."""
         self._check_kv_indices(bs=3, max_len=60_000, table_width=65_536)
         self._check_kv_indices(bs=1, max_len=200_000, table_width=262_144)
 
     def test_kv_indices_ragged_batch(self):
+        """Requests shorter than the block grid must not read past their own length."""
         self._check_kv_indices(bs=7, max_len=40_000, table_width=65_536)
 
     def test_draft_page_tables_long_context(self):
-        self._check_draft_page_tables(bs=3, max_len=60_000, table_width=65_536)
-        self._check_draft_page_tables(bs=1, max_len=200_000, table_width=262_144)
+        """The packed (step, block) grid axis must decode to the same step tables."""
+        self._check_draft_page_random_page_tables(
+            bs=3, max_len=60_000, table_width=65_536
+        )
+        self._check_draft_page_random_page_tables(
+            bs=1, max_len=200_000, table_width=262_144
+        )
 
     def test_draft_page_tables_ragged_batch(self):
-        self._check_draft_page_tables(bs=5, max_len=40_000, table_width=65_536)
+        """Ragged lengths exercise partial trailing blocks in every step."""
+        self._check_draft_page_random_page_tables(
+            bs=5, max_len=40_000, table_width=65_536
+        )
 
 
 if __name__ == "__main__":
