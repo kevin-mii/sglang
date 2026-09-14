@@ -1206,7 +1206,14 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    positions,
+                    q,
+                    k,
+                    v,
+                    idx_q,
+                    idx_k,
+                    idx_v,
+                    forward_batch,
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
@@ -1365,6 +1372,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            enable_fused_ar_quant_per_token=_is_hip,
         )
 
     def forward(
@@ -1402,9 +1411,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
-            # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
+        if not _is_hip and self.is_layer_sparse and get_parallel().tp_size > 1:
+            # Sparse-layer all-reduce deferral is ROCm-only; force the
+            # immediate all-reduce elsewhere.
             should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
