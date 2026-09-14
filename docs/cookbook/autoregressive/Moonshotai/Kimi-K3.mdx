@@ -178,7 +178,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
+| MI350X/MI355X 1×8 | TP8/DCP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, aiter attention with DCP8 (a2a) sharding the MLA KV across the 8 ranks, graph bs up to 256, fp8 kvcache, bf16 KDA state; 8k prefill chunks with `--prefill-decode-interval 16` so resident sessions keep decoding while a long turn prefills; DSPARK supported (block 3 under DCP). Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
 | Atlas 800I A3 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
 
 **DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:

@@ -1150,6 +1150,11 @@ export const config = {
     },
     {
       // MI350X and MI355X use the same single-node TP8 ROCm/AITER profile.
+      // Balanced shards the MLA KV across the 8 ranks (DCP8, a2a) on the aiter
+      // backend, keeps 8k prefill chunks and lets 16 decode steps run between
+      // chunks so resident sessions keep streaming while a 100k+ turn prefills;
+      // the KDA state pool is bf16 so the radix cache keeps more sessions
+      // resident (the pool, not the MLA KV, is what evicts long sessions).
       match: { hw: "mi350x", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
@@ -1164,10 +1169,15 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--prefill-decode-interval 16",
+        "--mamba-ssm-dtype bfloat16",
         "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1191,10 +1201,15 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
+        "--prefill-decode-interval 16",
+        "--mamba-ssm-dtype bfloat16",
         "--cuda-graph-max-bs-decode 256",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
