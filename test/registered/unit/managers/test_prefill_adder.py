@@ -848,10 +848,7 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def test_chunk_fairness_shares_budget_with_waiting_extends(self):
-        # A continuing chunked request (20K tokens left, chunk 8192) with two
-        # requests waiting: it takes half the chunk, a short extend rides along
-        # in the same iteration, and a request that would itself need chunking
-        # is skipped (only one chunked request is tracked at a time).
+        """A waiter that fits must ride along; one that needs chunking must wait."""
         self.mock_token_allocator.available_size.return_value = 1_000_000
         from sglang.srt.environ import envs
 
@@ -885,7 +882,7 @@ class TestPrefillAdder(CustomTestCase):
             self.assertEqual(small.extend_range.length, 1500)
             self.assertEqual(adder.rem_chunk_tokens, 4096 - 1500)
 
-            # Unused reserve goes back to the chunked request.
+            # the unused reserve goes back to the chunked request
             self.assertIs(adder.regrow_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range, Range(8192, 8192 + 4096 + 2596))
             self.assertEqual(adder.rem_chunk_tokens, 0)
@@ -902,18 +899,18 @@ class TestPrefillAdder(CustomTestCase):
                 rem_chunk_tokens=8192,
                 waiting_queue_len=1,
             )
-            # 6000 left: capped to 4096, nothing admitted, regrow finishes it.
+            # nothing admitted, so the regrow finishes the request
             chunked = self._fairness_req("chunked", prefix_len=8192, total_len=14192)
             self.assertIs(adder.add_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range.length, 4096)
             self.assertIsNone(adder.regrow_chunked_req(chunked))
             self.assertEqual(chunked.extend_range.length, 6000)
             self.assertEqual(adder.rem_chunk_tokens, 8192 - 6000)
-            # Second call is a no-op (the request is no longer marked capped).
+            # a second regrow must not grow again
             self.assertIs(adder.regrow_chunked_req(chunked), chunked)
             self.assertEqual(chunked.extend_range.length, 6000)
 
-            # An uncapped chunked request (nothing waiting) is untouched.
+            # an uncapped chunked request is untouched
             adder = self.create_adder(
                 self.create_running_batch(),
                 rem_input_tokens=16384,
