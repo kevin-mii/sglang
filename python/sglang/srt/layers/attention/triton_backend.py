@@ -1558,17 +1558,17 @@ class TritonAttnBackend(AttentionBackend):
     ) -> bool:
         """Is this EXTEND verify-shaped: equal per-request extend lengths of at most
         `SMALL_EXTEND_MAX_TOKENS` tokens, each over a non-empty cached prefix?"""
-        ext = forward_batch.extend_seq_lens_cpu
-        prefix = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
         return (
             forward_batch.forward_mode == ForwardMode.EXTEND
-            and ext is not None
-            and len(ext) > 0
-            and ext[0] <= self.SMALL_EXTEND_MAX_TOKENS
-            and all(e == ext[0] for e in ext)
-            and prefix is not None
-            and len(prefix) == len(ext)
-            and all(p > 0 for p in prefix)
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and extend_lens[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(n == extend_lens[0] for n in extend_lens)
+            and prefix_lens is not None
+            and len(prefix_lens) == len(extend_lens)
+            and all(n > 0 for n in prefix_lens)
             and kv_indices is not None
             and kv_indices.numel() > 0
         )
