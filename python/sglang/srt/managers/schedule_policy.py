@@ -1552,6 +1552,9 @@ class PrefillAdder:
                     compute_charge=raw_input_tokens if self.exact_chunk_fill else None,
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
+            elif has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
+                # only whole extends take the reserve: one chunked request is tracked at a time
+                return AddReqResult.CONTINUE
             elif self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
@@ -1590,9 +1593,6 @@ class PrefillAdder:
                     compute_charge=trunc_len,
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
-            elif has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
-                # only whole extends take the reserve: one chunked request is tracked at a time
-                return AddReqResult.CONTINUE
             else:
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
