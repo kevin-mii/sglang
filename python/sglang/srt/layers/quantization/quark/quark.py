@@ -415,7 +415,9 @@ class QuarkConfig(QuantizationConfig):
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
                 if self._serves_excluded_as_online_fp8(prefix):
-                    return Fp8LinearMethod(quant_config=self._excluded_online_fp8_config)
+                    return Fp8LinearMethod(
+                        quant_config=self._excluded_online_fp8_config
+                    )
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
