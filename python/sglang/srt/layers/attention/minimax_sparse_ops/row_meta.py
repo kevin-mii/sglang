@@ -38,21 +38,25 @@ def flattened_extend_row_meta(
     Row ``j`` of a request attends ``KV[0 : prefix + j + 1]``; ``packed`` is the
     per-request row count when it is constant across the batch, else 1.
     """
-    ext = [int(x) for x in extend_lens]
-    prefix = [int(x) for x in prefix_lens]
-    dev = req_pool_indices.device
+    extend_lens = [int(n) for n in extend_lens]
+    prefix_lens = [int(n) for n in prefix_lens]
+    device = req_pool_indices.device
     per_query_req = req_pool_indices.repeat_interleave(
-        torch.tensor(ext, dtype=torch.int64, device=dev)
+        torch.tensor(extend_lens, dtype=torch.int64, device=device)
     )
     per_query_seq_lens = torch.tensor(
-        [p + j + 1 for p, e in zip(prefix, ext) for j in range(e)],
+        [
+            prefix + j + 1
+            for prefix, extend in zip(prefix_lens, extend_lens)
+            for j in range(extend)
+        ],
         dtype=seq_lens_dtype,
-        device=dev,
+        device=device,
     )
     return SimpleNamespace(
         per_query_req=per_query_req,
         per_query_seq_lens=per_query_seq_lens,
-        max_seqlen=max(p + e for p, e in zip(prefix, ext)),
-        packed=ext[0] if all(e == ext[0] for e in ext) else 1,
-        rows=sum(ext),
+        max_seqlen=max(p + e for p, e in zip(prefix_lens, extend_lens)),
+        packed=extend_lens[0] if all(e == extend_lens[0] for e in extend_lens) else 1,
+        rows=sum(extend_lens),
     )

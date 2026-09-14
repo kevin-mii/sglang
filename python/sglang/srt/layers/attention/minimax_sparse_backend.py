@@ -165,8 +165,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
-        self._verify_meta_eager: Optional[tuple[int, SimpleNamespace]] = None
-        self._small_extend_meta_cache: Optional[tuple[int, SimpleNamespace]] = None
+        self._eager_verify_row_meta: Optional[tuple[int, SimpleNamespace]] = None
+        self._small_extend_row_meta: Optional[tuple[int, SimpleNamespace]] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -1399,16 +1399,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         """Persistent index top-k buffer shared by every forward with ``rows`` query rows."""
         if rows <= 0:
             return None
-        buf = self._decode_topk_buf.get(rows)
-        if buf is None:
+        topk_buf = self._decode_topk_buf.get(rows)
+        if topk_buf is None:
             num_kv_heads = self.kv_pool.main_pool.head_num
-            buf = torch.empty(
+            topk_buf = torch.empty(
                 (num_kv_heads, rows, self.topk_blocks * self._idx_group_size),
                 dtype=torch.int32,
                 device=device,
             )
-            self._decode_topk_buf[rows] = buf
-        return buf
+            self._decode_topk_buf[rows] = topk_buf
+        return topk_buf
 
     def _topk_reuse_for_rows(
         self,
@@ -1426,16 +1426,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         """
         if not (self.index_cache_enabled and disable_value):
             return None, None
-        buf = (
+        topk_buf = (
             self._row_topk_buf(rows, device)
             if allocate
             else self._decode_topk_buf.get(rows)
         )
-        if buf is None:
+        if topk_buf is None:
             return None, None
         if self._topk_is_source.get(layer.layer_id, True):
-            return None, buf
-        return buf, None
+            return None, topk_buf
+        return topk_buf, None
 
     def _sparse_decode_rows(
         self,
@@ -1506,31 +1506,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         Eager forwards only: the row metadata comes from host lists, so a captured
         copy would replay capture-time lengths.
         """
-        ext = forward_batch.extend_seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
         return (
             not self.is_npu
             and not is_in_breakable_cuda_graph()
             and forward_batch.forward_mode == ForwardMode.EXTEND
-            and ext is not None
-            and len(ext) > 0
-            and max(ext) <= self.SMALL_EXTEND_MAX_TOKENS
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and max(extend_lens) <= self.SMALL_EXTEND_MAX_TOKENS
             and forward_batch.extend_prefix_lens_cpu is not None
             and forward_batch.req_pool_indices is not None
         )
 
-    def _small_extend_meta(self, forward_batch: ForwardBatch) -> SimpleNamespace:
+    def _small_extend_row_meta_for(
+        self, forward_batch: ForwardBatch
+    ) -> SimpleNamespace:
         """Per-row metadata for a small extend, built once per forward batch."""
-        cached = self._small_extend_meta_cache
+        cached = self._small_extend_row_meta
         if cached is not None and cached[0] == id(forward_batch):
             return cached[1]
-        meta = flattened_extend_row_meta(
+        row_meta = flattened_extend_row_meta(
             forward_batch.req_pool_indices,
             forward_batch.extend_prefix_lens_cpu,
             forward_batch.extend_seq_lens_cpu,
             forward_batch.seq_lens.dtype,
         )
-        self._small_extend_meta_cache = (id(forward_batch), meta)
-        return meta
+        self._small_extend_row_meta = (id(forward_batch), row_meta)
+        return row_meta
 
     def _forward_gpu_triton_small_extend(
         self,
@@ -1549,7 +1551,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         Row ``j`` of a request attends ``KV[0:prefix+j+1]``; its new K/V were
         stored by the caller.
         """
-        meta = self._small_extend_meta(forward_batch)
+        row_meta = self._small_extend_row_meta_for(forward_batch)
         return self._sparse_decode_rows(
             q,
             k_cache,
@@ -1557,12 +1559,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q,
             idx_k_cache,
             idx_v_cache,
-            meta.per_query_req,
-            meta.per_query_seq_lens,
-            meta.max_seqlen,
+            row_meta.per_query_req,
+            row_meta.per_query_seq_lens,
+            row_meta.max_seqlen,
             layer,
             disable_value,
-            meta.packed,
+            row_meta.packed,
             allocate_topk_buf=True,
         )
 
@@ -1587,24 +1589,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         bs = forward_batch.seq_lens.shape[0]
         num_tokens = q.shape[0]
         ndt = num_tokens // max(bs, 1)
-        vmeta = self._verify_meta_cg.get((bs, ndt))
-        if vmeta is None:
+        row_meta = self._verify_meta_cg.get((bs, ndt))
+        if row_meta is None:
             # eager verify: the row metadata is layer-invariant, so build it once per forward
-            cached = self._verify_meta_eager
+            cached = self._eager_verify_row_meta
             if cached is not None and cached[0] == id(forward_batch):
-                vmeta = cached[1]
+                row_meta = cached[1]
             else:
                 # seq_lens is the prefix length on GPU verify batches
                 per_query_req, per_query_seq_lens = chain_verify_row_meta(
                     forward_batch.seq_lens, forward_batch.req_pool_indices, ndt
                 )
-                vmeta = SimpleNamespace(
+                row_meta = SimpleNamespace(
                     per_query_seq_lens=per_query_seq_lens.to(
                         forward_batch.seq_lens.dtype
                     ),
                     per_query_req=per_query_req,
                 )
-                self._verify_meta_eager = (id(forward_batch), vmeta)
+                self._eager_verify_row_meta = (id(forward_batch), row_meta)
         # _max_seqlen_k bounds the prefix, so add the draft tail
         return self._sparse_decode_rows(
             q,
@@ -1613,8 +1615,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q,
             idx_k_cache,
             idx_v_cache,
-            vmeta.per_query_req.to(forward_batch.req_pool_indices.dtype),
-            vmeta.per_query_seq_lens.to(forward_batch.seq_lens.dtype),
+            row_meta.per_query_req.to(forward_batch.req_pool_indices.dtype),
+            row_meta.per_query_seq_lens.to(forward_batch.seq_lens.dtype),
             int(self._max_seqlen_k) + int(ndt),
             layer,
             disable_value,
