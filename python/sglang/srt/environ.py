@@ -1095,6 +1095,12 @@ class Envs:
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
     # kill switch: grouped-head decode otherwise runs on the shared-KV verify kernel
     SGLANG_DISABLE_TRITON_DECODE_SHARED_KV = EnvBool(False)
+    # opt-in: sweep a long cached prefix in parallel slices instead of one serial pass per tile
+    SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX = EnvBool(False)
+    SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS = EnvInt(8192)
+    # ROCm: extends of at least MIN_ROWS rows in that route take aiter's CK paged batch-prefill
+    SGLANG_USE_AITER_EXTEND_LONG_PREFIX = EnvBool(False)
+    SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS = EnvInt(2048)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
