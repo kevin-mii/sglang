@@ -44,7 +44,7 @@ def _assert_close(fused, ref, cache_dtype, scaled, name):
 @pytest.mark.parametrize("has_v", [False, True])
 @pytest.mark.parametrize("scales", [UNIT_SCALES, SCALES])
 @pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
-def test_store_kv_index_quant(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype):
+def test_matches_unfused_stores(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype):
     torch.manual_seed(T * 31 + H * 7 + Di)
     # views of one wide row buffer, like the qkv/index projection splits in the model
     row = torch.randn(T, 3 * H * D + 2 * Di, dtype=torch.bfloat16, device=dev) * 20
@@ -58,8 +58,8 @@ def test_store_kv_index_quant(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype
     v_cache = torch.zeros_like(k_cache)
     idx_k_cache = torch.zeros(SLOTS, 1, Di, dtype=cache_dtype, device=dev)
     idx_v_cache = torch.zeros_like(idx_k_cache) if has_v else None
-    refs = [c.clone() for c in (k_cache, v_cache, idx_k_cache)]
-    ref_idx_v = idx_v_cache.clone() if has_v else None
+    unfused = [c.clone() for c in (k_cache, v_cache, idx_k_cache)]
+    unfused_idx_v = idx_v_cache.clone() if has_v else None
 
     assert can_store_kv_index_quant(
         k, v, k_cache, v_cache, idx_k, idx_k_cache, idx_v, idx_v_cache
@@ -67,19 +67,19 @@ def test_store_kv_index_quant(cache_dtype, T, H, D, Di, has_v, scales, idx_dtype
     store_kv_index_quant(
         k, v, k_cache, v_cache, idx_k, idx_k_cache, idx_v, idx_v_cache, loc, *scales
     )
-    _reference_store(k, refs[0], loc, scales[0])
-    _reference_store(v, refs[1], loc, scales[1])
-    _reference_store(idx_k, refs[2], loc, scales[2])
+    _reference_store(k, unfused[0], loc, scales[0])
+    _reference_store(v, unfused[1], loc, scales[1])
+    _reference_store(idx_k, unfused[2], loc, scales[2])
     if has_v:
-        _reference_store(idx_v, ref_idx_v, loc, scales[3])
+        _reference_store(idx_v, unfused_idx_v, loc, scales[3])
     torch.cuda.synchronize()
 
     scaled = scales[0] is not None
-    _assert_close(k_cache, refs[0], cache_dtype, scaled, "k")
-    _assert_close(v_cache, refs[1], cache_dtype, scaled, "v")
-    _assert_close(idx_k_cache, refs[2], cache_dtype, scaled, "idx_k")
+    _assert_close(k_cache, unfused[0], cache_dtype, scaled, "k")
+    _assert_close(v_cache, unfused[1], cache_dtype, scaled, "v")
+    _assert_close(idx_k_cache, unfused[2], cache_dtype, scaled, "idx_k")
     if has_v:
-        _assert_close(idx_v_cache, ref_idx_v, cache_dtype, scaled, "idx_v")
+        _assert_close(idx_v_cache, unfused_idx_v, cache_dtype, scaled, "idx_v")
     # unaddressed rows stay untouched
     mask = torch.ones(SLOTS, dtype=torch.bool, device=dev)
     mask[loc.long()] = False

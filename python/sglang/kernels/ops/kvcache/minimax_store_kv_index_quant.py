@@ -93,7 +93,7 @@ def can_store_kv_index_quant(
 ) -> bool:
     """Whether every (input, cache) pair has a layout the kernel can address."""
 
-    def _row_ok(x: torch.Tensor, cache: torch.Tensor) -> bool:
+    def _pair_storable(x: torch.Tensor, cache: torch.Tensor) -> bool:
         return (
             x.dtype in (torch.bfloat16, torch.float16)
             and cache.dtype in _SUPPORTED_CACHE_DTYPES
@@ -105,13 +105,13 @@ def can_store_kv_index_quant(
             and cache.stride(2) == 1
         )
 
-    if not (_row_ok(k, k_cache) and _row_ok(v, v_cache)):
+    if not (_pair_storable(k, k_cache) and _pair_storable(v, v_cache)):
         return False
-    if not _row_ok(idx_k, idx_k_cache):
+    if not _pair_storable(idx_k, idx_k_cache):
         return False
     if (idx_v is None) != (idx_v_cache is None):
         return False
-    if idx_v is not None and not _row_ok(idx_v, idx_v_cache):
+    if idx_v is not None and not _pair_storable(idx_v, idx_v_cache):
         return False
     return True
 
@@ -143,19 +143,19 @@ def store_kv_index_quant(
     Di = idx_k.shape[2]
     if T == 0:
         return
-    has_iv = idx_v is not None
-    if not has_iv:
+    has_idx_v = idx_v is not None
+    if not has_idx_v:
         idx_v, idx_v_cache = idx_k, idx_k_cache
 
-    def _effective(scale: Optional[float], x: torch.Tensor, cache: torch.Tensor):
+    def _scale_if_cast(scale: Optional[float], x: torch.Tensor, cache: torch.Tensor):
         if scale is None or x.dtype == cache.dtype:
             return 1.0
         return float(scale)
 
-    k_scale = _effective(k_scale, k, k_cache)
-    v_scale = _effective(v_scale, v, v_cache)
-    idx_k_scale = _effective(idx_k_scale, idx_k, idx_k_cache)
-    idx_v_scale = _effective(idx_v_scale, idx_v, idx_v_cache)
+    k_scale = _scale_if_cast(k_scale, k, k_cache)
+    v_scale = _scale_if_cast(v_scale, v, v_cache)
+    idx_k_scale = _scale_if_cast(idx_k_scale, idx_k, idx_k_cache)
+    idx_v_scale = _scale_if_cast(idx_v_scale, idx_v, idx_v_cache)
     _store_kv_index_quant_kernel[(T,)](
         k,
         v,
@@ -186,7 +186,7 @@ def store_kv_index_quant(
         HEAD_DIM=D,
         V_HEAD_DIM=Dv,
         IDX_DIM=Di,
-        HAS_IDX_V=has_iv,
+        HAS_IDX_V=has_idx_v,
         # one program per token with a static head loop: sized for the few KV heads per rank
         num_warps=1,
     )
