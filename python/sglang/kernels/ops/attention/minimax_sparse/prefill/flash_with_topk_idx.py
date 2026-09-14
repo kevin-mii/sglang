@@ -20,6 +20,8 @@ from ..common.utils import (
 
 _is_hip = is_hip()
 _MAX_PER_PAGE_SLOT_UNROLL = 8
+# Program budget for the score-only indexer's KV-block split (grid axis 2).
+_SCORE_ONLY_TARGET_PROGRAMS = 2048
 
 
 @triton.heuristics(
@@ -482,6 +484,7 @@ def _index_block_score_only_kernel(
     stride_s_q,
     stride_s_k,
     stride_r2t_b,
+    max_seqblock_k,  # KV blocks of the longest sequence; split over grid axis 2
     BLOCK_SIZE_Q: tl.constexpr,
     block_size: tl.constexpr,  # sparse K block size (== 128)
     page_size: tl.constexpr,  # paged-cache page size; block_size % page_size == 0
@@ -506,9 +509,14 @@ def _index_block_score_only_kernel(
     small; otherwise the plain per-token gather runs and only the score-only
     register saving applies. Either way: one BLOCK_SIZE_Q x block_size QK tile per
     KV block, reduced with tl.max over the block. Only score_type == "max".
+
+    Grid axis 2 splits the KV blocks: every (query row, KV block) score is
+    written by exactly one program, so a few query rows over a long cached
+    prefix (a new agent turn) no longer serialize the whole context in a
+    handful of programs. Axis 2 has one program for the full-prefill grids.
     """
     sm_scale_log2e = sm_scale * 1.4426950409
-    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
+    pid_q, pid_bh, pid_s = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     pid_b = pid_bh // num_heads
     pid_h = pid_bh % num_heads
     pid_kh = pid_h // gqa_group_size
@@ -517,6 +525,13 @@ def _index_block_score_only_kernel(
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
     if BLOCK_SIZE_Q * pid_q >= q_len:
+        return
+    # This program's KV-block range (causal upper bound, then the split's slice).
+    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
+    blocks_per_split = tl.cdiv(max_seqblock_k, tl.num_programs(2))
+    lo = pid_s * blocks_per_split * block_size
+    hi = min(hi, lo + blocks_per_split * block_size)
+    if lo >= hi:
         return
     sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
 
@@ -540,8 +555,7 @@ def _index_block_score_only_kernel(
     page_of = off_k // page_size  # [block_size] which physical page (0..pages-1)
     in_page = off_k % page_size  # [block_size] offset inside that page
 
-    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, block_size):
+    for i in tl.range(lo, hi, block_size):
         blk = i // block_size
         pos = i + off_k
         pos_mask = pos < seq_len
@@ -699,8 +713,19 @@ def flash_prefill_with_topk_index(
         and k_scale == 1.0
         and block_size_k % page_size == 0
     ):
-        # Source layers do not use idx_o, so run the score-only kernel.
-        _index_block_score_only_kernel[grid](
+        # Source layers do not use idx_o, so run the score-only kernel. Few
+        # query rows over a long context (a new turn on a cached prefix) leave
+        # the (q-block, head) grid nearly empty, so split the KV blocks over
+        # grid axis 2 up to a fixed program budget; full chunks keep one split.
+        def grid_score_only(META):
+            q_blocks = triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"])
+            base = q_blocks * batch_size * num_heads
+            key_splits = max(
+                1, min(max_seqblock_k, _SCORE_ONLY_TARGET_PROGRAMS // max(1, base))
+            )
+            return (q_blocks, batch_size * num_heads, key_splits)
+
+        _index_block_score_only_kernel[grid_score_only](
             q,
             k_cache,
             score,
@@ -724,6 +749,7 @@ def flash_prefill_with_topk_index(
             score.stride(1),
             score.stride(2),
             req_to_token.stride(0),
+            max_seqblock_k,
             block_size=block_size_k,
             page_size=page_size,
             PER_PAGE_SLOTS=(block_size_k // page_size <= _MAX_PER_PAGE_SLOT_UNROLL),
