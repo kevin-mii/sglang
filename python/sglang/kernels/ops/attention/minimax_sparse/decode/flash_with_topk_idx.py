@@ -841,6 +841,7 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    packed_queries: int = 1,
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -862,6 +863,25 @@ def flash_decode_with_topk_idx(
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
+    # packed rows of one request share its K cache, so score them as extra q heads in one pass
+    pack = int(packed_queries) if packed_queries else 1
+    if pack > 1 and local_blocks <= 0:
+        # exactness needs the per-row local re-forcing below, so no local blocks means no packing
+        pack = 1
+    if pack > 1:
+        assert disable_index_value and not use_dense_main_attn
+        assert batch_size % pack == 0
+        row_seq_lens, row_slot_ids, num_rows, heads_per_row = (
+            seq_lens,
+            slot_ids,
+            batch_size,
+            num_q_heads,
+        )
+        batch_size = batch_size // pack
+        q = q.reshape(batch_size, pack * num_q_heads, head_dim)
+        num_q_heads = pack * num_q_heads
+        seq_lens = row_seq_lens.view(batch_size, pack)[:, -1].contiguous()
+        slot_ids = row_slot_ids.view(batch_size, pack)[:, 0].contiguous()
     gqa_group_size = num_q_heads // num_kv_heads
     # sm scale
     if sm_scale is None:
@@ -1008,6 +1028,22 @@ def flash_decode_with_topk_idx(
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
+    if pack > 1:
+        # [pack*H, bs, blocks] -> [H, bs*pack, blocks], request-major rows
+        score = (
+            score.view(pack, heads_per_row, batch_size, score.shape[2])
+            .permute(1, 2, 0, 3)
+            .reshape(heads_per_row, batch_size * pack, score.shape[2])
+        )
+        batch_size, num_q_heads = num_rows, heads_per_row
+        seq_lens, slot_ids = row_seq_lens, row_slot_ids
+        # the kernel forced only the longest row's local blocks, so re-force each row's own
+        num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
+        block_ids = torch.arange(score.shape[2], device=score.device)
+        is_local = (
+            block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
+        ) & (block_ids[None, :] < num_blocks[:, None])
+        score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (

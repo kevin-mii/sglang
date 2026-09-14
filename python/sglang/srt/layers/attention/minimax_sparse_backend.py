@@ -19,9 +19,16 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops.row_meta import (
+    chain_verify_row_meta,
+    flattened_extend_row_meta,
+)
 from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -158,6 +165,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        self._eager_verify_row_meta: Optional[tuple[int, SimpleNamespace]] = None
+        self._small_extend_row_meta: Optional[tuple[int, SimpleNamespace]] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -259,6 +268,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
+        if (
+            spec.speculative_algorithm is not None
+            and not self.is_npu
+            and (spec.speculative_eagle_topk or 1) > 1
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 sparse attention target-verify on CUDA/ROCm supports "
+                "chain drafts only (--speculative-eagle-topk 1)."
+            )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -379,14 +397,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
         if self.index_cache_enabled and forward_batch.forward_mode.is_decode_or_idle():
-            bs = forward_batch.seq_lens.shape[0]
-            if bs > 0 and bs not in self._decode_topk_buf:
-                _nkv = self.kv_pool.main_pool.head_num
-                self._decode_topk_buf[bs] = torch.empty(
-                    (_nkv, bs, self.topk_blocks * self._idx_group_size),
-                    dtype=torch.int32,
-                    device=forward_batch.seq_lens.device,
-                )
+            self._row_topk_buf(
+                forward_batch.seq_lens.shape[0], forward_batch.seq_lens.device
+            )
+        # chain verify rows reuse the index top-k too, so their buffer is allocated here
+        if (
+            self.index_cache_enabled
+            and forward_batch.forward_mode.is_target_verify()
+            and self.speculative_num_draft_tokens
+        ):
+            self._row_topk_buf(
+                forward_batch.seq_lens.shape[0]
+                * int(self.speculative_num_draft_tokens),
+                forward_batch.seq_lens.device,
+            )
         # Per-forward cache of the layer-invariant prefill seqblock trio.
         self._prefill_seqblock_meta = None
         if self.is_npu:
@@ -401,7 +425,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -496,37 +520,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_dec_meta = (kv_indices_buf, plan)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if not self.is_npu:
-            return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
         fm = forward_batch.forward_mode
         if fm.is_target_verify():
             ndt = self.speculative_num_draft_tokens
             if ndt:
-                prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
-                offsets = torch.arange(
-                    1,
-                    int(ndt) + 1,
-                    device=forward_batch.seq_lens.device,
-                    dtype=torch.long,
+                # GPU verify batches keep seq_lens at the prefix; NPU carries prefix + draft
+                if self.is_npu:
+                    prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(
+                        min=0
+                    )
+                else:
+                    prefix = forward_batch.seq_lens
+                per_query_req, per_query_seq_lens = chain_verify_row_meta(
+                    prefix, forward_batch.req_pool_indices, int(ndt)
                 )
-                per_query_seq_lens = (
-                    (prefix.unsqueeze(1) + offsets.unsqueeze(0))
-                    .reshape(-1)
-                    .to(torch.int32)
-                )
-                per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
-                    int(ndt)
-                )
-                # Captured block_table for the native verify op (re-runs at replay).
-                _mb = self.req_to_token.shape[1] // self.page_size
-                _bt_cols = (
-                    torch.arange(_mb, device=per_query_req.device, dtype=torch.long)
-                    * self.page_size
-                ).clamp(max=self.req_to_token.shape[1] - 1)
-                _native_bt = (
-                    self.req_to_token[per_query_req][:, _bt_cols] // self.page_size
-                ).to(torch.int32)
+                _native_bt = None
+                if self.is_npu:
+                    # Captured block_table for the native verify op (re-runs at replay).
+                    _mb = self.req_to_token.shape[1] // self.page_size
+                    _bt_cols = (
+                        torch.arange(_mb, device=per_query_req.device, dtype=torch.long)
+                        * self.page_size
+                    ).clamp(max=self.req_to_token.shape[1] - 1)
+                    _native_bt = (
+                        self.req_to_token[per_query_req][:, _bt_cols] // self.page_size
+                    ).to(torch.int32)
                 self._verify_meta_cg[(forward_batch.seq_lens.shape[0], int(ndt))] = (
                     SimpleNamespace(
                         per_query_seq_lens=per_query_seq_lens,
@@ -534,7 +553,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         native_bt=_native_bt,
                     )
                 )
-        elif fm.is_decode_or_idle():
+        elif self.is_npu and fm.is_decode_or_idle():
             self._decode_seq_lens_i32_cg[forward_batch.seq_lens.shape[0]] = (
                 forward_batch.seq_lens.to(torch.int32)
             )
@@ -1323,7 +1342,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
         # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
-        if self.is_npu and forward_batch.extend_seq_lens is None:
+        if forward_batch.extend_seq_lens is None and (
+            self.is_npu or forward_batch.forward_mode.is_target_verify()
+        ):
             _bs = forward_batch.seq_lens.shape[0]
             _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
@@ -1335,8 +1356,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
             if forward_batch.extend_prefix_lens is None:
                 forward_batch.extend_prefix_lens = (
-                    forward_batch.seq_lens.to(torch.int32) - int(_ndt)
-                ).clamp(min=0)
+                    (forward_batch.seq_lens.to(torch.int32) - int(_ndt)).clamp(min=0)
+                    if self.is_npu
+                    else forward_batch.seq_lens.to(torch.int32)
+                )
 
         # NPU cache hit (same forward_batch).
         if (
@@ -1368,6 +1391,238 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self._extend_meta_key = id(forward_batch)
         return cu_seqlens, seq_lens, prefix_lens
+
+    # twin of TritonAttnBackend.SMALL_EXTEND_MAX_TOKENS: the dense layers take the same route
+    SMALL_EXTEND_MAX_TOKENS = 8
+
+    def _row_topk_buf(self, rows: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Persistent index top-k buffer shared by every forward with ``rows`` query rows."""
+        if rows <= 0:
+            return None
+        topk_buf = self._decode_topk_buf.get(rows)
+        if topk_buf is None:
+            num_kv_heads = self.kv_pool.main_pool.head_num
+            topk_buf = torch.empty(
+                (num_kv_heads, rows, self.topk_blocks * self._idx_group_size),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._decode_topk_buf[rows] = topk_buf
+        return topk_buf
+
+    def _topk_reuse_for_rows(
+        self,
+        rows: int,
+        layer,
+        disable_value: bool,
+        device: torch.device,
+        allocate: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """``(cached_topk_idx, topk_out)`` for index top-k reuse across layers.
+
+        The group's source layer publishes into the persistent buffer and the other
+        layers read it; with ``allocate=False`` a missing buffer disables reuse
+        instead of allocating under graph capture.
+        """
+        if not (self.index_cache_enabled and disable_value):
+            return None, None
+        topk_buf = (
+            self._row_topk_buf(rows, device)
+            if allocate
+            else self._decode_topk_buf.get(rows)
+        )
+        if topk_buf is None:
+            return None, None
+        if self._topk_is_source.get(layer.layer_id, True):
+            return None, topk_buf
+        return topk_buf, None
+
+    def _sparse_decode_rows(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        per_query_req: torch.Tensor,
+        per_query_seq_lens: torch.Tensor,
+        max_seqlen: int,
+        layer,
+        disable_value: bool,
+        packed_queries: int,
+        allocate_topk_buf: bool,
+    ):
+        """Run the sparse decode kernels over one query row per token.
+
+        Chain verify and small extends both present rows with their own causal
+        ``seq_len`` and request slot, so the decode kernels serve them unchanged.
+        """
+        from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+            minimax_sparse_decode,
+        )
+
+        cached_topk, topk_out = self._topk_reuse_for_rows(
+            q.shape[0], layer, disable_value, q.device, allocate_topk_buf
+        )
+        return minimax_sparse_decode(
+            q,
+            None,
+            k_cache,
+            v_cache,
+            idx_q,
+            None,
+            idx_k_cache,
+            idx_v_cache,
+            self.req_to_token,
+            per_query_req.to(self.req_to_token.device),
+            per_query_seq_lens,
+            int(max_seqlen),
+            1,
+            self.block_size_k,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            dense_main_attn_fn=None,
+            page_size=self.page_size,
+            use_msa=False,
+            q_scale=layer.q_scale_float,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            idx_q_scale=layer.idx_q_scale_float,
+            idx_k_scale=layer.idx_k_scale_float,
+            idx_v_scale=layer.idx_v_scale_float,
+            cached_topk_idx=cached_topk,
+            topk_out=topk_out,
+            # packing is a score-only shortcut, so value layers stay per-row
+            packed_queries=int(packed_queries) if disable_value else 1,
+        )
+
+    def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
+        """Route a few-token EXTEND over cached prefixes to the decode kernels.
+
+        Eager forwards only: the row metadata comes from host lists, so a captured
+        copy would replay capture-time lengths.
+        """
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        return (
+            not self.is_npu
+            and not is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and max(extend_lens) <= self.SMALL_EXTEND_MAX_TOKENS
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.req_pool_indices is not None
+        )
+
+    def _small_extend_row_meta_for(
+        self, forward_batch: ForwardBatch
+    ) -> SimpleNamespace:
+        """Per-row metadata for a small extend, built once per forward batch."""
+        cached = self._small_extend_row_meta
+        if cached is not None and cached[0] == id(forward_batch):
+            return cached[1]
+        row_meta = flattened_extend_row_meta(
+            forward_batch.req_pool_indices,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.seq_lens.dtype,
+        )
+        self._small_extend_row_meta = (id(forward_batch), row_meta)
+        return row_meta
+
+    def _forward_gpu_triton_small_extend(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        layer,
+        disable_value: bool,
+    ):
+        """Sparse attention for a small EXTEND as flattened decode rows.
+
+        Row ``j`` of a request attends ``KV[0:prefix+j+1]``; its new K/V were
+        stored by the caller.
+        """
+        row_meta = self._small_extend_row_meta_for(forward_batch)
+        return self._sparse_decode_rows(
+            q,
+            k_cache,
+            v_cache,
+            idx_q,
+            idx_k_cache,
+            idx_v_cache,
+            row_meta.per_query_req,
+            row_meta.per_query_seq_lens,
+            row_meta.max_seqlen,
+            layer,
+            disable_value,
+            row_meta.packed,
+            allocate_topk_buf=True,
+        )
+
+    def _forward_gpu_triton_verify(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        layer,
+        disable_value: bool,
+    ):
+        """Capture-safe sparse attention for TARGET_VERIFY on CUDA/ROCm.
+
+        Each request contributes ``ndt`` draft queries and query ``j`` attends
+        ``KV[0:prefix+j+1]``; the draft K/V were written by the caller, so the
+        batch flattens into single-token decode rows. Device ops only.
+        """
+        bs = forward_batch.seq_lens.shape[0]
+        num_tokens = q.shape[0]
+        ndt = num_tokens // max(bs, 1)
+        row_meta = self._verify_meta_cg.get((bs, ndt))
+        if row_meta is None:
+            # eager verify: the row metadata is layer-invariant, so build it once per forward
+            cached = self._eager_verify_row_meta
+            if cached is not None and cached[0] == id(forward_batch):
+                row_meta = cached[1]
+            else:
+                # seq_lens is the prefix length on GPU verify batches
+                per_query_req, per_query_seq_lens = chain_verify_row_meta(
+                    forward_batch.seq_lens, forward_batch.req_pool_indices, ndt
+                )
+                row_meta = SimpleNamespace(
+                    per_query_seq_lens=per_query_seq_lens.to(
+                        forward_batch.seq_lens.dtype
+                    ),
+                    per_query_req=per_query_req,
+                )
+                self._eager_verify_row_meta = (id(forward_batch), row_meta)
+        # _max_seqlen_k bounds the prefix, so add the draft tail
+        return self._sparse_decode_rows(
+            q,
+            k_cache,
+            v_cache,
+            idx_q,
+            idx_k_cache,
+            idx_v_cache,
+            row_meta.per_query_req.to(forward_batch.req_pool_indices.dtype),
+            row_meta.per_query_seq_lens.to(forward_batch.seq_lens.dtype),
+            int(self._max_seqlen_k) + int(ndt),
+            layer,
+            disable_value,
+            ndt,
+            allocate_topk_buf=False,
+        )
 
     def forward_extend(
         self,
@@ -1484,6 +1739,38 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     seq_lens,
                     prefix_lens,
                 )
+        elif forward_batch.forward_mode.is_target_verify():
+            # chain verify runs under graph capture, so it takes the decode-row path
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            idx_o, o = self._forward_gpu_triton_verify(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                layer,
+                disable_value,
+            )
+        elif self._is_small_extend(forward_batch):
+            # the prefill index kernels read the whole cache per query row, so go as decode rows
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            idx_o, o = self._forward_gpu_triton_small_extend(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                layer,
+                disable_value,
+            )
         else:
             # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
             # the bf16 k/v) and the DP trim.
