@@ -78,10 +78,7 @@ def _triton_kv_splits_default() -> int:
 
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
-        # Raise the Triton flash-decoding split count from the field default
-        # to 16 on AMD, but keep an explicit --triton-attention-num-kv-splits:
-        # long-context decode (e.g. 24 x 195K tokens on one KV head) wants
-        # more splits than either default.
+        # only lift the declared default, so an explicit --triton-attention-num-kv-splits holds
         kv_splits = getattr(server_args, "triton_attention_num_kv_splits", None)
         if kv_splits == _triton_kv_splits_default():
             declare_resolution(

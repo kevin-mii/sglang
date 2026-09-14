@@ -1081,18 +1081,10 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
-    # Triton extend attention over a long cached prefix (>= the token threshold
-    # below): sweep the prefix with larger query tiles and in parallel slices
-    # (one partial O/LSE each) and combine, instead of one serial pass per
-    # (query tile, head). Same math, fp32 partials; the win is parallelism
-    # at few extend rows and halved KV traffic at many rows.
+    # opt-in: sweep a long cached prefix in parallel slices instead of one serial pass per tile
     SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS = EnvInt(8192)
-    # Within the long-prefix EXTEND route, serve batches whose largest request
-    # has at least MIN_ROWS extend rows with aiter's CK paged batch-prefill
-    # kernel (prefix + chunk in one causal paged call) instead of the
-    # split-prefix Triton kernel. ROCm only; fp8 (per-tensor scales) or bf16
-    # KV at page size 1. Below the threshold the CK kernel is slower.
+    # ROCm: extends of at least MIN_ROWS rows in that route take aiter's CK paged batch-prefill
     SGLANG_USE_AITER_EXTEND_LONG_PREFIX = EnvBool(False)
     SGLANG_AITER_EXTEND_LONG_PREFIX_MIN_ROWS = EnvInt(2048)
     # Raise if Triton loads a kernel after the engine starts serving. This

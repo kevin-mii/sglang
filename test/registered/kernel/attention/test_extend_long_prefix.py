@@ -25,9 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=40, suite="jit-kernel-unit-test-amd")
 
-# Same math, different reduction order over prefix slices (fp32 partials).
-# Observed max abs diff vs the single-pass kernel on gfx950: ~5e-4 (bf16 KV),
-# ~7e-3 (fp8 KV, dominated by the fp8 P.V rounding both kernels share).
+# observed on gfx950: ~5e-4 (bf16 KV), ~7e-3 (fp8 KV, the P.V rounding both kernels share)
 ATOL = {torch.bfloat16: 1e-2, fp8_dtype: 3e-2}
 
 
@@ -40,7 +38,7 @@ def _inputs(prefix_lens, extend_lens, h_q, h_kv, d, kv_dtype, device):
     kv_indptr[1:] = torch.cumsum(
         torch.tensor(prefix_lens, dtype=torch.int32, device=device), 0
     )
-    # Scrambled page table so the split sweep is exercised through kv_indices.
+    # a scrambled page table exercises the split sweep through kv_indices
     kv_indices = torch.randperm(total_prefix, device=device).to(torch.int64)
     n_ext = int(sum(extend_lens))
     q = torch.randn(n_ext, h_q, d, dtype=torch.bfloat16, device=device)
@@ -131,7 +129,7 @@ class TestExtendLongPrefix(CustomTestCase):
         self._run([65536], [3], num_splits=16)
 
     def test_single_split_layout(self):
-        # num_splits == 1 still goes through the 4-D partial layout + combine.
+        # a single split still takes the 4-D partial layout and the combine
         self._run([20000], [2048], num_splits=1)
 
     def test_gqa_group_4(self):
@@ -144,7 +142,7 @@ class TestExtendLongPrefix(CustomTestCase):
         self._run([16384], [512], d=64)
 
     def test_prefix_shorter_than_one_tile_per_split(self):
-        # 100 prefix tokens over 16 splits: most slices are empty (LSE=-inf).
+        # 100 prefix tokens over 16 splits: most slices are empty
         self._run([100], [50], num_splits=16)
 
     def test_auto_split_count(self):

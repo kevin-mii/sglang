@@ -182,9 +182,6 @@ class TritonAttnBackend(AttentionBackend):
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
-        # Split-prefix extend for EXTEND rows over a long cached prefix
-        # (see extend_attention_fwd_long_prefix); gated per forward in
-        # _use_long_prefix_extend.
         self.extend_attention_fwd_long_prefix = torch.compiler.disable(
             extend_attention_fwd_long_prefix
         )
@@ -194,9 +191,6 @@ class TritonAttnBackend(AttentionBackend):
         self.long_prefix_extend_min_tokens = (
             envs.SGLANG_TRITON_EXTEND_LONG_PREFIX_MIN_TOKENS.get()
         )
-        # aiter CK paged batch-prefill for large EXTEND chunks over a long
-        # prefix (see aiter_extend_long_prefix); gated per forward in
-        # _use_aiter_long_prefix_extend.
         self.aiter_long_prefix_extend_enabled = False
         if _is_hip and envs.SGLANG_USE_AITER_EXTEND_LONG_PREFIX.get():
             from sglang.srt.layers.attention.aiter_extend_long_prefix import (
@@ -1572,15 +1566,12 @@ class TritonAttnBackend(AttentionBackend):
         average prefix per request comes from the kv_indices length."""
         if not self.long_prefix_extend_enabled or kv_indices is None:
             return False
-        # EXTEND / MIXED / SPLIT_PREFILL / DRAFT_EXTEND_V2 only; TARGET_VERIFY
-        # keeps its own kernels.
+        # target verify keeps its own kernels
         if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
             return False
-        # Eager only: the split count and the partial buffers follow host-side
-        # shapes, which a captured graph would bake in (draft extend can be
-        # captured in some configurations).
+        # the split count and partial buffers follow host shapes a captured graph would bake in
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
         )
