@@ -16,6 +16,8 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_llama_eagle3_draft,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -92,9 +94,19 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return is_kimi_k3(model_config.hf_config)
     if is_dspark_draft(model_config.hf_config):
         return use_verify_splitkv
+    # Grouped-head verify needs every local query head to share one TP-local
+    # KV head. Qwen3.5 at TP>=2, the MiniMax-M3 dense layers (4 KV heads, TP4/8)
+    # and its Llama-arch EAGLE3 draft all have that shape; the per-head
+    # split-KV kernel re-reads the prefix KV once per query head there (16x
+    # the traffic at 16 local heads: 0.56 ms vs ~0.1 ms per layer at 100K).
+    if not (
+        is_qwen3_5(model_config.hf_config)
+        or is_minimax_sparse(model_config.hf_config)
+        or is_llama_eagle3_draft(model_config.hf_config)
+    ):
+        return False
     return (
         use_verify_splitkv
-        and is_qwen3_5(model_config.hf_config)
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -231,6 +243,18 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # Decode steps of the same shapes (draft decode at topk 1, dense
+        # layers) reuse that kernel with one extend row per request; the page
+        # table already holds the new token, so the prefix is trimmed by one.
+        self.use_decode_shared_kv = (
+            self.use_verify_shared_kv
+            and not envs.SGLANG_DISABLE_TRITON_DECODE_SHARED_KV.get()
+        )
+        self._decode_shared_kv_qo_indptr = (
+            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+            if self.use_decode_shared_kv
+            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1530,6 +1554,23 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    # Largest per-request extend length routed to the verify kernels.
+    SMALL_EXTEND_MAX_TOKENS = 8
+
+    def _is_small_constant_extend(
+        self, forward_batch: ForwardBatch, kv_indices: torch.Tensor
+    ) -> bool:
+        ext = forward_batch.extend_seq_lens_cpu
+        return (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and ext is not None
+            and len(ext) > 0
+            and ext[0] <= self.SMALL_EXTEND_MAX_TOKENS
+            and all(e == ext[0] for e in ext)
+            and kv_indices is not None
+            and kv_indices.numel() > 0
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1704,10 +1745,23 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
+        # The EAGLE v2 draft-extend (DRAFT_EXTEND_V2) has the same shape: a
+        # constant num_draft_tokens-row causal chain per request over a
+        # prefix-only kv_indices, so it takes the same split-KV path. The
+        # serial-prefix extend kernel launches only bs*heads work-groups and
+        # costs O(context) per step at long prefix (2.2 ms at 100K for the
+        # MiniMax-M3 EAGLE3 draft vs ~0.3 ms split-KV).
+        # A small constant-length EXTEND over a cached prefix (a new turn) has
+        # the same shape too; the serial extend kernel costs 6 ms per dense
+        # layer at 195K context there.
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+                or self._is_small_constant_extend(forward_batch, kv_indices)
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
@@ -2297,6 +2351,40 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        if (
+            self.use_decode_shared_kv
+            and not self.use_mla
+            and score_mod is None
+            and sinks is None
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= 0)
+            and k is not None
+            and v is not None
+            and q.shape[0] + 1 <= self._decode_shared_kv_qo_indptr.shape[0]
+            and self.verify_shared_kv_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                1,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                max_bs=self.req_to_token_pool.size,
+                kv_len_adjust=-1,
+            )
+        ):
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

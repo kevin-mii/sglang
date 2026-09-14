@@ -1093,6 +1093,11 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # Decode attention for grouped-head shapes with one TP-local KV head (EAGLE3
+    # Llama draft, MiniMax-M3 dense layers): serve it with the split-KV
+    # grouped-head verify kernel (one extend row per request) instead of the
+    # per-head decode kernel; ~3x higher KV bandwidth at 100K+ contexts.
+    SGLANG_DISABLE_TRITON_DECODE_SHARED_KV = EnvBool(False)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
