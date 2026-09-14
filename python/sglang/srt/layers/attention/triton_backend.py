@@ -1556,10 +1556,8 @@ class TritonAttnBackend(AttentionBackend):
     def _is_small_constant_extend(
         self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
     ) -> bool:
-        """A plain EXTEND whose requests all extend by the same number of
-        tokens (<= SMALL_EXTEND_MAX_TOKENS) over a non-empty cached prefix:
-        exactly the target-verify shape, so the verify kernels can serve it.
-        Host-side list checks only."""
+        """Is this EXTEND verify-shaped: equal per-request extend lengths of at most
+        `SMALL_EXTEND_MAX_TOKENS` tokens, each over a non-empty cached prefix?"""
         ext = forward_batch.extend_seq_lens_cpu
         prefix = forward_batch.extend_prefix_lens_cpu
         return (

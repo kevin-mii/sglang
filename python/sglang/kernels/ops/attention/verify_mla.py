@@ -43,12 +43,7 @@ _SPLIT_CONFIG = {
 
 
 def split_config(head_dim):
-    """
-    Return (target stage-1 programs, max splits) for a head_dim; the module
-    defaults for untuned dims. max_splits also sizes the per-instance scratch:
-    att_out is bf16 [max_bs, h_q, max_splits, l_pad, v_head_dim] (plus the
-    fp32 lse without the last dim), so doubling it doubles that allocation.
-    """
+    """Return (target stage-1 programs, max splits) for a head_dim, module defaults if untuned."""
     return _SPLIT_CONFIG.get(head_dim, (TARGET_PROGRAMS, MAX_N_SPLITS))
 
 

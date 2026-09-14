@@ -1,6 +1,4 @@
-"""Decode attention served by the grouped-head verify kernel (one extend row per
-request, prefix trimmed by one so the freshly written token is attended to
-exactly once). Reference: decode_attention_fwd over the full page table."""
+"""Decode through the grouped-head verify kernel must match `decode_attention_fwd`."""
 
 import unittest
 

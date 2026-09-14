@@ -1,12 +1,4 @@
-"""Small constant-length EXTENDs over a long cached prefix on the verify kernels.
-
-A new agent turn (or a request restarted from the prefix cache) is an EXTEND of
-a few tokens over a very long cached prefix. TritonAttnBackend routes such
-batches (constant per-request extend length <= SMALL_EXTEND_MAX_TOKENS, all
-requests with a cached prefix) to the split-KV / grouped-head verify kernels,
-whose shape they share. This checks (a) the routing predicate and (b) kernel
-parity against extend_attention_fwd for extend lengths 1..8 over long prefixes.
-"""
+"""Small constant-length extends over a long prefix must match `extend_attention_fwd`."""
 
 import unittest
 from types import SimpleNamespace
