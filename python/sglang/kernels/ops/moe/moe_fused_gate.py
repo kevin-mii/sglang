@@ -278,15 +278,9 @@ def moe_fused_gate(
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
     within). The first argument is named ``scores`` (raw GEMM logits) to match
-    the existing call sites.
-
-
-    Contract relied on by ``select_experts`` when it folds the fused shared
-    expert into the gate (``num_fused_shared_experts > 0``): with RENORMALIZE
-    and APPLY_SCALE the routed columns hold the renormalized weights times
-    ``routed_scaling_factor`` and every shared column holds exactly 1.0 at id
-    ``num_experts + i``. Callers that need a different shared weight must not
-    use the fold.
+    the existing call sites. With RENORMALIZE and APPLY_SCALE each shared column
+    is exactly 1.0 at id ``num_experts + i``, which ``select_experts`` relies on
+    when it folds the shared slot into the gate.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (

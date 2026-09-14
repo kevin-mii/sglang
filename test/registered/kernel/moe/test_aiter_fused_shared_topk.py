@@ -42,8 +42,7 @@ class TestAiterFusedSharedTopK(CustomTestCase):
     ROUTED_SCALING_FACTOR = 2.0
 
     def _reference(self, logits, bias):
-        # HF MiniMax-M3 semantics: sigmoid scores, top-k on score + bias,
-        # renormalize the raw scores of the winners, then routed_scaling_factor.
+        # HF: sigmoid scores, top-k on score+bias, renormalize winners, then routed_scaling_factor
         scores = logits.sigmoid()
         ref_ids = torch.topk(scores + bias, self.TOPK_ROUTED, dim=-1).indices
         ref_w = scores.gather(1, ref_ids)

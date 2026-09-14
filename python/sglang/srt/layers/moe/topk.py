@@ -2210,7 +2210,7 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    # The gate already wrote the shared slot (select_experts folded it in).
+    # skipped when select_experts folded the shared slot into the gate
     _aiter_append = (
         num_fused_shared_experts > 0 and _use_aiter and not shared_experts_already_fused
     )
@@ -2360,22 +2360,13 @@ def select_experts(
     # slots on the marker) and places that marker at id num_experts, which the
     # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
     # 384 routed experts on EP8, where the valid ids are 0..391.
-    #
-    # The same holds for every aiter path: _post_process_topk_ids appends the
-    # shared expert (fused_append_shared_experts, weight 1.0) whenever
-    # `_use_aiter and num_fused_shared_experts > 0`, and the gate is already
-    # asked for K_routed. Letting the JIT gate (moe_fused_gate) emit its own
-    # marker too made MiniMax-M3 on ROCm run 3 routed experts instead of 4 and
-    # count the shared expert twice (id 128 at weight 1.0 in two columns):
-    # GSM8K-500 0.81 fused vs 0.88 unfused.
+    # every aiter path appends the shared expert later, so the gate must emit no marker
     num_fused_shared_experts_for_gate = (
         0
         if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
-    # The JIT gate (biased_topk_jit_kernel_impl / biased_topk_xpu ->
-    # moe_fused_gate) serves the request iff this holds; the dispatch below and
-    # the shared-slot fold decision both read it so they cannot drift apart.
+    # read by both the dispatch and the fold decision, so the two cannot drift apart
     _jit_gate_serves_request = (
         not use_grouped_topk
         and not (torch_native and custom_routing_function is None)
@@ -2383,15 +2374,7 @@ def select_experts(
         and not _is_cpu
         and scoring_func in ("sqrtsoftplus", "sigmoid")
     )
-    # Exception on the aiter path: when the Triton JIT gate serves the request
-    # (sigmoid / sqrtsoftplus, no groups, no custom routing) and the shared
-    # slot would be appended with weight 1.0 anyway, let the gate fill that slot
-    # itself. With RENORMALIZE and APPLY_SCALE the gate writes exactly
-    # [K_routed renormalized x scale, shared = 1.0] (see moe_fused_gate), so the
-    # separate fused_append_shared_experts launch (~4.5us per layer on graph
-    # replay) is skipped in _post_process_topk_ids. Only for the plain
-    # single-marker layout without an expert-location remap, whose id space the
-    # later remap would otherwise have to skip.
+    # the JIT gate writes the shared slot as exactly 1.0, so the append launch can be skipped
     _shared_folded_into_gate = (
         _use_aiter
         and num_fused_shared_experts > 0
