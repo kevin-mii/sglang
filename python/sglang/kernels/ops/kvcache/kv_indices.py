@@ -18,18 +18,15 @@ def kv_indices_num_token_blocks(table_width: int, base_programs: int) -> int:
     return max(1, min(cap, want))
 
 
-# Below this page-table width one program per request already copies its
-# page table quickly; wider tables split the copy over token blocks.
+# below this width one program per request copies its page table fast enough
 KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH = 32768
 
 
 def kv_indices_token_blocks_for_copy(table_width: int, base_programs: int) -> int:
-    """Token blocks per program for a page-table copy launched every step.
+    """Token blocks per request for a page-table copy that runs every step.
 
-    Returns 1 (the historical single-program copy) below
-    ``KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH`` and ``kv_indices_num_token_blocks``
-    otherwise. Callers pass ``TOKEN_BLOCK_PARALLEL=(blocks > 1)`` (or
-    ``NUM_STEPS``) to the kernel so the grid and the kernel agree.
+    Callers pass the kernel flag from the same value, so the grid and the
+    kernel cannot disagree.
     """
     if table_width < KV_INDICES_TOKEN_BLOCKS_MIN_WIDTH:
         return 1

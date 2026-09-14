@@ -2391,9 +2391,7 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
-        # Long-context spec decode copies every request's page table once per
-        # draft step here; spread the copy over token blocks instead of one
-        # program per (step, request) crawling the whole context serially.
+        # one program per (step, request) walks the whole context, so split it over token blocks
         num_token_blocks = kv_indices_token_blocks_for_copy(
             self.pool_len, self.speculative_num_steps * num_seqs * self.topk
         )
