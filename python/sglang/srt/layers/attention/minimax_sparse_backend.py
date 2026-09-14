@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.row_meta import (
     chain_verify_row_meta,
+    flattened_extend_row_meta,
 )
 from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -163,6 +164,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
         # (forward_batch, meta) for eager verify; see _forward_gpu_triton_verify.
         self._verify_meta_eager = None
+        # (forward_batch, meta) for the small-extend decode-style path.
+        self._small_extend_meta_cache = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -1509,6 +1512,65 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             packed_queries=int(packed_queries) if disable_value else 1,
         )
 
+    def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
+        ext = forward_batch.extend_seq_lens_cpu
+        return (
+            not self.is_npu
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and ext is not None
+            and len(ext) > 0
+            and max(ext) <= self.SMALL_EXTEND_MAX_TOKENS
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.req_pool_indices is not None
+        )
+
+    def _small_extend_meta(self, forward_batch: ForwardBatch) -> SimpleNamespace:
+        """Per-row metadata for a small extend, built once per forward batch
+        from the host lists (eager path, never captured)."""
+        cached = self._small_extend_meta_cache
+        if cached is not None and cached[0] is forward_batch:
+            return cached[1]
+        meta = flattened_extend_row_meta(
+            forward_batch.req_pool_indices,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.seq_lens.dtype,
+        )
+        self._small_extend_meta_cache = (forward_batch, meta)
+        return meta
+
+    def _forward_gpu_triton_small_extend(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        layer,
+        disable_value: bool,
+    ):
+        """Sparse attention for a small EXTEND as flattened decode rows: row j of
+        a request attends KV[0:prefix+j+1] (its new K/V were stored by the caller).
+        Same kernels and index top-k reuse as the chain-verify path."""
+        meta = self._small_extend_meta(forward_batch)
+        return self._sparse_decode_rows(
+            q,
+            k_cache,
+            v_cache,
+            idx_q,
+            idx_k_cache,
+            idx_v_cache,
+            meta.per_query_req,
+            meta.per_query_seq_lens,
+            meta.max_seqlen,
+            layer,
+            disable_value,
+            meta.packed,
+            allocate_topk_buf=True,
+        )
+
     def _forward_gpu_triton_verify(
         self,
         q: torch.Tensor,
@@ -1693,6 +1755,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
             idx_o, o = self._forward_gpu_triton_verify(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                layer,
+                disable_value,
+            )
+        elif self._is_small_extend(forward_batch):
+            # A few new tokens over a long cached prefix (a new agent turn, a
+            # restart after prefix-cache hit): the prefill kernels are built for
+            # many query rows and read the whole index-K cache at ~10 GB/s here
+            # (2.5 ms/layer at 195K). Flatten the rows like target verify and
+            # use the bandwidth-bound decode kernels instead (~30 us/layer).
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            idx_o, o = self._forward_gpu_triton_small_extend(
                 q,
                 k_cache,
                 v_cache,
