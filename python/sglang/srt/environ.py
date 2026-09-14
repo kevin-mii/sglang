@@ -1599,9 +1599,7 @@ class Envs:
     # Run the sparse prefill main attention through AITER's Gluon paged attention
     # instead of the Triton kernel. Unsupported cases fall back to Triton.
     SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL = EnvBool(True)
-    # Per-buffer cap (MiB) on the Gluon sparse-prefill gather scratch (K and V
-    # each). The gathered span is the batch's total prefix+chunk length; batches
-    # above the cap fall back to the Triton sparse kernel.
+    # per-buffer MiB cap on the Gluon prefill gather scratch; larger spans fall back to Triton
     SGLANG_MINIMAX_GLUON_PREFILL_SCRATCH_MB = EnvInt(2048)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
