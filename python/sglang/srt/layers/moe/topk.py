@@ -2130,6 +2130,7 @@ def _post_process_topk_ids(
     layer_id: int,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    shared_experts_already_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -2215,7 +2216,10 @@ def _post_process_topk_ids(
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
 
-    _aiter_append = num_fused_shared_experts > 0 and _use_aiter
+    # skipped when select_experts folded the shared slot into the gate
+    _aiter_append = (
+        num_fused_shared_experts > 0 and _use_aiter and not shared_experts_already_fused
+    )
     if _aiter_append and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
         # That router emits the shared slots itself; appending again would write
         # the shared id twice and evict a real routed expert.
@@ -2366,11 +2370,36 @@ def select_experts(
     # slots on the marker) and places that marker at id num_experts, which the
     # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
     # 384 routed experts on EP8, where the valid ids are 0..391.
+    # every aiter path appends the shared expert later, so the gate must emit no marker
     num_fused_shared_experts_for_gate = (
         0
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
+    # read by both the dispatch and the fold decision, so the two cannot drift apart
+    _jit_gate_serves_request = (
+        not use_grouped_topk
+        and not (torch_native and custom_routing_function is None)
+        and custom_routing_function is None
+        and not _is_cpu
+        and scoring_func in ("sqrtsoftplus", "sigmoid")
+    )
+    # the JIT gate writes the shared slot as exactly 1.0, so the append launch can be skipped
+    _shared_folded_into_gate = (
+        _use_aiter
+        and num_fused_shared_experts > 0
+        and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        and _jit_gate_serves_request
+        and not _is_xpu
+        and renormalize
+        and bool(apply_routed_scaling_factor_on_output)
+        and routed_scaling_factor is not None
+        and expert_location_dispatch_info is None
+        and topk_config.fused_shared_experts_scaling_factor in (None, 1.0)
+        and not _eplb_remap_enabled()
+    )
+    if _shared_folded_into_gate:
+        num_fused_shared_experts_for_gate = num_fused_shared_experts
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -2418,18 +2447,18 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
-        _can_use_jit_kernel = not _is_cpu
-
-        if _can_use_jit_kernel and (
-            scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"
-        ):
+        # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports.
+        if _jit_gate_serves_request:
             _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=(
+                    num_routed_topk
+                    if (_use_aiter and not _shared_folded_into_gate)
+                    else top_k
+                ),
                 renormalize=renormalize,
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts_for_gate,
@@ -2553,6 +2582,7 @@ def select_experts(
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
+        shared_experts_already_fused=_shared_folded_into_gate,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(
