@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.kvcache.kv_indices import kv_indices_token_blocks_for_copy
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -107,7 +108,10 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
+        num_token_blocks = kv_indices_token_blocks_for_copy(
+            req_to_token.size(1), batch_size
+        )
+        create_flashinfer_kv_indices_triton[(batch_size, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -115,6 +119,7 @@ class EagleVerifyInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -377,7 +382,8 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
+        num_token_blocks = kv_indices_token_blocks_for_copy(req_to_token.size(1), bs)
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -385,5 +391,6 @@ class EagleDraftExtendInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
