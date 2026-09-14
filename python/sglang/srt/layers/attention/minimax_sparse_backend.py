@@ -271,7 +271,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if (
             spec.speculative_algorithm is not None
             and not self.is_npu
-            and (getattr(spec, "speculative_eagle_topk", None) or 1) > 1
+            and (spec.speculative_eagle_topk or 1) > 1
         ):
             raise NotImplementedError(
                 "MiniMax-M3 sparse attention target-verify on CUDA/ROCm supports "

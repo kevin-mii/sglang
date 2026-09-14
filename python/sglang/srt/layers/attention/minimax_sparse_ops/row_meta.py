@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Tuple
 
 import torch
 
 
 def chain_verify_row_meta(
     prefix_lens: torch.Tensor, req_pool_indices: torch.Tensor, num_draft_tokens: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``(per_query_req, per_query_seq_lens)`` for an EAGLE chain-verify batch.
 
     Row ``j`` of a request attends ``KV[0 : prefix + j + 1]``; device ops only,
