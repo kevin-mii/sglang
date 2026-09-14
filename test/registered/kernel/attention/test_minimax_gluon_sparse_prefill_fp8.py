@@ -1,13 +1,4 @@
-"""Gluon sparse prefill (MiniMax-M3, ROCm gfx950) on bf16 and fp8 K/V pools.
-
-The Gluon paged-attention prefill must match a pure-torch block-sparse
-softmax reference for fresh prompts, batched prompts,
-prefix-extend with non-block-aligned chunk boundaries, and a second chunked
-prefill chunk, on bf16 pools and on fp8 pools with unit and non-unit
-per-tensor K/V scales. Before the fp8 support the dispatch silently fell back
-to Triton on fp8 pools, which is the configuration the fp8 indexer cache
-targets.
-"""
+"""The Gluon sparse prefill must match a block-sparse softmax reference on bf16 and fp8 pools."""
 
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -41,7 +32,7 @@ def _gfx950() -> bool:
     return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
 
 
-HQ, HKV, D, BLK, TOPK = 16, 1, 128, 128, 18  # TP4 rank: 16 q heads, 1 kv head
+HQ, HKV, D, BLK, TOPK = 16, 1, 128, 128, 18  # one TP4 rank of MiniMax-M3
 
 
 @unittest.skipUnless(_HAS_DEPS and _gfx950(), "gfx950 + aiter Gluon path required")
@@ -79,8 +70,7 @@ class TestGluonSparsePrefillFp8(CustomTestCase):
         )
         seq_lens = torch.tensor(seqs, dtype=torch.int32, device=dev)
         prefix_lens = torch.tensor(prefixes, dtype=torch.int32, device=dev)
-        # Synthetic causal top-k: ascending block ids up to the query's own
-        # block, -1 tail.
+        # synthetic causal top-k: ascending block ids up to the query's own block, -1 tail
         topk = torch.full((HKV, total_q, TOPK), -1, dtype=torch.int32, device=dev)
         for b in range(B):
             for i in range(ext[b]):
@@ -116,9 +106,7 @@ class TestGluonSparsePrefillFp8(CustomTestCase):
             k_scale=k_scale,
             v_scale=v_scale,
         )
-        # Gluon vs a pure-torch block-sparse softmax on sampled queries: first
-        # rows, rows across a block-size_q boundary, chunk boundaries, request
-        # boundaries, last rows.
+        # sampled rows: first, block_size_q boundary, chunk and request boundaries, last
         sample = sorted(
             {0, 1, 5, 7, 8, 9, 130, 200, total_q - 1, total_q - 2, total_q // 2}
             | ({int(cu[1]) - 1, int(cu[1]), int(cu[1]) + 3} if B > 1 else set())
@@ -139,20 +127,23 @@ class TestGluonSparsePrefillFp8(CustomTestCase):
             self.assertLess(err, 2e-2, f"query {gi}: gluon vs torch max abs {err}")
             self.assertFalse(torch.isnan(out[gi]).any().item())
 
-    def test_bf16_pool(self):
+    def test_bf16_pool_matches_reference(self):
+        """The pool the base PR already served; guards the shared gather and layout."""
         self._run_case(torch.bfloat16, [700], [0], 8)
         self._run_case(torch.bfloat16, [5000, 3100], [0, 0], 8)
         self._run_case(torch.bfloat16, [9000, 4200], [7000, 300], 4)
         self._run_case(torch.bfloat16, [20000], [8192], 8)
 
-    def test_fp8_pool_unit_scales(self):
+    def test_fp8_pool_matches_reference(self):
+        """Before fp8 support the dispatch fell back to Triton; a wrong x or descale shows here."""
         fp8 = torch.float8_e4m3fn
         self._run_case(fp8, [700], [0], 8)
         self._run_case(fp8, [5000, 3100], [0, 0], 8)
         self._run_case(fp8, [9000, 4200], [7000, 300], 4)
         self._run_case(fp8, [20000], [8192], 8)
 
-    def test_fp8_pool_non_unit_scales(self):
+    def test_fp8_pool_forwards_non_unit_scales(self):
+        """Dropped k/v scales would still pass the unit-scale case."""
         self._run_case(
             torch.float8_e4m3fn, [6000, 2500], [1000, 0], 8, k_scale=0.5, v_scale=2.0
         )

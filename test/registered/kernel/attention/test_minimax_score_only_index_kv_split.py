@@ -1,10 +1,4 @@
-"""Score-only prefill indexer: KV-block split (grid axis 2) vs single split.
-
-MiniMax-M3 has one index head per rank at TP4, so without the split the
-score-only indexer launched 1-8 programs for a turn's few hundred new tokens,
-each crawling the whole context. Splitting the KV blocks over a third grid
-axis must leave the selected top-k block indices bit-identical.
-"""
+"""The KV-block split of the score-only indexer must leave the top-k indices bit-identical."""
 
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -23,7 +17,7 @@ try:
 except Exception:  # pragma: no cover
     _HAS_DEPS = False
 
-H, KH, D = 1, 1, 128  # MiniMax-M3 at TP4: 1 index head, 1 index-K head per rank
+H, KH, D = 1, 1, 128  # one TP4 rank of MiniMax-M3: one index head
 
 
 @unittest.skipUnless(
@@ -84,7 +78,7 @@ class TestScoreOnlyIndexKvSplit(CustomTestCase):
 
     def _check(self, kc, cases):
         for lens, exts in cases:
-            # One slot mapping per case, shared by both launches.
+            # one slot mapping per case, shared by both launches
             for b, L in enumerate(lens):
                 self.req_to_token[b, :L] = torch.randperm(
                     self.max_slots, device=self.dev
@@ -95,7 +89,8 @@ class TestScoreOnlyIndexKvSplit(CustomTestCase):
                 torch.equal(ref, out), f"top-k differs for lens={lens} exts={exts}"
             )
 
-    def test_bf16_index_cache(self):
+    def test_bf16_index_cache_topk_is_identical(self):
+        """A (row, block) written by two programs or by none changes the top-k."""
         self._check(
             self.k_cache,
             [
@@ -108,7 +103,8 @@ class TestScoreOnlyIndexKvSplit(CustomTestCase):
             ],
         )
 
-    def test_fp8_index_cache(self):
+    def test_fp8_index_cache_topk_is_identical(self):
+        """The fp8 index cache takes the per-page gather path; same invariant."""
         kc = self.k_cache.to(torch.float8_e4m3fn)
         self._check(
             kc, [([198000], [10]), ([198000], [1536]), ([120000, 200000], [2048, 4096])]
