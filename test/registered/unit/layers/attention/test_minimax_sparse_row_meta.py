@@ -1,5 +1,4 @@
-"""Unit tests for the flattened-row metadata helpers of the MiniMax-M3 sparse
-attention backend (EAGLE chain verify and small extends on CUDA/ROCm)."""
+"""The flattened-row metadata must be request-major with causal lengths."""
 
 import unittest
 
@@ -17,8 +16,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestChainVerifyRowMeta(CustomTestCase):
     def test_rows_are_request_major_and_causal(self):
-        # GPU verify batches keep seq_lens at the prefix length; the ndt draft
-        # slots follow it, so row j of a request attends prefix + j + 1 tokens.
+        """A draft-major order or an off-by-one length would attend the wrong KV."""
         prefix = torch.tensor([10, 3], dtype=torch.int64)
         req_pool_indices = torch.tensor([7, 2], dtype=torch.int32)
         per_query_req, per_query_seq_lens = chain_verify_row_meta(

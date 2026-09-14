@@ -860,21 +860,10 @@ def flash_decode_with_topk_idx(
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
-    # Packed scoring (chain verify): ``packed_queries`` consecutive rows belong to
-    # one request and share its K cache, so score them in ONE pass as extra q
-    # heads against the request's longest causal length (K reads dominate the
-    # score kernel; the block max/lse over at most ``packed_queries - 1``
-    # not-yet-visible keys of the tail block only affects that block, and the
-    # per-row top-k below still bounds each row by its own length). The top-k
-    # then runs per original row. Score-only layers only (disable_index_value),
-    # and only with local_blocks > 0 (each row's own local blocks are re-forced
-    # after the un-pack, which is what keeps the per-row top-k exact).
+    # packed rows of one request share its K cache, so score them as extra q heads in one pass
     pack = int(packed_queries) if packed_queries else 1
     if pack > 1 and local_blocks <= 0:
-        # Exactness of the packed pass relies on re-forcing each row's own
-        # local block(s) after the un-pack (see below); without local blocks a
-        # shorter row's tail block could be (de)selected on keys it must not
-        # see yet, so score row by row instead.
+        # exactness needs the per-row local re-forcing below, so no local blocks means no packing
         pack = 1
     if pack > 1:
         assert disable_index_value and not use_dense_main_attn
@@ -1037,7 +1026,7 @@ def flash_decode_with_topk_idx(
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
     if pack > 1:
-        # [pack*H, bs, blocks] -> [H, bs*pack, blocks] with request-major rows.
+        # [pack*H, bs, blocks] -> [H, bs*pack, blocks], request-major rows
         H = rows_heads
         score = (
             score.view(pack, H, batch_size, score.shape[2])
@@ -1046,12 +1035,7 @@ def flash_decode_with_topk_idx(
         )
         batch_size, num_q_heads = rows_batch, rows_heads
         seq_lens, slot_ids = rows_seq_lens, rows_slot_ids
-        # The score kernel forced the local blocks of the request's longest
-        # row; rows that end in an earlier block need their own last block(s)
-        # forced (same 1e29 marker), or the boundary case would drop the local
-        # block from a shorter row's top-k. ``local_blocks > 0`` is guaranteed
-        # by the fallback above. (Follow-up: pass per-row seq_lens to the
-        # top-k kernel's local forcing to avoid these three small launches.)
+        # the kernel forced only the longest row's local blocks, so re-force each row's own
         num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
         blocks = torch.arange(score.shape[2], device=score.device)
         is_local = (

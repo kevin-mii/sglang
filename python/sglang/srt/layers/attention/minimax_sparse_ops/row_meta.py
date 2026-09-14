@@ -1,8 +1,4 @@
-"""Per-row metadata for MiniMax-M3 sparse attention forwards that flatten a
-batch into one query row per token (EAGLE chain verify, small extends).
-
-Pure tensor helpers with no engine imports so they are unit-testable on CPU.
-"""
+"""Per-row metadata for MiniMax-M3 sparse forwards that flatten a batch into one query row per token."""
 
 from __future__ import annotations
 
@@ -15,12 +11,10 @@ import torch
 def chain_verify_row_meta(
     prefix_lens: torch.Tensor, req_pool_indices: torch.Tensor, num_draft_tokens: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-row metadata for an EAGLE chain verify batch (``topk == 1``).
+    """``(per_query_req, per_query_seq_lens)`` for an EAGLE chain-verify batch.
 
-    Every request contributes ``num_draft_tokens`` draft rows; row ``j`` of a
-    request attends ``KV[0 : prefix + j + 1]``. Returns ``(per_query_req,
-    per_query_seq_lens)`` with ``bs * num_draft_tokens`` entries, request-major,
-    built from device ops only so it is safe under graph capture.
+    Row ``j`` of a request attends ``KV[0 : prefix + j + 1]``; device ops only,
+    so the result is capture-safe.
     """
     ndt = int(num_draft_tokens)
     offsets = torch.arange(1, ndt + 1, device=prefix_lens.device, dtype=torch.long)
@@ -41,11 +35,8 @@ def flattened_extend_row_meta(
 ) -> SimpleNamespace:
     """Per-row metadata for a small EXTEND served as flattened decode rows.
 
-    Row ``j`` of a request with ``prefix`` cached tokens and ``extend`` new
-    tokens attends ``KV[0 : prefix + j + 1]``. ``packed`` is the per-request
-    row count when it is constant across the batch (the packed index-scoring
-    kernel needs equal counts), else 1. Host lists in, device tensors out
-    (eager path only).
+    Row ``j`` of a request attends ``KV[0 : prefix + j + 1]``; ``packed`` is the
+    per-request row count when it is constant across the batch, else 1.
     """
     ext = [int(x) for x in extend_lens]
     prefix = [int(x) for x in prefix_lens]
