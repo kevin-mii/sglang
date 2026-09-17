@@ -61,7 +61,8 @@ def _triton_fused_store_flashmla_kernel(
     if token_id >= N:
         return
 
-    loc = tl.load(indices_ptr + token_id).to(tl.int32)
+    # Token indices fit int32, but byte offsets in large KV pools need int64.
+    loc = tl.load(indices_ptr + token_id).to(tl.int64)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
