@@ -189,7 +189,7 @@ def mxfp8_gemv(
 
 
 # M > 32: hipBLASLt bf16 on the bf16 copy or the Triton dot_scaled tile, per the table's "large_m"
-LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
+LARGE_M_BUCKETS = (64, 128, 256, 512, 1024, 4096, 8192, 16384)
 HIPBLASLT_BF16 = "hipblaslt_bf16"
 
 
@@ -281,6 +281,8 @@ def _mxfp8_shuffled_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     OUT_F32: tl.constexpr,
+    EVEN_M: tl.constexpr = False,
+    EVEN_N: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -313,13 +315,23 @@ def _mxfp8_shuffled_gemm_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _ in range(0, k_per_split // BLOCK_K):
-        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0)
-        w_raw = tl.load(w_ptrs, mask=blk_mask[:, None], other=0)  # [T * S, 2048]
+        # The masks are loop-invariant: when the tile divides the problem they are all-true, and Triton
+        # still emits a v_cndmask per element per iteration for them (26 of them in a loop with 8 MFMA).
+        if EVEN_M:
+            x = tl.load(x_ptrs)
+            xs = tl.load(xs_ptrs)
+        else:
+            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0)
+            xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=127)
+        if EVEN_N:
+            w_raw = tl.load(w_ptrs)  # [T * S, 2048]
+            ws = tl.load(ws_ptrs)
+        else:
+            w_raw = tl.load(w_ptrs, mask=blk_mask[:, None], other=0)
+            ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=127)
         w7 = tl.reshape(w_raw, (T, S, 2, 2, 16, 2, 16))  # (t, s, g1, g0, row, half, e)
         w7 = tl.permute(w7, (0, 4, 1, 5, 2, 3, 6))  # (t, row, s, half, g1, g0, e)
         w = tl.reshape(w7, (BLOCK_N, BLOCK_K))
-        xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=127)
-        ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=127)
         acc = tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3", acc)
         x_ptrs += BLOCK_K
         xs_ptrs += BLOCK_K // 32
@@ -332,10 +344,11 @@ def _mxfp8_shuffled_gemm_kernel(
         + offs_m[:, None] * stride_om
         + offs_n[None, :]
     )
-    if OUT_F32:
-        tl.store(o_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+    o_val = acc if OUT_F32 else acc.to(tl.bfloat16)
+    if EVEN_M and EVEN_N:
+        tl.store(o_ptrs, o_val)
     else:
-        tl.store(o_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        tl.store(o_ptrs, o_val, mask=m_mask[:, None] & n_mask[None, :])
 
 
 def mxfp8_shuffled_gemm(
@@ -376,6 +389,8 @@ def mxfp8_shuffled_gemm(
         BLOCK_N=bn,
         BLOCK_K=bk,
         OUT_F32=split_k > 1,
+        EVEN_M=(m % bm == 0),
+        EVEN_N=(n % bn == 0),
         num_warps=warps,
         num_stages=2,
     )

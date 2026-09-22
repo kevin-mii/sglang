@@ -19,6 +19,10 @@ _NUM_WARPS, _NUM_STAGES, _WAVES_PER_EU, _MFMA_NONKDIM = 2, 2, 2, 16
 _CACHE_MODIFIER = ".cg"
 # 8 splits of 256-wide K steps fill the machine up to this many rows
 _SPLIT_K, _SPLIT_K_BLOCK_K, _SPLIT_K_MAX_M = 8, 256, 64
+# T > _SPLIT_K_MAX_M: "hipblaslt" (strided-batched bf16 + fake-quant, default) or "triton" (the grid kernel)
+import os as _os
+
+_LARGE_M_ROUTE = _os.environ.get("SGLANG_OPT_WO_A_LARGE_M_ROUTE", "hipblaslt")
 
 
 @triton.jit
@@ -316,6 +320,19 @@ def batched_gemm_bf16_fp8_grid(
     if split_k:
         assert _split_k_applies(T, D, R), (T, D, R)
         _batched_gemm_split_k(x, w, out, fp8_grid, eps)
+        return out
+    if _LARGE_M_ROUTE == "hipblaslt":
+        # Above the split-K ceiling the 16x32 Triton tile re-streams the whole per-group
+        # weight once per 16 rows (~800 MB at 768 rows): 23-126 us at T = 96-768. hipBLASLt's
+        # strided-batched bf16 GEMM, written directly into the [T, G, R] layout, is 17-31 us
+        # over the same range (job 34984, cold weights), and the consumer's fp8-grid rounding
+        # is the same per-32 fake-quant applied once afterwards. Deterministic per shape.
+        y = out.view(T, G, R)
+        torch.bmm(x.transpose(0, 1), w.transpose(1, 2), out=y.transpose(0, 1))
+        if fp8_grid:
+            from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fake_quant_fp8_activation
+
+            out.copy_(fake_quant_fp8_activation(out))
         return out
     grid = (G, triton.cdiv(T, _BLOCK_M) * triton.cdiv(R, _BLOCK_N))
     _batched_gemm_bf16_fp8_grid_kernel[grid](

@@ -40,8 +40,12 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 # aiter batched GEMM fork with wo_b's fp8-grid rounding in its epilogue; None keeps the aiter kernel
 _wo_a_fp8_grid_gemm = None
+import os as _os
+
+_LARGE_M_EMIT = _os.environ.get("SGLANG_OPT_WO_A_LARGE_M_EMIT", "grid")
 if _use_aiter and _is_gfx95_supported and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get():
     from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+        _split_k_applies,
         batched_gemm_bf16_fp8_grid as _wo_a_fp8_grid_gemm,
     )
 
@@ -216,6 +220,23 @@ def wo_a_fp8_grid_matmul(o: torch.Tensor, wo_a: torch.Tensor, fp8_grid: bool):
     # the split-K regime ends at 64 rows, so a request's verify and decode rows would
     # take different reduction orders; deterministic inference keeps the single chain
     split_k = False if get_exec().deterministic.enable_deterministic_inference else None
+    if (
+        fp8_grid
+        and _LARGE_M_EMIT == "mx"
+        and split_k is not False
+        and not _split_k_applies(o.shape[0], o.shape[2], wo_a.shape[1])
+    ):
+        # Above the split-K ceiling the GEMM runs on hipBLASLt and the fp8-grid rounding is a
+        # separate pass; wo_b's dot_scaled route would quantize that rounded tensor again
+        # (idempotent). Quantize the raw result once and hand wo_b the (q, scale) pair instead:
+        # one pass fewer, same values (job in night/woa_mx.sbatch).
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            Mxfp8Activation,
+            mxfp8_e4m3_quantize,
+        )
+
+        y = _wo_a_fp8_grid_gemm(o, wo_a, fp8_grid=False, split_k=split_k)
+        return Mxfp8Activation(*mxfp8_e4m3_quantize(y))
     y = _wo_a_fp8_grid_gemm(o, wo_a, fp8_grid=fp8_grid, split_k=split_k)
     if fp8_grid:
         return Fp8GridActivation(y)
