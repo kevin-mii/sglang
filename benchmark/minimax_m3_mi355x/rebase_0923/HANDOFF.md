@@ -6,7 +6,7 @@ Target: TTFT p50 < 3 s. The throughput target ("2.5TPS") still needs to be pinne
 
 ## TL;DR
 
-- Branch **`M3-perf-rebase-0923`** is M3-perf merged onto sglang main `4e60d70ba4`. That is the exact sglang commit of the latest image
+- Branch **`M3-perf-rebase`** is M3-perf merged onto sglang main `4e60d70ba4`. That is the exact sglang commit of the latest image
   `lmsysorg/sglang-rocm:v0.5.20-rocm724-mi35x-20260923` (digest `sha256:02108de8f9418a12425fb56415794fe82d180cb985488725d485e96d97a9a26b`).
   It serves correctly on that image: **GSM8K-500 = 0.872** (the branch reference is 0.85-0.89) and EAGLE3 accept length 2.8 of 4.
 - First reproduction, 2 x TP4 behind the cache-aware router. It beats the given baseline on every row:
@@ -54,8 +54,8 @@ Inside the container:
 ```bash
 export M3_WORK=/scratch; mkdir -p $M3_WORK/models $M3_WORK/data $M3_WORK/logs
 # 1. sglang: the image's editable tree sits at exactly 4e60d70ba4, so check the branch out there (keeps the compiled rust extension)
-cd /sgl-workspace/sglang && git remote add kevin https://github.com/kevin-mii/sglang && git fetch kevin M3-perf-rebase-0923 \
-  && git checkout -b M3-perf-rebase-0923 FETCH_HEAD
+cd /sgl-workspace/sglang && git remote add kevin https://github.com/kevin-mii/sglang && git fetch kevin M3-perf-rebase \
+  && git checkout -b M3-perf-rebase FETCH_HEAD
 R=/sgl-workspace/sglang/benchmark/minimax_m3_mi355x
 # 2. aiter (image ships acf8fdf9): FlyDSL XCD-swizzle fix, rebased for this aiter, plus the M3 tuned MoE rows
 cd /sgl-workspace/aiter && git apply $R/rebase_0923/aiter_acf8fdf9_xcd_swizzle.patch \
