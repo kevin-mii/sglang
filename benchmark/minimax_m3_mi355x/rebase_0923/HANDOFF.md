@@ -1,0 +1,122 @@
+# MiniMax-M3 MXFP4 on 8x MI355X: handoff (2026-09-23)
+
+Goal: reproduce, then improve, this workload on 8x MI355X with `amd/MiniMax-M3-MXFP4` + EAGLE3.
+The workload is ISL 74,176 tokens, OSL 650, 90% cached prefix, GSM8K prompts, c = 64/80/128 with 5 x c requests each.
+Target: TTFT p50 < 3 s. The throughput target ("2.5TPS") still needs to be pinned down: 2.5x the baseline output throughput, or something else?
+
+## TL;DR
+
+- Branch **`M3-perf-rebase-0923`** is M3-perf merged onto sglang main `4e60d70ba4`. That is the exact sglang commit of the latest image
+  `lmsysorg/sglang-rocm:v0.5.20-rocm724-mi35x-20260923` (digest `sha256:02108de8f9418a12425fb56415794fe82d180cb985488725d485e96d97a9a26b`).
+  It serves correctly on that image: **GSM8K-500 = 0.872** (the branch reference is 0.85-0.89) and EAGLE3 accept length 2.8 of 4.
+- First reproduction, 2 x TP4 behind the cache-aware router. It beats the given baseline on every row:
+
+  | conc | TTFT p50 ms (given -> here) | TTFT p90 ms | out tok/s/GPU | in tok/s/GPU | acc.len |
+  |---:|---:|---:|---:|---:|---:|
+  | 64 | 5,147 -> **4,921** | 22,294 -> 8,149 | 186 -> **246** | 21.2K -> 28.1K | 2.77 |
+  | 80 | 10,433 -> **6,567** | 21,436 -> 10,267 | 207 -> **353** | 23.6K -> 40.3K | 2.81 |
+  | 128 | 9,057 -> **8,541** | 43,705 -> 16,358 | 238 -> **439** | 27.2K -> 50.1K | 2.80 |
+
+  Raw data: `results/baseline_2xtp4_real.{json,log}`. This client's ITL column is per token (spec-decode bursts spread
+  evenly), so it is not comparable to the given 29 ms ITL. Compare TPS/user instead (44-51 here).
+- **The original node went bad.** After a few server restarts, every sglang server on it keeps its KFD queues evicted about 90% of the time.
+  Details are in "Why the original node was abandoned" below. Continue on a clean node.
+
+## Where TTFT goes (measured, for the next person optimizing)
+
+- One request's prefill on its own (7.4K new tokens on a 66.8K cached prefix, TP4) takes **213 ms**.
+- The closed-loop client plus fixed OSL makes arrivals **synchronized waves** of about c/2 requests per replica. They start together and finish together.
+  With `--chunked-prefill-size 8192`, one 7.4K prefill fits per forward pass, so a wave drains serially: burst of 8 = 1.66 s for the last request,
+  burst of 32 = 5.0 s for the last request (157 ms/request). That is the TTFT. Decode also stalls during these bursts (ITL p90 about 57 ms), because
+  SGLang disables mixed prefill+decode chunks under spec decode.
+- At c=128, `--max-running-requests 48` per replica (96 total) makes a third of the requests queue at the server.
+
+Levers, in the order I'd try them:
+1. `CHUNK=16384 EXTRA="--max-prefill-tokens 32768"` (two prefills per pass), then 32768/65536. Measure with `burst_ttft.py`.
+   A 32768 attempt on the bad node failed its server warmup; that is not yet separated from the node problem.
+2. `MAXRUN=64` so c=128 doesn't queue. This captures new graph batch sizes (52-64), so expect a longer startup.
+3. `FAIRNESS=0` versus 0.5 (the chunked-prefill fairness reserve splits chunks; it helps p99 but may hurt p50 under bursts).
+4. Prefill/decode disaggregation (1 prefill TP4 + 1 decode TP4, the final config of the vLLM MI355X blog). It keeps prefill bursts off the decode path.
+   It halves prefill capacity per wave, so check it with `burst_ttft.py` numbers first.
+5. `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ` is 4 here (the fast AgentX setting). `endpoint/ENDPOINT.md` shows 4 corrupts tool-call tags past ~60K context.
+   Use 1 for anything user-facing; it costs about 11% decode.
+
+## Reproduce on a clean node (8x MI355X, docker available)
+
+```bash
+docker run -it --network host --device /dev/kfd --device /dev/dri --group-add video --ipc host --shm-size 64g \
+  --security-opt seccomp=unconfined -v /scratch:/scratch \
+  lmsysorg/sglang-rocm@sha256:02108de8f9418a12425fb56415794fe82d180cb985488725d485e96d97a9a26b bash
+```
+
+Inside the container:
+
+```bash
+export M3_WORK=/scratch; mkdir -p $M3_WORK/models $M3_WORK/data $M3_WORK/logs
+# 1. sglang: the image's editable tree sits at exactly 4e60d70ba4, so check the branch out there (keeps the compiled rust extension)
+cd /sgl-workspace/sglang && git remote add kevin https://github.com/kevin-mii/sglang && git fetch kevin M3-perf-rebase-0923 \
+  && git checkout -b M3-perf-rebase-0923 FETCH_HEAD
+R=/sgl-workspace/sglang/benchmark/minimax_m3_mi355x
+# 2. aiter (image ships acf8fdf9): FlyDSL XCD-swizzle fix, rebased for this aiter, plus the M3 tuned MoE rows
+cd /sgl-workspace/aiter && git apply $R/rebase_0923/aiter_acf8fdf9_xcd_swizzle.patch \
+  && test "$(grep -c 'XCD remap is a bijection' aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py)" = 2 \
+  && cp $R/tuned_fmoe_m3_gfx950.csv aiter/configs/model_configs/minimax_m3_gfx950_perf_tuned_fmoe.csv
+# 3. weights (~250 GB) and GSM8K
+python -c "from huggingface_hub import snapshot_download as d; d('Inferact/MiniMax-M3-EAGLE3-GQA', local_dir='$M3_WORK/models/MiniMax-M3-EAGLE3-GQA'); d('amd/MiniMax-M3-MXFP4', local_dir='$M3_WORK/models/MiniMax-M3-MXFP4', max_workers=32)"
+python -c "from huggingface_hub import hf_hub_download as h; [h('openai/gsm8k', f'main/{s}-00000-of-00001.parquet', repo_type='dataset', local_dir='$M3_WORK/data/gsm8k') for s in ('train','test')]"
+# 4. servers, ONE AT A TIME, then the router
+cd $R/rebase_0923
+./up.sh 30001 0,1,2,3 && ./up.sh 30002 4,5,6,7
+setsid nohup python -m sglang_router.launch_router --worker-urls http://127.0.0.1:30001 http://127.0.0.1:30002 \
+  --policy cache_aware --host 0.0.0.0 --port 30000 > $M3_WORK/logs/router.log 2>&1 &
+# 5. quality gate (expect 0.85-0.89), then the benchmark (about 6 min)
+python -m sglang.test.few_shot_gsm8k --port 30001 --num-questions 500 --num-shots 5 --parallel 48
+python m3_prefix_bench.py --url http://127.0.0.1:30000 --warm-urls http://127.0.0.1:30001,http://127.0.0.1:30002 \
+  --conc 64,80,128 --gpus 8 --out $M3_WORK/logs/bench.json
+```
+
+Server config = `serve_m3.sh`, which is the `reproduce.sh real` config: MXFP4, fp8 KV, EAGLE3 GQA 3 steps / 4 draft tokens, custom AR, INT4 quick-reduce,
+Gluon sparse prefill, index top-k freq 4, long-prefix extend kernels, breakable prefill graphs, fairness reserve 0.5, mem 0.85, max-running 48.
+Knobs are environment variables: `CHUNK MAXRUN MEMFRAC STEPS DRAFT TOPK_FREQ FAIRNESS NOSPEC=1 EXTRA="..."`, e.g.
+`./up.sh 30001 0,1,2,3 CHUNK=16384 EXTRA="--max-prefill-tokens 32768"`.
+
+Probes: `single_ttft.py URL` (isolated prefill latency), `burst_ttft.py URL N` (N simultaneous prefills). Stop a server with `./stop_port.sh PORT`.
+
+## What changed on the branch (on top of M3-perf)
+
+- `294049c7d3`: `moe_sorting_small.py` accepts aiter's new `output=` buffer. Newer aiter passes it to `_moe_sorting_impl`, which the branch
+  monkeypatches. Without this fix, prefill graph capture dies with `TypeError: unexpected keyword argument 'output'`.
+- `22cbbbb1db`: merge of main `4e60d70ba4`, 13 conflicts. The non-trivial resolutions (details in the commit message):
+  - `schedule_policy.py`: main's PrefillAdder/prefill-budget refactor taken whole; the fairness reserve re-ported onto it.
+  - `topk.py`: the branch's shared-slot gate fold kept alongside main's JIT-grouped-topk append guard; the fold is disabled on main's new `dynamic_expert_bias` path.
+  - `minimax_sparse.py`: the Gluon/MSA prefill paths are skipped when HiSparse `loc_mapping` is set.
+  - `topk_sparse.py`: the HiSparse slot remap added to both the SUB_K and dense paths.
+  - `kvcache.cuh`: main's warp load/store with the branch's ROCm out-of-bounds write guard.
+- `rebase_0923/` (this directory): scripts, results, the aiter patch and this handoff.
+- Not yet done: flattening the merge into a linear rebase for upstreaming, and a full GSM8K-1000 / needle / 257K check on the merged branch
+  (only GSM8K-500 has been run).
+
+## Why the original node was abandoned
+
+Symptoms: weight loading at about 40 MB/s per GPU, prefill graph capture at 100-300 s per shape (versus 71 s for all 58), host-to-device copies at
+0.1-0.7 GB/s (53 GB/s when healthy), and kernel launch at 55-140 us (4.7 us when healthy). While any sglang server was up, this hit every
+GPU process on the box, including ones on GPUs the server did not use.
+
+Evidence: `/sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms` grows about 9 s per 10 s for every sglang process, from its first seconds,
+before weights load. A standalone torch process (1 or 4 GPUs, compute + H2D, with and without fork) shows 0 evictions on the same node. There was no VRAM
+leak, no GTT use, no cgroup limit or reclaim, and the PCIe links were Gen5 x16. It started after the first servers were stopped with SIGKILL (and
+one run with `TORCHINDUCTOR_COMPILE_THREADS` at default, where 128 inductor workers inherited `/dev/kfd`). Stuck teardowns sat in `D` state in
+`synchronize_srcu`. Root cause not found. It needs host access (dmesg, amdgpu driver state) or a reboot/driver reload.
+
+The container was also unusual: no docker, seccomp blocked unshare, and ROCm 7.0. The latest image was extracted into `/sgl-workspace/scratch/rootfs`
+and run natively after upgrading the container's glibc to 2.39 (backup in `/sgl-workspace/scratch/glibc_backup/`). A normal docker node needs none of that.
+
+## Operational rules learned the hard way
+
+- **Start replicas sequentially.** Two simultaneous 243 GB loads collapse H2D bandwidth.
+- **Never SIGKILL a live GPU server.** Use `stop_port.sh` (SIGTERM to the process group), then wait until `/sys/class/kfd/kfd/proc/` is empty
+  and no sglang process is in `D` state before starting the next one.
+- Keep `TORCHINDUCTOR_COMPILE_THREADS=1` (already set in `serve_m3.sh`): inductor's forked compile pool otherwise inherits `/dev/kfd`.
+- Health check for a node: `for f in /sys/class/kfd/kfd/proc/*/stats_*/evicted_ms; do cat $f; done` twice, 10 s apart, while a server runs.
+  If it grows by seconds, the node is in the bad state.
+- `pkill -f <pattern>` from a shell whose own command line contains the pattern kills that shell. Match PIDs by port instead.
