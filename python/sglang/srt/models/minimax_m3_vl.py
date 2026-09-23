@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -72,7 +70,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+        # no index_v_proj in the M3 checkpoint
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
@@ -85,7 +84,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -197,7 +196,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )
