@@ -518,6 +518,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         return_local_topk_ids=False,
         accumulate=True,
         output_aux=False,
+        output=None,
     ):
         if (
             not output_aux
@@ -545,7 +546,12 @@ def apply_aiter_small_moe_sort_patch() -> None:
             )
             num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
             if (expert_mask is not None) or accumulate:
-                moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+                # a caller buffer (newer aiter's `output=`) stands in; the small sort zero-fills it
+                moe_buf = (
+                    output
+                    if output is not None
+                    else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+                )
             else:
                 moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
             quant_ret = _run_small_sort(
@@ -583,6 +589,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
+            **({} if output is None else {"output": output}),
         )
 
     @functools.wraps(orig_mx_quant)
