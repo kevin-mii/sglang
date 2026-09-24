@@ -13,14 +13,15 @@ consumed as-is) and the activation is MXFP8-quantized in one fused pass.
 
 from __future__ import annotations
 
-import functools
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from sglang.kernels.jit.utils import cache_once
 
 # MXFP8 constants (OCP microscaling: 1x32 block, E8M0 shared scale).
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
@@ -335,9 +336,7 @@ def dot_scaled_mxfp8_blockscaled_linear(
     return out.to(output_dtype).view(*output_shape)
 
 
-# bf16-dequant route: both operands are exact in bf16, so only the fp32 sum order differs from MXFP8
-@dataclass(frozen=True, slots=True)
-class Fp8GridActivation:
+class Fp8GridActivation(msgspec.Struct, frozen=True):
     """A bf16 activation already on the fp8 e4m3 grid with a per-32 ue8m0 scale; the bf16-dequant
     linear skips fake_quant_fp8_activation for it, every other consumer unwraps .x. Not a
     tuple: a legacy (fp8, scale) pair check or a row slice must fail loudly."""
@@ -345,8 +344,7 @@ class Fp8GridActivation:
     x: torch.Tensor
 
 
-@dataclass(frozen=True, slots=True)
-class Mxfp8Activation:
+class Mxfp8Activation(msgspec.Struct, frozen=True):
     """An activation quantized as the CUDA MXFP8 route quantizes it: q fp8 e4m3 [M, K] and
     scale ue8m0 exponent bytes [M, K // 32]; dequantized it is the Fp8GridActivation of
     the same input."""
@@ -461,7 +459,7 @@ def dequant_block_fp8_weight_to_bf16(
 SKINNY_GEMM_MAX_TOKENS = 2
 
 
-@functools.cache
+@cache_once
 def _skinny_cu_count() -> int:
     try:
         from aiter.jit.utils.chip_info import get_cu_num
@@ -470,6 +468,7 @@ def _skinny_cu_count() -> int:
     return int(get_cu_num())
 
 
+# both operands are exact in bf16, so only the fp32 sum order differs from the MXFP8 route
 def bf16_dequant_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -490,7 +489,6 @@ def bf16_dequant_blockscaled_linear(
         bias is None
         and x.shape[0] <= SKINNY_GEMM_MAX_TOKENS
         and cu_count > 0
-        and weight.dtype == torch.bfloat16
         and weight.is_contiguous()
         and weight.shape[1] % 8 == 0
     ):

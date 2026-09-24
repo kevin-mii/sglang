@@ -5,14 +5,13 @@ or hipBLASLt bf16 per the tuned table in mxfp8_gemv_gfx95_configs.json."""
 
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -38,8 +37,7 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "mxfp8_gemv_gfx95_configs.
 M_BUCKETS = (1, 2, 4, 8, 16, 32)
 
 
-@dataclass(frozen=True)
-class GemvConfig:
+class GemvConfig(msgspec.Struct, frozen=True):
     waves: int = 8  # waves per workgroup: 4, 8, 16
     steps: int = 1  # 128-K steps in flight per wave: 1, 2, 4
     rows: int = 16  # weight rows per wave tile: 16, 32
@@ -80,7 +78,7 @@ def _m_bucket(m: int) -> int:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@cache_once
 def _config_table(section: str) -> Dict[str, str]:
     """One {'gfx950:N:K:M_bucket': entry} section of CONFIG_FILE."""
     try:
@@ -97,7 +95,7 @@ def _config_table(section: str) -> Dict[str, str]:
     return {str(key): str(value) for key, value in table.get(section, {}).items()}
 
 
-@functools.lru_cache(maxsize=None)
+@cache_once
 def _gfx_name() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
@@ -107,7 +105,7 @@ def select_config(m: int, n: int, k: int) -> GemvConfig:
     return _select_config(_m_bucket(m), n, k)
 
 
-@functools.lru_cache(maxsize=None)
+@cache_once
 def _select_config(bucket: int, n: int, k: int) -> GemvConfig:
     table = _config_table("configs")
     key = f"{_gfx_name()}:{n}:{k}:{bucket}"
@@ -164,25 +162,23 @@ def mxfp8_gemv(
 ) -> torch.Tensor:
     """out[M, N] bf16 = x[M, K] . W^T on the gfx950 scaled matrix core; x is fp8 e4m3 with
     x_scale ue8m0 [M, K/32] or bf16 quantized in-kernel; config overrides the table."""
-    assert x.dim() == 2 and x.is_contiguous(), x.shape
+    # shapes, contiguity and the M range are checked by the launcher's TensorMatcher
     m, k = x.shape
     n = weight_shuffled.shape[0] * _TILE_N
-    assert 1 <= m <= MXFP8_GEMV_MAX_TOKENS, m
     x_bf16 = x.dtype == torch.bfloat16
     if x_bf16:
         x_scale = empty_sentinel(x.device, torch.uint8)
     else:
+        # the kernel takes the fp8 bytes, so the launcher cannot tell fp8 from uint8
         assert x.dtype == torch.float8_e4m3fn and x_scale is not None, x.dtype
-        assert x_scale.dtype == torch.uint8 and x_scale.shape == (m, k // 32), (
-            x_scale.shape
-        )
         x_scale = x_scale.contiguous()
-        # the kernel takes the fp8 bytes
         x = x.view(torch.uint8)
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
-    cfg = config or select_config(m, n, k)
-    assert cfg.valid_for(m, n), (cfg, m, n, k)
-    _jit_mxfp8_gemv_module(cfg, x_bf16).run(
+    if config is None:
+        config = select_config(m, n, k)
+    else:
+        assert config.valid_for(m, n), (config, m, n, k)
+    _jit_mxfp8_gemv_module(config, x_bf16).run(
         weight_shuffled, weight_scale_ue8m0, x, x_scale, out
     )
     return out
