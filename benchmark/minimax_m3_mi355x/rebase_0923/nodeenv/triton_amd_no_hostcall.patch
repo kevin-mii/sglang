@@ -1,0 +1,18 @@
+--- triton/backends/amd/compiler.py	2026-09-24 22:35:12.339308207 +0000
++++ triton/backends/amd/compiler.py	2026-09-24 22:35:12.354307914 +0000
+@@ -515,7 +515,14 @@
+         # Disable inlining of print related functions,
+         # because inlining of these function could slow down compilation significantly
+         amd.disable_print_inline(llvm_mod)
+-        return str(llvm_mod)
++        # GPUs without PCIe atomics (e.g. MI350X VFs) cannot dispatch kernels whose code object keeps a hostcall buffer.
++        # Kernels that read the implicit-arg block (tl.num_programs) keep it conservatively; mark them hostcall-free
++        # unless they really print/assert.
++        llir = str(llvm_mod)
++        if os.environ.get("TRITON_AMD_NO_HOSTCALL_PTR", "1") == "1" and "hostcall" not in llir and "printf" not in llir:
++            kernel_fn.add_fn_attr("amdgpu-no-hostcall-ptr", "")
++            llir = str(llvm_mod)
++        return llir
+ 
+     @staticmethod
+     def make_amdgcn(src, metadata, options):

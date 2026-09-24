@@ -905,6 +905,9 @@ class Envs:
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Build JIT kernels with buffered device printf instead of hostcall. GPUs without
+    # PCIe atomics (e.g. MI350X VFs) cannot dispatch kernels that keep a hostcall buffer.
+    SGLANG_ROCM_NO_HOSTCALL = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.

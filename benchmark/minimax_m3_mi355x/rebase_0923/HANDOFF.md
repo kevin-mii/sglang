@@ -21,27 +21,74 @@ Target: TTFT p50 < 3 s. The throughput target ("2.5TPS") still needs to be pinne
   evenly), so it is not comparable to the given 29 ms ITL. Compare TPS/user instead (44-51 here).
 - **The original node went bad.** After a few server restarts, every sglang server on it keeps its KFD queues evicted about 90% of the time.
   Details are in "Why the original node was abandoned" below. Continue on a clean node.
+- **2026-09-24, node 2 (8x MI350X VF): all targets met** once routing was fixed. The default `cache_aware` router sent 100% of c=64
+  traffic to one replica. With `--policy round_robin` and `MAXRUN=64` (details in "Node attempt 2"):
 
-## Node attempt 2 (2026-09-24): environment works, node lacks PCIe atomics
+  | conc | TTFT p50 ms (cache_aware, maxrun 48 -> round_robin, maxrun 64) | TTFT p90 ms | out tok/s/GPU | acc.len |
+  |---:|---:|---:|---:|---:|
+  | 64 | 5,557 -> **317** | 9,400 -> 3,713 | 218 -> **390** | 2.76 |
+  | 80 | 7,280 -> **410** | 11,886 -> 4,713 | 306 -> **417** | 2.78 |
+  | 128 | 17,170 -> **680** | 21,487 -> 7,555 | 363 -> **469** (3.75K total) | 2.81 |
 
-A second node (k3s pod, 8x **"AMD Instinct MI350X VF"**, ROCm 7.0 / sglang 0.5.14 / glibc 2.35 in the pod, no docker) got as far as
-server startup. The image environment works through proot (below). The server then fails in the first prefill-graph warmup on a
-node-level limitation, so no benchmark numbers came from this node.
+  GSM8K-500 = 0.878 on the final config. All numbers use `SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4`, which corrupts long-context
+  tool-call output (`endpoint/ENDPOINT.md`). Raw data: `results/node2_0924/`.
 
-- **Failure:** `hipModuleLaunchKernel(...) failed with 'hipErrorIllegalState'`, surfacing as `RuntimeError: HIP error` in
-  `qr_all_reduce` during `Capturing prefill shape (num_tokens=8192)`. With `AMD_LOG_LEVEL=1` the runtime says why:
-  `rocvirtual.cpp:3650 Pcie atomics not enabled, hostcall not supported` then `AQL dispatch failed!`.
-  On these virtual-function GPUs, PCIe atomics are off, so any kernel whose code object has a `hidden_hostcall_buffer` argument cannot dispatch.
-- **Suspected kernel (not yet confirmed):** aiter's FlyDSL bf16 GEMM. All 592 cached `flydsl_cache/gemm_a16w16_gfx950_*` objects carry
-  `hidden_hostcall_buffer`. The FlyDSL MoE caches and the sglang Triton cache do not. The tuned bf16 CSVs route shapes to it
-  (`model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv` has 125 `flydsl` rows). Several prebuilt aiter modules also contain
-  hostcall kernels (`module_custom`, `module_moe_asm`, `module_moe_ck2stages_*`, `module_topk_plain`, `module_top_k_per_row`, ...).
-  If a node like this has to be used, try dropping or rerouting the `flydsl` rows (for example to `hipblaslt`) and rerun with `AMD_LOG_LEVEL=1`.
-  Quick-reduce and custom AR themselves pass a standalone 4-rank eager + graph test on this node.
-- **Preflight for the next node:** start one replica with `AMD_LOG_LEVEL=1` added to its knobs and
-  `grep -a "Pcie atomics not enabled" $M3_WORK/logs/server_30001.log`. Any hit means the node cannot run this stack as-is. MI355X bare metal
-  (the original node) did not have this problem.
-- Healthy otherwise: `evicted_ms` stayed 0, weights loaded in 24.5 s per rank, H2D 57 GB/s, bf16 GEMM 1.14 PFLOP/s, P2P between all 8 GPUs.
+## Node attempt 2 (2026-09-24): MI350X VF node, no PCIe atomics, runs after hostcall workarounds
+
+Node: k3s pod, 8x **"AMD Instinct MI350X VF"**, ROCm 7.0 / sglang 0.5.14 / glibc 2.35 in the pod, no docker. The image runs through
+proot (next section). Healthy otherwise: `evicted_ms` stayed 0, weights load in 24.5 s per rank, H2D 57 GB/s, bf16 GEMM 1.14 PFLOP/s,
+P2P works between all 8 GPUs. One isolated 7.4K-token prefill on a 66.8K cached prefix takes 235 ms here (213 ms on the MI355X node).
+
+### Hostcall: the node-level blocker and its workarounds
+
+On these VFs **PCIe atomics are off**. The HIP runtime refuses to dispatch any kernel whose code object carries a `hidden_hostcall_buffer`
+argument (device printf/assert, or implicit-arg reads the compiler can't analyze). The symptom is `hipErrorIllegalState` from
+`hipModuleLaunchKernel`, usually surfacing later as a bare `HIP error` in some other op (first seen in `qr_all_reduce`). Run with `AMD_LOG_LEVEL=1`;
+the runtime then logs `rocvirtual.cpp:3650 Pcie atomics not enabled, hostcall not supported` / `AQL dispatch failed!`.
+**Preflight on any new node:** start one replica with `AMD_LOG_LEVEL=1` and grep for that line.
+To find the kernel: `grep -a -l hidden_hostcall_buffer` over the kernel caches (Triton `/root/.cache/sglang/triton`, aiter `aiter/jit/*.so` and
+`flydsl_cache`, sglang JIT `/root/.cache/sglang/jit`).
+
+Four kernels on the M3 path hit this. Each has a fix, and none changes what the kernel computes:
+
+| Kernel | Cause | Fix |
+|---|---|---|
+| aiter FlyDSL bf16 hgemm (`flydsl_cache/gemm_a16w16_gfx950_*`; the only FlyDSL family with hostcall, MoE kernels are clean) | FlyDSL codegen doesn't mark kernels hostcall-free | `AITER_CONFIG_GEMM_BF16=` a copy of the bf16 tuned table without `flydsl` rows (`nodeenv/aiter_bf16_nohostcall_csv.py`; 1,620 of 3,701 rows dropped, those shapes use aiter's torch fallback) |
+| Triton `_index_block_score_only_kernel` (M3 sparse prefill; uses `tl.num_programs`) | implicit-arg read keeps the hostcall slot | patch Triton's AMD backend to add `amdgpu-no-hostcall-ptr` to every kernel that doesn't print (`nodeenv/triton_amd_no_hostcall.patch`, applies to `/opt/venv/lib/python3.12/site-packages/triton/backends/amd/compiler.py`; env `TRITON_AMD_NO_HOSTCALL_PTR=0` disables it) |
+| sglang JIT `build_tree_kernel_efficient` (EAGLE tree; `printf` warning in `sgl_kernel/speculative/eagle.cuh`) | hostcall printf | `SGLANG_ROCM_NO_HOSTCALL=1` builds sglang JIT kernels with `-mprintf-kind=buffered` (on this branch, `kernels/jit/utils/arch.py`) |
+| aiter CK `mha_batch_prefill_fp8bf16_*` (long-prefix extend, `SGLANG_USE_AITER_EXTEND_LONG_PREFIX`) | device `assert()` -> `__assert_fail` | `AITER_NO_HOSTCALL=1` builds aiter JIT modules with `-mprintf-kind=buffered -DNDEBUG` (`nodeenv/aiter_jit_no_hostcall.patch`, apply in `/sgl-workspace/aiter`) |
+
+Delete an already-built module/cache entry after applying a fix so it gets rebuilt. Prebuilt aiter modules that still contain hostcall kernels
+(`module_custom`, `module_moe_asm`, `module_moe_ck2stages_*`, `module_topk_plain`, `module_top_k_per_row`, `module_moe_opus`) are not loaded by this
+config. If one fails later, delete its `.so` so aiter rebuilds it with `AITER_NO_HOSTCALL=1`. Quick-reduce and custom AR are fine (standalone
+4-rank eager + graph test `nodeenv/qr_test.py`).
+
+Server knobs used on this node (both replicas):
+`AMD_LOG_LEVEL=1 SGLANG_ROCM_NO_HOSTCALL=1 AITER_NO_HOSTCALL=1 AITER_CONFIG_GEMM_BF16=/scratch/m3/aiter_cfg/bf16_tuned_gemm_nohostcall.csv MAXRUN=64`,
+everything else as `serve_m3.sh` (git `2f0da89e4b` plus the `arch.py`/`environ.py` change in the commit that added this section).
+Router: `python -m sglang_router.launch_router --worker-urls http://127.0.0.1:30001 http://127.0.0.1:30002 --policy round_robin --port 30000`.
+GSM8K-500: 0.892 (maxrun 48) and 0.878 (maxrun 64).
+
+### Results on this node (TOPK_FREQ=4; see the note in TL;DR)
+
+| config | c=64 TTFT p50 / p90 ms, out/s/GPU | c=80 | c=128 |
+|---|---|---|---|
+| cache_aware router (default), maxrun 48 | 5,557 / 9,400, 218 | 7,280 / 11,886, 306 | 17,170 / 21,487, 363 |
+| round_robin, maxrun 48 | 327 / 3,737, 391 | 434 / 4,737, 416 | 5,381 / 9,491, 434 |
+| **round_robin, maxrun 64** | **317** / 3,713, 390 | **410** / 4,713, 417 | **680** / 7,555, **469** |
+
+Files: `results/node2_0924/bench_{baseline,rr,rr_maxrun64}.{json,log}` and per-replica load every 2 s in `load_*.csv` (`load_sampler.py`).
+
+- **Why the router mattered:** under `cache_aware`, c=64 put all requests on 30002 (48 running + 16 queued) while 30001 sat idle. c=80 gave 30001
+  about 8 requests, and c=128 about 32 (30002: 47 running + 48 queued). The defaults `--balance-abs-threshold 64 --balance-rel-threshold 1.5` never
+  trigger at these concurrencies, and every request matches the same 90% prefix. The handoff's MI355X baseline table was measured the same
+  way and probably has the same imbalance. `round_robin` keeps both replicas at c/2 (the bench warms the prefix on both).
+- **MAXRUN=64** removes the per-replica queue at c=128 (64 clients per replica vs 48 slots): p50 5.4 s -> 0.68 s, output +8%.
+- TTFT p90 is still 3.7-7.6 s: the first wave of each level is c/2 simultaneous prefills per replica, drained one per forward
+  (see "Where TTFT goes"). Chunk size, the fairness reserve and PD disaggregation from that list were not tried; they target p90 now.
+- Untried: `power_of_two` or `cache_aware --balance-abs-threshold 1` (load-aware). Round-robin is load-oblivious, but closed-loop load stayed even here.
+- Pitfall: rerunning the bench with the same seed after an aborted run inflates `cache%` (95% instead of 90%) and flatters TTFT.
+  `POST /flush_cache` on each replica first.
 
 ### Setup on a pod without docker, mounts or unshare (proot)
 
@@ -70,14 +117,8 @@ Run other tools as `/scratch/m3/bin/inimg python ...`.
   Steady-state serving is unaffected. Startup pays about 100 s extra for Python imports, because one tracer process serves all TP ranks.
 - `/opt/rocm` in the rootfs is an absolute symlink. Inspect it through inimg (`/opt/rocm-7.2.4/.info/version` = 7.2.4), not from the host.
 
-### Untested lever found while reading the router (check this first when benchmarking)
-
-`sglang_router` `cache_aware` defaults are `--balance-abs-threshold 64 --balance-rel-threshold 1.5 --cache-threshold 0.3`.
-Every request here shares the same 90% prefix, so prefix matching favors whichever worker the router's tree saw first. Rebalancing
-only starts when the load gap exceeds 64, which can never happen at c=64 and barely at c=128. The two replicas may be very unevenly
-loaded, which would inflate TTFT (and explain c=64 out tok/s being far below c=128). Measure with
-`load_sampler.py OUT.csv http://127.0.0.1:30001 http://127.0.0.1:30002` during a run. Try `--balance-abs-threshold 4` (or
-`--policy round_robin`/`power_of_two`: both replicas are prefix-warmed by the bench) before any server-side knob.
+- Stop servers with `nodeenv/stop_graceful.sh PORT` (SIGTERM to the process group, waits up to 180 s, never SIGKILLs; `stop_port.sh` SIGKILLs after 20 s).
+  The router renames itself `sglang::router`; find its PID by that name, not by `launch_router`.
 
 ## Relation to the cookbook recipe
 

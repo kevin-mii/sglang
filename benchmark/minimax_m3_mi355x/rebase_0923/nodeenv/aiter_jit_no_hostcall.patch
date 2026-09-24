@@ -1,0 +1,14 @@
+diff --git a/aiter/jit/core.py b/aiter/jit/core.py
+index 0129dd460..d745ffe18 100644
+--- a/aiter/jit/core.py
++++ b/aiter/jit/core.py
+@@ -1159,6 +1159,9 @@ def build_module(
+ 
+         flags_cc += flags_extra_cc
+         flags_hip += flags_extra_hip
++        if os.environ.get("AITER_NO_HOSTCALL") == "1":
++            # device printf via a buffer, not hostcall: GPUs without PCIe atomics (e.g. MI350X VFs) can't dispatch hostcall kernels
++            flags_hip += ["-mprintf-kind=buffered", "-DNDEBUG"]
+         archs = validate_and_update_archs()
+         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+         flags_hip = sorted(set(flags_hip))  # remove same flags

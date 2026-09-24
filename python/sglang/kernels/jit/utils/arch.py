@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils.common import (
     is_hip_runtime,
     is_musa_runtime,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,8 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
                 flags.append("-DHIP_FP8_TYPE_E4M3=1")
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
+        if envs.SGLANG_ROCM_NO_HOSTCALL.get():
+            flags.append("-mprintf-kind=buffered")
         return flags
     else:
         if arch is None:

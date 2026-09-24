@@ -13,13 +13,14 @@ It has the full context, setup commands, first results, measured TTFT analysis, 
 - Client: `rebase_0923/m3_prefix_bench.py` (prints the report table).
 
 ## Targets
-- **TTFT p50 < 3 s** at every concurrency (currently 4.9 / 6.6 / 8.5 s at c = 64 / 80 / 128).
-- **>= 2.5K output tok/s total (8 GPUs) at c = 128.** Already met: 3.5K (439/GPU). Keep it while fixing TTFT.
+- **TTFT p50 < 3 s** at every concurrency. Met on 2026-09-24 (node 2): 0.32 / 0.41 / 0.68 s with `--policy round_robin` and `MAXRUN=64`
+  (HANDOFF "Node attempt 2"). The default cache_aware router puts almost all traffic on one replica. p90 (3.7-7.6 s) is what's left.
+- **>= 2.5K output tok/s total (8 GPUs) at c = 128.** Met: 3.75K (469/GPU) on node 2. Keep it while fixing TTFT.
 - Quality must hold: GSM8K-500 5-shot in 0.85-0.89 on any config you report.
 
 ## Steps
 1. **Node health first.** No docker? Use HANDOFF "Setup on a pod without docker" (proot). Run the PCIe-atomics preflight from
-   HANDOFF "Node attempt 2" on the first start. Otherwise follow HANDOFF "Reproduce on a clean node" (docker image by digest, branch checkout at `/sgl-workspace/sglang`,
+   HANDOFF "Node attempt 2" on the first start; on a hit, apply the four hostcall workarounds listed there. Otherwise follow HANDOFF "Reproduce on a clean node" (docker image by digest, branch checkout at `/sgl-workspace/sglang`,
    the aiter patch plus tuned CSV, weights). Then run the eviction check from HANDOFF "Operational rules" while one replica starts.
    If `evicted_ms` grows by seconds per 10 s, or `/health` takes more than about 10 min, stop and report: the node is bad.
 2. **Reproduce the baseline table** (2 x TP4 + cache-aware router, default `serve_m3.sh`). It should land near
