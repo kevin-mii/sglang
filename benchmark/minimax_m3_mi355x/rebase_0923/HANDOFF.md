@@ -22,6 +22,63 @@ Target: TTFT p50 < 3 s. The throughput target ("2.5TPS") still needs to be pinne
 - **The original node went bad.** After a few server restarts, every sglang server on it keeps its KFD queues evicted about 90% of the time.
   Details are in "Why the original node was abandoned" below. Continue on a clean node.
 
+## Node attempt 2 (2026-09-24): environment works, node lacks PCIe atomics
+
+A second node (k3s pod, 8x **"AMD Instinct MI350X VF"**, ROCm 7.0 / sglang 0.5.14 / glibc 2.35 in the pod, no docker) got as far as
+server startup. The image environment works through proot (below). The server then fails in the first prefill-graph warmup on a
+node-level limitation, so no benchmark numbers came from this node.
+
+- **Failure:** `hipModuleLaunchKernel(...) failed with 'hipErrorIllegalState'`, surfacing as `RuntimeError: HIP error` in
+  `qr_all_reduce` during `Capturing prefill shape (num_tokens=8192)`. With `AMD_LOG_LEVEL=1` the runtime says why:
+  `rocvirtual.cpp:3650 Pcie atomics not enabled, hostcall not supported` then `AQL dispatch failed!`.
+  On these virtual-function GPUs, PCIe atomics are off, so any kernel whose code object has a `hidden_hostcall_buffer` argument cannot dispatch.
+- **Suspected kernel (not yet confirmed):** aiter's FlyDSL bf16 GEMM. All 592 cached `flydsl_cache/gemm_a16w16_gfx950_*` objects carry
+  `hidden_hostcall_buffer`. The FlyDSL MoE caches and the sglang Triton cache do not. The tuned bf16 CSVs route shapes to it
+  (`model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv` has 125 `flydsl` rows). Several prebuilt aiter modules also contain
+  hostcall kernels (`module_custom`, `module_moe_asm`, `module_moe_ck2stages_*`, `module_topk_plain`, `module_top_k_per_row`, ...).
+  If a node like this has to be used, try dropping or rerouting the `flydsl` rows (for example to `hipblaslt`) and rerun with `AMD_LOG_LEVEL=1`.
+  Quick-reduce and custom AR themselves pass a standalone 4-rank eager + graph test on this node.
+- **Preflight for the next node:** start one replica with `AMD_LOG_LEVEL=1` added to its knobs and
+  `grep -a "Pcie atomics not enabled" $M3_WORK/logs/server_30001.log`. Any hit means the node cannot run this stack as-is. MI355X bare metal
+  (the original node) did not have this problem.
+- Healthy otherwise: `evicted_ms` stayed 0, weights loaded in 24.5 s per rank, H2D 57 GB/s, bf16 GEMM 1.14 PFLOP/s, P2P between all 8 GPUs.
+
+### Setup on a pod without docker, mounts or unshare (proot)
+
+This pod had `CAP_SYS_ADMIN`/`CAP_SYS_CHROOT`, but AppArmor (`cri-containerd.apparmor.d`) blocks `mount` and `unshare`, so chroot has no
+`/proc`, `/sys` or `/dev`. 254 of the image's objects need glibc >= 2.38, so they can't run natively on the pod's 2.35 either.
+Swapping the pod's glibc (what attempt 1 did) was not needed. Everything below lives under `/scratch/m3` and leaves the pod untouched.
+
+```bash
+N=benchmark/minimax_m3_mi355x/rebase_0923/nodeenv   # in a host-side clone of this branch
+mkdir -p /scratch/m3/{image,bin,models,data,logs}
+python $N/image_pull.py              # pulls the pinned digest from Docker Hub by manifest (26.6 GB, 47 gzip layers)
+bash   $N/image_extract.sh           # applies layers with OCI whiteouts into /scratch/m3/image/rootfs (68 GB)
+curl -sSL -o /scratch/m3/bin/proot https://proot.gitlab.io/proot/bin/proot && chmod +x /scratch/m3/bin/proot
+cp $N/inimg $N/up_host.sh /scratch/m3/bin/
+/scratch/m3/bin/inimg python -c "import torch; print(torch.__version__, torch.cuda.device_count())"   # 2.11.0+rocm7.2 8
+```
+
+Then follow "Reproduce on a clean node" steps 1-3 against the rootfs (`/scratch/m3/image/rootfs/sgl-workspace/{sglang,aiter}`; host-side
+`git` on those paths is fine). Use `M3_WORK=/scratch/m3` (inimg sets it). Start servers from the host with
+`/scratch/m3/bin/up_host.sh 30001 0,1,2,3 [KNOB=...]`, not `inimg ./up.sh`: proot waits for every traced child, so the latter never returns.
+Run other tools as `/scratch/m3/bin/inimg python ...`.
+`stop_port.sh` works from the host (same PID namespace).
+
+- `inimg` defaults its cwd to `/tmp`. From `/sgl-workspace`, the `sglang/` directory shadows the editable install as a namespace package.
+- proot overhead (seccomp fast path active): kernel launch 3.7 us (native 4.5), graph replay identical, `getpid` unchanged, `stat` 19 us (native 0.9).
+  Steady-state serving is unaffected. Startup pays about 100 s extra for Python imports, because one tracer process serves all TP ranks.
+- `/opt/rocm` in the rootfs is an absolute symlink. Inspect it through inimg (`/opt/rocm-7.2.4/.info/version` = 7.2.4), not from the host.
+
+### Untested lever found while reading the router (check this first when benchmarking)
+
+`sglang_router` `cache_aware` defaults are `--balance-abs-threshold 64 --balance-rel-threshold 1.5 --cache-threshold 0.3`.
+Every request here shares the same 90% prefix, so prefix matching favors whichever worker the router's tree saw first. Rebalancing
+only starts when the load gap exceeds 64, which can never happen at c=64 and barely at c=128. The two replicas may be very unevenly
+loaded, which would inflate TTFT (and explain c=64 out tok/s being far below c=128). Measure with
+`load_sampler.py OUT.csv http://127.0.0.1:30001 http://127.0.0.1:30002` during a run. Try `--balance-abs-threshold 4` (or
+`--policy round_robin`/`power_of_two`: both replicas are prefix-warmed by the bench) before any server-side knob.
+
 ## Relation to the cookbook recipe
 
 `docs/cookbook/autoregressive/MiniMax/MiniMax-M3.mdx` recommends, for MI350X/MI355X, **MXFP8 at `--tp 8`, `--mem-fraction-static 0.80`, no speculative decoding**.

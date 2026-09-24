@@ -1,0 +1,11 @@
+#!/bin/bash
+# inimg CMD...: run CMD inside the ROCm 7.2.4 sglang image rootfs via proot (no mounts/chroot allowed in this pod)
+R=${M3_ROOTFS:-/scratch/m3/image/rootfs}
+cp -f /etc/resolv.conf /etc/hosts $R/etc/ 2>/dev/null
+exec ${PROOT:-/scratch/m3/bin/proot} -r $R -b /proc -b /sys -b /dev -b /dev/shm -b /scratch -b /tmp -w "${INIMG_CWD:-/tmp}" \
+  /usr/bin/env -i HOME=/root TERM=xterm M3_WORK=/scratch/m3 HF_TOKEN="${HF_TOKEN:-}" HF_HOME=/scratch/m3/hf \
+  PATH=/root/.cargo/bin:/opt/venv/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LD_LIBRARY_PATH=/opt/rocm/lib HSA_ENABLE_IPC_MODE_LEGACY=1 HIP_FORCE_DEV_KERNARG=1 HSA_NO_SCRATCH_RECLAIM=1 \
+  SGLANG_USE_AITER=1 SGLANG_SET_CPU_AFFINITY=1 SGLANG_DISABLE_CUDNN_CHECK=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+  SGLANG_MOE_PADDING=1 AITER_USE_SYSTEM_TRITON=1 PYTORCH_ROCM_ARCH="gfx942;gfx950" GPU_ARCH=gfx950-rocm724 LC_ALL=C.UTF-8 \
+  "$@"
