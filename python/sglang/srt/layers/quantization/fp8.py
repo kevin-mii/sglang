@@ -933,7 +933,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
-        elif backend.is_gfx95():
+        elif backend.is_gfx95_mxfp8_native():
             fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -1147,7 +1147,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if _is_hip:
-            if self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
+            if (
+                self.block_fp8_as_mxfp8
+                and self.mxfp8_dense_backend.is_gfx95_mxfp8_native()
+            ):
                 return fp8_hip.apply_dense(self, layer, x, bias)
             # the gfx950 producers wrap their operand only for the gfx950 routes above
             assert not isinstance(x, (Fp8GridActivation, Mxfp8Activation)), type(x)
