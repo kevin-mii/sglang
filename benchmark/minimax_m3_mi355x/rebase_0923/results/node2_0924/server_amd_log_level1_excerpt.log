@@ -1,0 +1,60 @@
+GIT: 2f0da89e4bffca6a5f3a571a69653291ccd9cfd2 Thu Sep 24 22:08:21 UTC 2026
+AITER_USE_SYSTEM_TRITON=1
+HIP_FORCE_DEV_KERNARG=1
+HIP_VISIBLE_DEVICES=0,1,2,3
+NCCL_MIN_NCHANNELS=112
+ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5
+SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144
+SGLANG_DISABLE_CUDNN_CHECK=1
+SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1
+SGLANG_M3_ALLOW_CUSTOM_AR=1
+SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4
+SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1
+SGLANG_MOE_PADDING=1
+SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL=1
+SGLANG_SET_CPU_AFFINITY=1
+SGLANG_TIMEOUT_KEEP_ALIVE=3600
+SGLANG_TRITON_EXTEND_LONG_PREFIX=1
+SGLANG_USE_AITER=1
+SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1
+ARGS: tp=4 mem=0.85 maxrun=48 chunk=8192 steps=3 draft=4 extra=
+/sgl-workspace/sglang/python/sglang/launch_server.py:71: UserWarning: 'python -m sglang.launch_server' is still supported, but 'sglang serve' is the recommended entrypoint.
+  Example: sglang serve --model-path <model> [options]
+  warnings.warn(
+[2026-09-24 22:08:27] Registered linear attn model: config=GigaChat35Config, backend=GDNAttnBackend, archs=['GigaChat35ForCausalLM', 'GigaChat35ForCausalLMNextN']
+[aiter] import [module_aiter_core] under /sgl-workspace/aiter/aiter/jit/module_aiter_core.so
+[aiter] merge tuned file under model_configs/ and configs/ /sgl-workspace/aiter/aiter/configs/bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/minimax_m3_eagle_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/qwen32B_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/glm47_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/dsv4_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/qwen3_5_397b_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/q3vl_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/kimik3_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/glm5_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/flux2_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/kimi_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/qwen3_8b_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/dsv3_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/llama70B_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/glm53_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/llama405B_bf16_tuned_gemm.csv:/sgl-workspace/aiter/aiter/configs/model_configs/kimik2_bf16_tuned_gemm.csv
+[2026-09-24 22:08:35] aiter fused_qk_norm_mrope_3d kernel available
+[2026-09-24 22:08:36] Tokenizer for /scratch/m3/models/MiniMax-M3-MXFP4 is still TokenizersBackend after retries with --trust-remote-code. Model-specific tokenizer attributes may be missing.
+...
+[2026-09-24 22:10:09 TP0] Load weight end. elapsed=15.50 s, type=MiniMaxM3SparseForConditionalGeneration, quant=quark, avail mem=220.06 GB, mem usage=57.97 GB.
+[2026-09-24 22:10:09 TP1] Load weight end. elapsed=15.77 s, type=MiniMaxM3SparseForConditionalGeneration, quant=quark, avail mem=220.03 GB, mem usage=57.97 GB.
+[2026-09-24 22:10:10 TP3] Load weight end. elapsed=16.76 s, type=MiniMaxM3SparseForConditionalGeneration, quant=quark, avail mem=220.15 GB, mem usage=57.97 GB.
+[2026-09-24 22:10:10 TP2] Load weight end. elapsed=17.05 s, type=MiniMaxM3SparseForConditionalGeneration, quant=quark, avail mem=220.06 GB, mem usage=57.97 GB.
+[2026-09-24 22:10:14 TP2] Load weight end. elapsed=0.18 s, type=LlamaForCausalLMEagle3, avail mem=218.54 GB, mem usage=1.65 GB.
+[2026-09-24 22:10:14 TP3] Load weight end. elapsed=0.19 s, type=LlamaForCausalLMEagle3, avail mem=218.63 GB, mem usage=1.65 GB.
+[2026-09-24 22:10:14 TP1] Load weight end. elapsed=0.25 s, type=LlamaForCausalLMEagle3, avail mem=218.51 GB, mem usage=1.65 GB.
+[2026-09-24 22:10:14 TP0] Load weight end. elapsed=0.25 s, type=LlamaForCausalLMEagle3, avail mem=218.54 GB, mem usage=1.65 GB.
+[2026-09-24 22:10:17 TP3] Capture target prefill CUDA graph begin. backend=breakable, num_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048, 2
+[2026-09-24 22:10:17 TP2] Capture target prefill CUDA graph begin. backend=breakable, num_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048, 2
+[2026-09-24 22:10:18 TP1] Capture target prefill CUDA graph begin. backend=breakable, num_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048, 2
+[2026-09-24 22:10:18 TP0] Capture target prefill CUDA graph begin. backend=breakable, num_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048, 2
+:1:rocvirtual.cpp           :3650: 5626911410317 us:  Pcie atomics not enabled, hostcall not supported
+:1:rocvirtual.cpp           :3990: 5626911410340 us:  AQL dispatch failed!
+'hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, extra)' failed with 'hipErrorIllegalState'
+[2026-09-24 22:10:25 TP2] RuntimeError: HIP error
+:1:rocvirtual.cpp           :3650: 5626912618498 us:  Pcie atomics not enabled, hostcall not supported
+:1:rocvirtual.cpp           :3990: 5626912618534 us:  AQL dispatch failed!
+'hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, extra)' failed with 'hipErrorIllegalState'
+[2026-09-24 22:10:26 TP3] RuntimeError: HIP error
+:1:rocvirtual.cpp           :3650: 5626912837591 us:  Pcie atomics not enabled, hostcall not supported
+:1:rocvirtual.cpp           :3990: 5626912837613 us:  AQL dispatch failed!
+'hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, extra)' failed with 'hipErrorIllegalState'
+:1:rocvirtual.cpp           :3650: 5626912842454 us:  Pcie atomics not enabled, hostcall not supported
+:1:rocvirtual.cpp           :3990: 5626912842476 us:  AQL dispatch failed!
+'hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream, params, extra)' failed with 'hipErrorIllegalState'
+[2026-09-24 22:10:26 TP0] RuntimeError: HIP error
+[2026-09-24 22:10:26 TP1] RuntimeError: HIP error
+RuntimeError: HIP error
