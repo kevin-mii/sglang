@@ -114,6 +114,9 @@ before weights load. A standalone torch process (1 or 4 GPUs, compute + H2D, wit
 leak, no GTT use, no cgroup limit or reclaim, and the PCIe links were Gen5 x16. It started after the first servers were stopped with SIGKILL (and
 one run with `TORCHINDUCTOR_COMPILE_THREADS` at default, where 128 inductor workers inherited `/dev/kfd`). Stuck teardowns sat in `D` state in
 `synchronize_srcu`. Root cause not found. It needs host access (dmesg, amdgpu driver state) or a reboot/driver reload.
+Later on 2026-09-24, even a Qwen2.5-0.5B sglang server on one GPU (no IPC, no custom AR) failed to become healthy within 10 min, and the full M3
+server's prefill-graph capture ran at about 2 min per shape. So the problem is node-level, not M3-specific. A GPU reset was impossible from the container
+(`/sys` is read-only, no debugfs; the `amd-smi`/`rocm-smi` reset was not attempted because it was blocked pending approval). The node was released for reacquisition.
 
 The container was also unusual: no docker, seccomp blocked unshare, and ROCm 7.0. The latest image was extracted into `/sgl-workspace/scratch/rootfs`
 and run natively after upgrading the container's glibc to 2.39 (backup in `/sgl-workspace/scratch/glibc_backup/`). A normal docker node needs none of that.
