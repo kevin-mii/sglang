@@ -22,6 +22,13 @@ Target: TTFT p50 < 3 s. The throughput target ("2.5TPS") still needs to be pinne
 - **The original node went bad.** After a few server restarts, every sglang server on it keeps its KFD queues evicted about 90% of the time.
   Details are in "Why the original node was abandoned" below. Continue on a clean node.
 
+## Relation to the cookbook recipe
+
+`docs/cookbook/autoregressive/MiniMax/MiniMax-M3.mdx` recommends, for MI350X/MI355X, **MXFP8 at `--tp 8`, `--mem-fraction-static 0.80`, no speculative decoding**.
+This work deliberately diverges, as requested: the MXFP4 quark checkpoint, EAGLE3 (3 steps / 4 tokens), and 2 x TP4 behind the cache-aware router
+instead of TP8. M3 has 4 KV heads, so TP8 replicates KV, and two replicas double the prefill lanes for this burst-bound workload. It also uses mem 0.85 and the
+M3-perf env knobs in `serve_m3.sh`. The cookbook TP8 MXFP8 config has not been measured on this workload; it is worth one run as a reference point.
+
 ## Where TTFT goes (measured, for the next person optimizing)
 
 - One request's prefill on its own (7.4K new tokens on a 66.8K cached prefix, TP4) takes **213 ms**.
