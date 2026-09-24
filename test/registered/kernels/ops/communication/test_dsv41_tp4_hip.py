@@ -30,7 +30,7 @@ from sglang.test.dsv4_moe_stub import make_dsv4_moe_stub
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
-register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-c-test-large-8-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
     not is_hip() or "LOCAL_RANK" not in os.environ,
     reason="run through the four-GPU entry point",

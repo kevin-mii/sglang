@@ -30,7 +30,7 @@ from sglang.test.layer_ut_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 # (N, K) of the TP4 dense projections plus a small odd one.
