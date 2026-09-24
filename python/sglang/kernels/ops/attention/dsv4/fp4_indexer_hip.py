@@ -857,9 +857,9 @@ def index_q_pack_weights_hip(
 def rocm_indexer_head_weights(
     x: torch.Tensor, weight: torch.Tensor, scale: float
 ) -> torch.Tensor:
-    """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the
-    layout the FlyDSL logits kernels take. x bf16 [M, K] with
-    M <= rocm_indexer_head_weights_max_tokens(...), weight bf16 [N, K]."""
+    """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the layout the
+    FlyDSL logits kernels take. x bf16 [M, K] and weight bf16 [N, K], with
+    M <= rocm_gemv_split_k_max_tokens(n=N, k=K, weight_dtype=torch.bfloat16)."""
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
     partials = rocm_router_gemv_split_k(x, weight)

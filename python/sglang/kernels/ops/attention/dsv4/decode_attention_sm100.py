@@ -1,5 +1,5 @@
-"""SM100 small-batch paged attention with the heads on the MMA N dimension; the
-caller applies the inverse RoPE to the result."""
+"""SM100 / gfx950 small-batch paged attention with the heads on the MMA N dimension;
+the inverse RoPE is applied by the caller, or by the combine when inv_rope is given."""
 
 from typing import Optional
 
@@ -14,11 +14,6 @@ MAX_BATCH = 8
 NUM_HEADS = 16
 HEAD_DIM = 512
 SOFTMAX_SCALE = HEAD_DIM**-0.5
-
-if torch.version.hip:
-    from .swapab_gluon_hip import partial_gluon
-else:
-    from .decode_attention_sm100_gluon import partial_gluon
 
 
 def can_use_swapab_attention(
@@ -103,6 +98,11 @@ def swapab_attention(
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once."""
+    if torch.version.hip:
+        from .swapab_gluon_hip import partial_gluon
+    else:
+        from .decode_attention_sm100_gluon import partial_gluon
+
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)

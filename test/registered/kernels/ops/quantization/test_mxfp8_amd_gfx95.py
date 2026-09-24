@@ -1,4 +1,4 @@
-"""The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant, graph-capturable."""
+"""The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant."""
 
 import unittest
 
@@ -94,15 +94,16 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 ROUTE_SHAPES = [(1856, 5120)]
 
 
-# The plan each M takes on the TP4 dense shape: a decode row through the gemv, a
-# small prefill through hipBLASLt (bf16 mirror) or the dot_scaled GEMM without one,
-# a large prefill through the dot_scaled GEMM. Pinned so a routing change shows up
-# here instead of only as a numerics drift elsewhere.
+# The plan each tested M takes on the TP4 dense shape, read off the tuned tables: a
+# decode row through the gemv, the 64-row bucket through hipBLASLt (bf16 mirror) or the
+# dot_scaled GEMM without one, the 4096-row bucket through the dot_scaled GEMM. Pinned
+# so a routing change shows up here instead of only as a numerics drift elsewhere.
 def _expected_plan(m: int, has_bf16: bool) -> str:
     if m <= 32:
         return "gemv"
-    if m <= 1024:
+    if m <= 64:
         return "hipblaslt_bf16" if has_bf16 else "dot_scaled"
+    assert 1024 < m <= 4096, m
     return "dot_scaled"
 
 
@@ -130,8 +131,8 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
             for m in MS:
                 plan = _expected_plan(m, has_bf16)
                 self.assertEqual(native_route_plan(m, n, k, has_bf16), plan, m)
-                # A free fp8 input must not change the kernel, or the bf16 and the
-                # fp8 entry points of one layer would sum in different orders.
+                # At these M the fp8-input table picks the same kernel, so the bf16 and
+                # the fp8 entry points of one layer sum in the same order.
                 self.assertEqual(native_route_plan(m, n, k, has_bf16, True), plan, m)
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
@@ -163,9 +164,9 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
     def test_repeatable_and_batch_invariant_inside_each_kernel(self):
-        """Rows that share a kernel (the gemv below 32 tokens; the dot_scaled GEMM
-        above 1024) sum in the same order at every batch size, so a prefix of a batch
-        is bitwise the batch's prefix."""
+        """Rows that share a kernel (the gemv up to 32 tokens; the dot_scaled GEMM in
+        the 4096-row bucket) sum in the same order at every batch size, so a prefix of
+        a batch is bitwise the batch's prefix."""
         n, k = 1856, 5120
         _, _, w_sh, ws8, w_small, _ = self._weights(n, k, seed=1)
         has_bf16 = w_small is not None

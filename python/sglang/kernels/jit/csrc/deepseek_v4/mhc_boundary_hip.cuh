@@ -1,5 +1,5 @@
 // ROCm (gfx950) prefill-regime kernel for the fused mHC sublayer boundary: the operation
-// sequence of the Triton `_hc_boundary_partial_kernel` (mhc.py) at its decode configuration,
+// sequence of the Triton `_hc_boundary_partial_kernel` (mhc_boundary_hip.py) at its decode configuration,
 // so a row's fp32 result is bitwise identical in both regimes. Compiled with -ffp-contract=off:
 // the Triton binary contracts none of the hc_post multiplies and adds.
 #pragma once

@@ -9,10 +9,8 @@
 #ifndef USE_ROCM
 #include <cuda_fp8.h>
 #elif defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
-// Only on the arches that take the hardware branch below. hip_fp8.h is what defines
-// HIP_FP8_TYPE_FNUZ, and nothing else in this include tree pulls it in, so gating on
-// those macros instead would also flip the software cast's arch constants on gfx942 --
-// it picks fn today because the macro is not visible there.
+// The arches that take the hardware branch below. utils.cuh includes hip_fp8.h on every
+// ROCm target, so HIP_FP8_TYPE_FNUZ also selects the software cast's fnuz constants on gfx942.
 #include <hip/hip_fp8.h>
 #define SGL_ROCM_FP8_HW_CVT 1
 #endif
@@ -59,8 +57,7 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 // __HIP_SATFINITE -- the x2 fast path converts the value it was handed, not the clamped
 // one (ROCm 7.2).
 //
-// gfx942 keeps the software cast below, top-segment bug and all -- this instruction does
-// not produce the fnuz flavour that arch needs, so it takes a separate fix.
+// gfx942 keeps the software cast below: this instruction does not produce the fnuz flavour.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   const fp32x2_t v{fp8_e4m3_clip(x), fp8_e4m3_clip(y)};
   return std::bit_cast<fp8x2_e4m3_t>(__hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3));
