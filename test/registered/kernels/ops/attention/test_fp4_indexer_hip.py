@@ -34,10 +34,29 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    index_q_rope_pack_weights_flydsl,
+    indexer_head_weights,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    read_fp4_index_k_split,
+    store_fp4_index_k_cache_split,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+    index_k_norm_rope_pack_store,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
+    index_k_norm_rope_pack_store_split,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+    build_decode_schedule,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+    rope_tail_fake_quant_fp4,
+)
+from sglang.kernels.ops.moe.rocm_router_gate import (
+    rocm_router_gemv_split_k,
 )
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -285,14 +304,6 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
 def test_index_q_pack_weights_matches_standalone() -> None:
     """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
     weights) is bitwise the three standalone launches it replaces."""
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-        index_q_rope_pack_weights_flydsl,
-        indexer_head_weights,
-    )
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-        rope_tail_fake_quant_fp4,
-    )
-    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
     torch.manual_seed(0)
     num_tokens, num_heads = 16, 32
@@ -497,10 +508,6 @@ def test_decode_schedule_matches_aiter_varctx_schedule(num_queries: int) -> None
     split factor, including zero-length rows and prefix sums carried across row blocks."""
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
         compute_varctx_schedule,
-    )
-
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
-        build_decode_schedule,
     )
 
     torch.manual_seed(num_queries)
@@ -942,9 +949,6 @@ def test_pack_fp4_query_flydsl_single_launch():
 
 @pytest.mark.parametrize("compressed_kv", [False, True], ids=["False", "True"])
 def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-        rope_tail_fake_quant_fp4,
-    )
 
     torch.manual_seed(19)
     table = torch.polar(
@@ -965,15 +969,6 @@ def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
 def test_index_k_split_writer_matches_the_paged_writer(ratio: int) -> None:
     """index_k_norm_rope_pack_store_split writes the bytes of the paged
     index_k_norm_rope_pack_store, moved to the split FlyDSL layout; slot 0 stays empty."""
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-        read_fp4_index_k_split,
-    )
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
-        index_k_norm_rope_pack_store,
-    )
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
-        index_k_norm_rope_pack_store_split,
-    )
 
     torch.manual_seed(ratio)
     num_tokens, page_size, num_pages, max_pos = 100, 64, 4, 4096
@@ -1041,13 +1036,6 @@ def _unpack(packed: torch.Tensor) -> torch.Tensor:
 
 def test_low_ratio_triton_paths_round_half_to_even_like_cuda() -> None:
     """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-        read_fp4_index_k_split,
-        store_fp4_index_k_cache_split,
-    )
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-        rope_tail_fake_quant_fp4,
-    )
 
     scale = 2.0**-3
     e8m0 = 127 + int(torch.log2(torch.tensor(scale)))

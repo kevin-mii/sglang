@@ -4,6 +4,12 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.moe.rocm_router_gate import (
+    ROCM_ROUTER_MAX_TOKENS,
+    rocm_router_gate,
+    rocm_router_gemv_split_k,
+    rocm_router_reduce_partials,
+)
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -40,17 +46,6 @@ def _aiter_gate(logits, bias, topk, renorm, rsf):
 )
 class TestRocmRouterGate(CustomTestCase):
     def setUp(self):
-        from sglang.kernels.ops.moe.rocm_router_gate import (
-            ROCM_ROUTER_MAX_TOKENS,
-            rocm_router_gate,
-            rocm_router_gemv_split_k,
-            rocm_router_reduce_partials,
-        )
-
-        self.max_tokens = ROCM_ROUTER_MAX_TOKENS
-        self.gate = rocm_router_gate
-        self.gemv = rocm_router_gemv_split_k
-        self.reduce = rocm_router_reduce_partials
         self.device = torch.device("cuda")
         self.gen = torch.Generator(device=self.device).manual_seed(0)
         self.bias_bf16 = (
@@ -62,7 +57,7 @@ class TestRocmRouterGate(CustomTestCase):
 
     def _assert_same_gate(self, logits, bias, renorm=True, rsf=ROUTED_SCALING, msg=""):
         ref_w, ref_i = _aiter_gate(logits, bias, TOPK, renorm, rsf)
-        out_w, out_i = self.gate(logits, bias, TOPK, renorm, rsf)
+        out_w, out_i = rocm_router_gate(logits, bias, TOPK, renorm, rsf)
         self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg}")
         self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg}")
 
@@ -86,13 +81,13 @@ class TestRocmRouterGate(CustomTestCase):
         reduce must write the same logits as rocm_router_reduce_partials, and gate them
         to the same weights and ids."""
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)
-        partials = self.gemv(x, weight)
-        ref_logits = torch.empty(self.max_tokens, NUM_EXPERTS, device=self.device)
-        self.reduce(partials, ref_logits)
-        ref_w, ref_i = self.gate(ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING)
+        x = self._randn(ROCM_ROUTER_MAX_TOKENS, HIDDEN).to(torch.bfloat16)
+        partials = rocm_router_gemv_split_k(x, weight)
+        ref_logits = torch.empty(ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device)
+        rocm_router_reduce_partials(partials, ref_logits)
+        ref_w, ref_i = rocm_router_gate(ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING)
         logits = torch.full_like(ref_logits, float("nan"))
-        out_w, out_i = self.gate(
+        out_w, out_i = rocm_router_gate(
             logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
         )
         self.assertTrue(torch.equal(logits, ref_logits))
@@ -103,13 +98,13 @@ class TestRocmRouterGate(CustomTestCase):
         """The split-K GEMV is within fp32 rounding of fp64, and every M runs the same
         16-row tile, so a row's result does not depend on the batch."""
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)
+        x = self._randn(ROCM_ROUTER_MAX_TOKENS, HIDDEN).to(torch.bfloat16)
         ref = (x.double() @ weight.double().T).float()
-        full = torch.empty(self.max_tokens, NUM_EXPERTS, device=self.device)
-        self.reduce(self.gemv(x, weight), full)
+        full = torch.empty(ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device)
+        rocm_router_reduce_partials(rocm_router_gemv_split_k(x, weight), full)
         self.assertTrue(torch.allclose(full, ref, atol=2e-3, rtol=1e-4))
         part = torch.empty(17, NUM_EXPERTS, device=self.device)
-        self.reduce(self.gemv(x[:17], weight), part)
+        rocm_router_reduce_partials(rocm_router_gemv_split_k(x[:17], weight), part)
         self.assertTrue(torch.equal(part, full[:17]))
 
 

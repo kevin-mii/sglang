@@ -7,10 +7,16 @@ follow the decode kernel's own reference quantizer.
 
 import math
 import unittest
+from typing import Tuple
 
 import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
+from sglang.kernels.ops.attention.dsv4.compress import (
+    CompressorDecodePlan,
+    compress_norm_rope_store,
+)
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_k_norm_rope_flashmla,
@@ -62,7 +68,9 @@ def rope_tail(
     return torch.cat([head, rotated], dim=-1)
 
 
-def token_rows(pages, layout, page_size, locs):
+def token_rows(
+    pages: torch.Tensor, layout: KVLayout, page_size: int, locs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """The (data row, scale row) bytes of the tokens at locs."""
     locs = locs.long()
     page, offset = locs // page_size, locs % page_size
@@ -78,7 +86,9 @@ def token_rows(pages, layout, page_size, locs):
     return data, scale
 
 
-def random_rows(n, generator, device="cuda"):
+def random_rows(
+    n: int, generator: torch.Generator, device: str = "cuda"
+) -> torch.Tensor:
     """bf16 rows over a wide dynamic range, with zero, negative-zero and tiny tiles."""
     x = torch.randn(n, 512, generator=generator, device=device, dtype=torch.bfloat16)
     scale = torch.exp2(
@@ -92,7 +102,14 @@ def random_rows(n, generator, device="cuda"):
     return x
 
 
-def reference_pages(layout, page_size, num_pages, locs, values, page_bytes):
+def reference_pages(
+    layout: KVLayout,
+    page_size: int,
+    num_pages: int,
+    locs: torch.Tensor,
+    values: torch.Tensor,
+    page_bytes: int,
+) -> torch.Tensor:
     full = torch.zeros(
         num_pages, page_size, 512, device=values.device, dtype=values.dtype
     )
@@ -170,7 +187,6 @@ class TestV41KVStore(CustomTestCase):
 
     def test_fused_store_cache(self):
         """Ragged page fills: a random subset of slots is written, the rest stays zero."""
-        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 
         g = torch.Generator(device="cuda").manual_seed(0)
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
@@ -210,7 +226,6 @@ class TestV41KVStore(CustomTestCase):
     def test_fused_store_cache_with_rope(self):
         """The in-kernel RoPE tail equals rope_tail (bf16-rounded) before quantizing,
         so the fp4 cache holds exactly fake_quant_compressed_kv(rope_tail(x))."""
-        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 
         g = torch.Generator(device="cuda").manual_seed(1)
         page_size, num_pages, n = 64, 5, 200
@@ -251,7 +266,6 @@ class TestV41KVStore(CustomTestCase):
     def test_boundary_tiles(self):
         """Tie, saturation and subnormal-scale tiles follow the reference. (NaN / inf
         rows are not fed: the kernels do not reproduce the reference's handling of them.)"""
-        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 
         maxima = [
             0,
@@ -294,7 +308,6 @@ class TestV41KVStore(CustomTestCase):
         """The fused RMSNorm + RoPE + store (the SWA write) equals norm -> rope_tail ->
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
-        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 
         g = torch.Generator(device="cuda").manual_seed(2)
         page_size, num_pages, n = 256, 3, 300
@@ -383,10 +396,6 @@ class TestV41KVStore(CustomTestCase):
     def test_compress_norm_rope_store(self):
         """The ratio-4 / ratio-128 writer (norm + RoPE + store from a decode plan) in
         the V4.1 layouts: bitwise on exact-norm rows, one-code close on general rows."""
-        from sglang.kernels.ops.attention.dsv4.compress import (
-            CompressorDecodePlan,
-            compress_norm_rope_store,
-        )
 
         g = torch.Generator(device="cuda").manual_seed(5)
         ratio = 4
