@@ -1,6 +1,7 @@
 """The gfx950 fused fp8-grid producers (RMSNorm + fake-quant, clamp + silu * mul, wo_a GEMM epilogue) must match the unfused launches bitwise on the quant step."""
 
 import unittest
+from typing import Optional
 
 import torch
 
@@ -8,7 +9,6 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_triton,
 )
 from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
-    _split_k_applies,
     batched_gemm_bf16_fp8_grid,
 )
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
@@ -30,7 +30,7 @@ EPS = 1e-6
 
 
 def _reference_norm(
-    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor = None
+    x: torch.Tensor, weight: torch.Tensor, residual: Optional[torch.Tensor] = None
 ):
     """The unfused RMSNorm: fp32 math, bf16 output (and bf16-rounded residual sum)."""
     xf = x.float()
@@ -88,30 +88,27 @@ class TestRmsnormFakeQuantFp8(CustomTestCase):
 
     def test_residual_add(self):
         torch.manual_seed(1)
-        for m, k in [(17, 5120)]:
-            x, w = self._make(m, k)
-            residual = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-            y_ref, res_ref = _reference_norm(x, w, residual.clone())
-            res = residual.clone()
-            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS, residual=res)
-            self.assertTrue(torch.equal(res, res_ref), (m, k))
-            self.assertLessEqual(_ulp(y, y_ref).max().item(), 1, (m, k))
-            self.assertTrue(torch.equal(fq.x, _reference_fake_quant(y)), (m, k))
+        x, w = self._make(17, 5120)
+        residual = torch.randn(17, 5120, device="cuda", dtype=torch.bfloat16)
+        y_ref, res_ref = _reference_norm(x, w, residual.clone())
+        res = residual.clone()
+        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS, residual=res)
+        self.assertTrue(torch.equal(res, res_ref))
+        self.assertLessEqual(_ulp(y, y_ref).max().item(), 1)
+        self.assertTrue(torch.equal(fq.x, _reference_fake_quant(y)))
 
     def test_rows_independent_and_repeatable(self):
         torch.manual_seed(2)
-        for k in (5120,):
-            x, w = self._make(64, k)
-            fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
-            fq2, y2 = rmsnorm_fake_quant_fp8(x, w, EPS)
-            self.assertTrue(torch.equal(fq.x, fq2.x) and torch.equal(y, y2))
-            r = 63
-            fq1, y1 = rmsnorm_fake_quant_fp8(x[r : r + 1], w, EPS)
-            self.assertTrue(torch.equal(fq1.x[0], fq.x[r]), (k, r))
-            self.assertTrue(torch.equal(y1[0], y[r]), (k, r))
-            fq_half, y_half = rmsnorm_fake_quant_fp8(x[:9], w, EPS)
-            self.assertTrue(torch.equal(fq_half.x, fq.x[:9]))
-            self.assertTrue(torch.equal(y_half, y[:9]))
+        x, w = self._make(64, 5120)
+        fq, y = rmsnorm_fake_quant_fp8(x, w, EPS)
+        fq2, y2 = rmsnorm_fake_quant_fp8(x, w, EPS)
+        self.assertTrue(torch.equal(fq.x, fq2.x) and torch.equal(y, y2))
+        fq1, y1 = rmsnorm_fake_quant_fp8(x[63:64], w, EPS)
+        self.assertTrue(torch.equal(fq1.x[0], fq.x[63]))
+        self.assertTrue(torch.equal(y1[0], y[63]))
+        fq_half, y_half = rmsnorm_fake_quant_fp8(x[:9], w, EPS)
+        self.assertTrue(torch.equal(fq_half.x, fq.x[:9]))
+        self.assertTrue(torch.equal(y_half, y[:9]))
 
     def test_emit_fp8_is_the_same_quantization(self):
         # the native-route fp8 codes + scales dequantize exactly to the same launch's fp8-grid bf16 activation
@@ -165,8 +162,7 @@ class TestSiluAndMulClampTriton(CustomTestCase):
             )
 
 
-GEMM_SHAPES = [(2, 1024, 4096)]
-G, R, D = GEMM_SHAPES[0]
+G, R, D = 2, 1024, 4096
 
 
 def _aiter_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -178,14 +174,13 @@ def _aiter_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return y.transpose(0, 1).contiguous().flatten(1)
 
 
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "gfx950 bf16-dequant dense route only"
-)
-class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
-    def setUp(self):
-        self.gemm = batched_gemm_bf16_fp8_grid
-        self.fake_quant = fake_quant_fp8_activation
+def _weights(seed: int, r: int = R) -> torch.Tensor:
+    torch.manual_seed(seed)
+    return (torch.randn(G, r, D, device="cuda") * 0.02).bfloat16()
 
+
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 wo_a GEMM")
+class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
     def _assert_within_bf16_of_exact(self, out, x, w, ctx):
         """One bf16 rounding (half an ulp of the result) of an fp32 sum whose
         association differs from aiter's: the fp32 error is bounded by the sum of
@@ -200,61 +195,65 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
 
     def test_bitwise_against_aiter_and_separate_fake_quant(self):
         """The single-launch regime (T above the split-K cap, or forced) is bitwise aiter's."""
-        cases = [(1, 1.0), (64, 0.5)]
-        for g, r, d in GEMM_SHAPES:
-            for seed, (t, scale) in enumerate(cases):
-                torch.manual_seed(seed)
-                w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
-                x = (torch.randn(t, g, d, device="cuda") * scale).bfloat16()
-                ref = _aiter_reference(x, w)
-                plain = self.gemm(x, w, fp8_grid=False, split_k=False)
-                self.assertTrue(torch.equal(plain, ref), (g, r, d, t, scale))
-                grid = self.gemm(x, w, split_k=False)
-                self.assertTrue(
-                    torch.equal(grid, self.fake_quant(ref)), (g, r, d, t, scale)
-                )
-            # Above the split-K cap the default regime is the single launch. aiter's own
-            # kernel changes tile there, so the gate is the fp64 bound rather than bitwise.
-            torch.manual_seed(99)
-            w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
-            x = torch.randn(65, g, d, device="cuda").bfloat16()
-            plain = self.gemm(x, w, fp8_grid=False)
-            self._assert_within_bf16_of_exact(plain, x, w, (g, r, d, 65))
-            self.assertTrue(torch.equal(self.gemm(x, w), self.fake_quant(plain)))
+        for seed, (t, scale) in enumerate([(1, 1.0), (64, 0.5)]):
+            w = _weights(seed)
+            x = (torch.randn(t, G, D, device="cuda") * scale).bfloat16()
+            ref = _aiter_reference(x, w)
+            plain = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False, split_k=False)
+            self.assertTrue(torch.equal(plain, ref), (t, scale))
+            grid = batched_gemm_bf16_fp8_grid(x, w, split_k=False)
+            self.assertTrue(
+                torch.equal(grid, fake_quant_fp8_activation(ref)), (t, scale)
+            )
+        # Above the split-K cap the default regime is the single launch. aiter's own
+        # kernel changes tile there, so the gate is the fp64 bound rather than bitwise.
+        w = _weights(99)
+        x = torch.randn(65, G, D, device="cuda").bfloat16()
+        plain = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False)
+        self._assert_within_bf16_of_exact(plain, x, w, (65,))
+        self.assertTrue(
+            torch.equal(
+                batched_gemm_bf16_fp8_grid(x, w), fake_quant_fp8_activation(plain)
+            )
+        )
 
     def test_split_k_regime(self):
         """T <= 64 takes the split-K launches: within one bf16 ulp of the fp32 product
         (the reassociated sum), on the grid, batch-invariant and repeatable."""
-        for g, r, d in GEMM_SHAPES:
-            if not _split_k_applies(1, d, r):
-                continue
-            torch.manual_seed(5)
-            w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
-            x = (torch.randn(64, g, d, device="cuda") * 1.5).bfloat16()
-            full_plain = self.gemm(x, w, fp8_grid=False)
-            self.assertTrue(
-                torch.equal(full_plain, self.gemm(x, w, fp8_grid=False, split_k=True))
+        w = _weights(5)
+        x = (torch.randn(64, G, D, device="cuda") * 1.5).bfloat16()
+        full_plain = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False)
+        self.assertTrue(
+            torch.equal(
+                full_plain,
+                batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False, split_k=True),
             )
-            self._assert_within_bf16_of_exact(full_plain, x, w, (g, r, d, "split"))
-            full_grid = self.gemm(x, w)
-            self.assertTrue(torch.equal(full_grid, self.fake_quant(full_plain)))
-            for t in (1, 17):
-                sub = self.gemm(x[:t], w)
-                self.assertTrue(torch.equal(sub, full_grid[:t]), (g, r, d, t))
-                self.assertTrue(
-                    torch.equal(self.gemm(x[:t], w, fp8_grid=False), full_plain[:t])
-                )
+        )
+        self._assert_within_bf16_of_exact(full_plain, x, w, ("split",))
+        full_grid = batched_gemm_bf16_fp8_grid(x, w)
+        self.assertTrue(torch.equal(full_grid, fake_quant_fp8_activation(full_plain)))
+        for t in (1, 17):
+            self.assertTrue(
+                torch.equal(batched_gemm_bf16_fp8_grid(x[:t], w), full_grid[:t]), t
+            )
+            self.assertTrue(
+                torch.equal(
+                    batched_gemm_bf16_fp8_grid(x[:t], w, fp8_grid=False),
+                    full_plain[:t],
+                ),
+                t,
+            )
 
     def test_odd_r_takes_the_single_launch(self):
         """R that is not a 32 multiple never takes split-K (its partial kernel stores
         whole N tiles), so the default regime is the single launch."""
-        g, r, d = 2, 1000, 4096
-        torch.manual_seed(7)
-        w = (torch.randn(g, r, d, device="cuda") * 0.02).bfloat16()
-        x = torch.randn(8, g, d, device="cuda").bfloat16()
-        out = self.gemm(x, w, fp8_grid=False)
+        w = _weights(7, r=1000)
+        x = torch.randn(8, G, D, device="cuda").bfloat16()
+        out = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False)
         self.assertTrue(
-            torch.equal(out, self.gemm(x, w, fp8_grid=False, split_k=False))
+            torch.equal(
+                out, batched_gemm_bf16_fp8_grid(x, w, fp8_grid=False, split_k=False)
+            )
         )
         self.assertTrue(torch.equal(out, _aiter_reference(x, w)))
 
