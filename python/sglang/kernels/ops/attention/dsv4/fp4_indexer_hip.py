@@ -213,8 +213,8 @@ def prepare_fp4_decode_workspace(
     kernel touches is reachable from the returned workspace, so none of it can
     be handed out again by a later capture sharing the graph memory pool.
     """
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-        compute_varctx_schedule,
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        build_decode_schedule,
     )
 
     guarded, max_seq_len = _guard_page_table(page_table, bucket=bucket)
@@ -226,13 +226,8 @@ def prepare_fp4_decode_workspace(
         dtype=torch.int32,
         device=guarded.device,
     )
-    schedule_scratch, _, _ = compute_varctx_schedule(
-        c4_seq_lens,
-        block_k=256,
-        parallel_unit_num=cta_count,
-        max_seq_len=max_seq_len,
-        next_n=1,
-        cta_info_out=cta_info,
+    schedule_scratch = build_decode_schedule(
+        c4_seq_lens, cta_info_out=cta_info, max_seq_len=max_seq_len
     )
     return FP4DecodeWorkspace(
         guarded, c4_seq_lens, cta_info, cta_count, max_seq_len, schedule_scratch
@@ -339,9 +334,26 @@ def aiter_fp4_paged_mqa_logits(
         page_table = workspace.guarded_page_table
         max_seq_len = workspace.max_seq_len
     elif is_decode:
+        # No usable workspace: build the schedule here too, rather than letting
+        # AITER build it with its varctx kernel, which cannot reserve its scratch
+        # at large batches.
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+            build_decode_schedule,
+        )
+
         page_table, max_seq_len = _guard_page_table(
             page_table, bucket=page_table_bucket
         )
+        cta_count = _decode_cta_count(num_tokens, max_seq_len)
+        cta_info = torch.empty(
+            (cta_count, _DECODE_CTA_INFO_WIDTH),
+            dtype=torch.int32,
+            device=page_table.device,
+        )
+        scratch = build_decode_schedule(
+            c4_seq_lens, cta_info_out=cta_info, max_seq_len=max_seq_len
+        )
+        fallback_schedule = (cta_info, cta_count, scratch)
     else:
         # No usable workspace (DP padding or truncated activations): build the
         # schedule here rather than letting AITER rebuild it from ~29 torch ops
@@ -389,14 +401,14 @@ def aiter_fp4_paged_mqa_logits(
     }
 
     if is_decode:
-        pinned = (
-            {}
-            if workspace is None
-            else {
+        if workspace is None:
+            cta_info, cta_count, _ = fallback_schedule
+            pinned = {"cta_info": cta_info, "total_ctas": cta_count}
+        else:
+            pinned = {
                 "cta_info": workspace.cta_info,
                 "total_ctas": workspace.cta_count,
             }
-        )
         logits = flydsl_pa_mqa_logits_fp4(
             q_payload.reshape(num_tokens, 1, q_fp4.shape[-2], _HEAD_DIM // 2),
             q_scale.reshape(num_tokens, 1, *_Q_SCALE_SHAPE),

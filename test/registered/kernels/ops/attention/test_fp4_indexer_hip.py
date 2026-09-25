@@ -503,6 +503,40 @@ def test_decode_cta_count_stays_within_available_chunks(
     assert cta_count <= max(1024, num_queries * 4)
 
 
+@pytest.mark.parametrize("num_queries", [1, 300, 1536, 4096])
+def test_decode_schedule_matches_aiter_varctx_schedule(num_queries: int) -> None:
+    """The in-tree decode schedule writes AITER compute_varctx_schedule's cta_info rows and
+    split factor, including zero-length rows and prefix sums carried across row blocks."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
+
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        build_decode_schedule,
+    )
+
+    torch.manual_seed(num_queries)
+    max_seq_len = 65536
+    c4_seq_lens = torch.randint(
+        0, max_seq_len, (num_queries,), device=get_device(), dtype=torch.int32
+    )
+    c4_seq_lens[::7] = 0
+    cta_count = _decode_cta_count(num_queries, max_seq_len)
+    ref_safe, ref, _ = compute_varctx_schedule(
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=max_seq_len,
+        next_n=1,
+    )
+    cta_info = torch.empty_like(ref)
+    scratch = build_decode_schedule(
+        c4_seq_lens, cta_info_out=cta_info, max_seq_len=max_seq_len
+    )
+    assert torch.equal(scratch[:1], ref_safe)
+    assert torch.equal(cta_info, ref)
+
+
 def _decode_plan(seq_lens: torch.Tensor, compress_ratio: int) -> CompressorDecodePlan:
     """Hand-build the 16-byte decode plan rows the metadata builder reads."""
     words = torch.zeros((seq_lens.shape[0], 4), dtype=torch.int32, device=get_device())
