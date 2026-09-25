@@ -19,12 +19,12 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
-    index_q_pack_weights_hip,
+    index_q_rope_pack_weights_flydsl,
+    indexer_head_weights,
     logits_rows_per_chunk,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
-    rocm_indexer_head_weights,
     sort_selection_rows,
 )
 from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
@@ -463,7 +463,7 @@ def topk_within_candidate_blocks_hip(
 
 
 def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
-    """Row counts rocm_indexer_head_weights / the split-K GEMV serve: a small contiguous bf16 batch."""
+    """Row counts indexer_head_weights / the split-K GEMV serve: a small contiguous bf16 batch."""
     return (
         0 < x.shape[0] <= indexer.weights_proj_hip_max_tokens
         and x.dim() == 2
@@ -474,9 +474,9 @@ def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
 
 def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
     """indexer.head_weights(x) as the contiguous bf16 [T, H] the FlyDSL kernels take; decode row
-    counts run rocm_indexer_head_weights (same two roundings as aiter's GEMM plus the scale)."""
+    counts run indexer_head_weights (same two roundings as aiter's GEMM plus the scale)."""
     if _gemv_head_weight_rows(indexer, x):
-        return rocm_indexer_head_weights(
+        return indexer_head_weights(
             x, indexer.weights_proj.weight, indexer.head_weight_scale
         )
     return indexer.head_weights(x).contiguous()
@@ -497,7 +497,7 @@ def _indexer_inputs(layer, x, q_lora, pos):
         # decode rows: wq_b, split-K head-weight GEMV, then one launch for RoPE, fp4 pack and reduce
         q, _ = indexer.wq_b(q_lora)
         partials = rocm_router_gemv_split_k(x, indexer.weights_proj.weight)
-        return index_q_pack_weights_hip(
+        return index_q_rope_pack_weights_flydsl(
             q,
             layer.freqs_cis,
             pos,
@@ -521,7 +521,7 @@ def build_low_ratio_decode_workspaces(
         ratio: prepare_fp4_decode_workspace(
             meta.page_table,
             meta.compressed_seq_lens,
-            bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         )
         for ratio, meta in metadata_by_ratio.items()
     }
@@ -538,7 +538,7 @@ def refresh_low_ratio_prefill_workspaces(
             meta.page_table,
             meta.compressed_seq_lens,
             workspace=previous.get(ratio),
-            bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         )
         for ratio, meta in metadata_by_ratio.items()
     }
@@ -876,7 +876,7 @@ def low_ratio_index_topk_hip_extend(
 
     # group requests to fit the pooled logits block; rows are independent, so grouping is exact
     rows_per_chunk = logits_rows_per_chunk(
-        indexer_metadata.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
+        indexer_metadata.page_table, page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET
     )
     groups = _request_groups(extend_lens_cpu, rows_per_chunk)
     for req_lo, req_hi, tok_lo, tok_hi in groups:

@@ -286,8 +286,8 @@ def test_index_q_pack_weights_matches_standalone() -> None:
     """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
     weights) is bitwise the three standalone launches it replaces."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-        index_q_pack_weights_hip,
-        rocm_indexer_head_weights,
+        index_q_rope_pack_weights_flydsl,
+        indexer_head_weights,
     )
     from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
         rope_tail_fake_quant_fp4,
@@ -308,10 +308,10 @@ def test_index_q_pack_weights_matches_standalone() -> None:
         q.view(num_tokens, num_heads, 128), freqs[pos], rope_dim
     )
     ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
-    ref_w = rocm_indexer_head_weights(x, w, scale)
+    ref_w = indexer_head_weights(x, w, scale)
 
     partials = rocm_router_gemv_split_k(x, w)
-    q_fp4, q_scale, weights = index_q_pack_weights_hip(
+    q_fp4, q_scale, weights = index_q_rope_pack_weights_flydsl(
         q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
     )
     # torch.equal ignores dtype
@@ -325,7 +325,7 @@ def test_index_q_pack_weights_matches_standalone() -> None:
     ).abs()
     assert int(ulps.max()) <= 1
     # a row alone equals the row inside the batch
-    one_fp4, one_scale, one_weights = index_q_pack_weights_hip(
+    one_fp4, one_scale, one_weights = index_q_rope_pack_weights_flydsl(
         q[:1],
         freqs,
         pos[:1],

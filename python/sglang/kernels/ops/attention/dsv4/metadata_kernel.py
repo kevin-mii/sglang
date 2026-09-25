@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 # blocks of the page-index row per program: a long capture context is not one serial loop
-PAGE_INDEX_BLOCKS_PER_PROGRAM = 4
+_PAGE_INDEX_BLOCKS_PER_PROGRAM = 4
 
 
 @triton.jit
@@ -90,7 +90,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_page_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
-    ITERS_PER_PROGRAM: tl.constexpr,
+    BLOCKS_PER_PROGRAM: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     if batch_id >= bs:
@@ -127,9 +127,9 @@ def _init_compressed_attn_metadata_kernel(
 
     if COMPUTE_PAGE_INDICES:
         page_indices_base = batch_id * c128_cur_max_seq_len
-        chunk_start = tl.program_id(1) * (ITERS_PER_PROGRAM * BLOCK_SIZE)
+        chunk_start = tl.program_id(1) * (BLOCKS_PER_PROGRAM * BLOCK_SIZE)
         for block_start in tl.range(
-            chunk_start, chunk_start + ITERS_PER_PROGRAM * BLOCK_SIZE, BLOCK_SIZE
+            chunk_start, chunk_start + BLOCKS_PER_PROGRAM * BLOCK_SIZE, BLOCK_SIZE
         ):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
             mask = offsets < c128_cur_max_seq_len
@@ -222,7 +222,7 @@ def _init_compressed_attn_metadata_triton(
         max(
             1,
             triton.cdiv(
-                c128_cur_max_seq_len, PAGE_INDEX_BLOCKS_PER_PROGRAM * BLOCK_SIZE
+                c128_cur_max_seq_len, _PAGE_INDEX_BLOCKS_PER_PROGRAM * BLOCK_SIZE
             ),
         ),
     )
@@ -251,7 +251,7 @@ def _init_compressed_attn_metadata_triton(
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,
-        PAGE_INDEX_BLOCKS_PER_PROGRAM,
+        _PAGE_INDEX_BLOCKS_PER_PROGRAM,
     )
 
     return (

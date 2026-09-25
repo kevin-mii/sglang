@@ -39,6 +39,8 @@ _DECODE_BASE_CTA_TARGET = 1024
 # Preserve per-query parallelism when the batch itself exceeds one CTA per CU.
 _DECODE_CTAS_PER_QUERY = 4
 _PREFILL_BASE_CTA_TARGET = 1024
+# FlyDSL compiles one kernel per page-table width: bucket it so a new context length pays no JIT
+LOW_RATIO_PAGE_TABLE_BUCKET = 64
 # AITER varctx cta_info row: [batch_packed, chunk_start, chunk_count, ctx_len].
 _DECODE_CTA_INFO_WIDTH = 4
 
@@ -140,29 +142,32 @@ def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
     return min(available_ctas, target_ctas)
 
 
-# FlyDSL compiles one kernel per page-table width: bucket it so a new context length pays no JIT
-LOW_RATIO_PAGE_TABLE_BUCKET = 64
-
-
-def _guarded_pages(logical_width: int, bucket: int = 4) -> int:
+def _guarded_pages(logical_width: int, page_table_bucket: int = 4) -> int:
     """Page columns after padding for 256-token scheduling."""
-    return max(4, (logical_width + bucket - 1) // bucket * bucket)
+    return max(
+        4,
+        (logical_width + page_table_bucket - 1)
+        // page_table_bucket
+        * page_table_bucket,
+    )
 
 
 def _guard_page_table(
-    page_table: torch.Tensor, out: Optional[torch.Tensor] = None, bucket: int = 4
+    page_table: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    page_table_bucket: int = 4,
 ):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         pad_page_table,
     )
 
-    return pad_page_table(page_table, out=out, bucket=bucket)
+    return pad_page_table(page_table, out=out, page_table_bucket=page_table_bucket)
 
 
-def logits_rows_per_chunk(page_table: torch.Tensor, bucket: int = 4) -> int:
+def logits_rows_per_chunk(page_table: torch.Tensor, page_table_bucket: int = 4) -> int:
     """Rows whose logits fit the pooled block, for callers that loop by row."""
-    width = _guarded_pages(page_table.shape[1], bucket) * _KV_BLOCK_SIZE
+    width = _guarded_pages(page_table.shape[1], page_table_bucket) * _KV_BLOCK_SIZE
     return max(1, _LOGITS_BUDGET_ELEMS // width)
 
 
@@ -205,7 +210,7 @@ def _alloc_logits(
 def prepare_fp4_decode_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
-    bucket: int = 4,
+    page_table_bucket: int = 4,
 ) -> FP4DecodeWorkspace:
     """Build the decode page-table, schedule, and logits buffers.
 
@@ -217,7 +222,9 @@ def prepare_fp4_decode_workspace(
         build_decode_schedule,
     )
 
-    guarded, max_seq_len = _guard_page_table(page_table, bucket=bucket)
+    guarded, max_seq_len = _guard_page_table(
+        page_table, page_table_bucket=page_table_bucket
+    )
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     num_queries = guarded.shape[0]
     cta_count = _decode_cta_count(num_queries, max_seq_len)
@@ -238,7 +245,7 @@ def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
     workspace: Optional[FP4PrefillWorkspace] = None,
-    bucket: int = 4,
+    page_table_bucket: int = 4,
 ) -> FP4PrefillWorkspace:
     """Build or refresh the prefill page-table, schedule, and logits buffers.
 
@@ -261,7 +268,7 @@ def prepare_fp4_prefill_workspace(
 
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     if workspace is None:
-        rows, _, padded_width = padded_page_table_shape(page_table, bucket)
+        rows, _, padded_width = padded_page_table_shape(page_table, page_table_bucket)
         cta_count = max(_PREFILL_BASE_CTA_TARGET, rows)
         device = page_table.device
         buffers = PrefillScheduleBuffers(rows, device)
@@ -294,7 +301,7 @@ def prepare_fp4_prefill_workspace(
         block_k=256,
         guarded_out=workspace.guarded_page_table,
         buffers=workspace.schedule_buffers,
-        bucket=bucket,
+        page_table_bucket=page_table_bucket,
     )
     return workspace
 
@@ -342,7 +349,7 @@ def aiter_fp4_paged_mqa_logits(
         )
 
         page_table, max_seq_len = _guard_page_table(
-            page_table, bucket=page_table_bucket
+            page_table, page_table_bucket=page_table_bucket
         )
         cta_count = _decode_cta_count(num_tokens, max_seq_len)
         cta_info = torch.empty(
@@ -382,7 +389,7 @@ def aiter_fp4_paged_mqa_logits(
             parallel_unit_num=cta_count,
             max_seq_len=max_seq_len,
             block_k=256,
-            bucket=page_table_bucket,
+            page_table_bucket=page_table_bucket,
         )
         fallback_schedule = (cta_info, cta_count, buffers)
     q_payload = q_fp4.view(torch.uint8)
@@ -807,7 +814,7 @@ def _index_q_pack_weights_kernel(
         )
 
 
-def index_q_pack_weights_hip(
+def index_q_rope_pack_weights_flydsl(
     q: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
@@ -819,7 +826,7 @@ def index_q_pack_weights_hip(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The HIP index-Q inputs in one launch: (q_fp4 [T, H, 64] int8, q_scale [T, 1, 4, 16, 4]
     uint8, weights [T, H] bf16), bitwise pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
-    freqs_cis[positions], rope_dim)) and rocm_indexer_head_weights's reduce of the
+    freqs_cis[positions], rope_dim)) and indexer_head_weights's reduce of the
     [split_k, T, H] fp32 head_weight_partials."""
     T = q.shape[0]
     H = num_heads
@@ -866,7 +873,7 @@ def index_q_pack_weights_hip(
     return q_fp4, q_scale, weights
 
 
-def rocm_indexer_head_weights(
+def indexer_head_weights(
     x: torch.Tensor, weight: torch.Tensor, scale: float
 ) -> torch.Tensor:
     """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the layout the
