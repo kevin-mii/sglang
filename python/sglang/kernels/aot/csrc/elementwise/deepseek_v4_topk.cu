@@ -256,6 +256,11 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, uint32
 
 // Bitonic sort of n (a power of two, 64 <= n <= kMaxTopK) 32-bit keys, one per thread: strides
 // below the wavefront width exchange through lane shuffles, the wider ones through LDS.
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
+constexpr uint32_t kWaveSize = 32;  // RDNA and gfx1250 run 32-lane waves
+#else
+constexpr uint32_t kWaveSize = 64;
+#endif
 
 // lane ^ J's value in registers: DPP for J <= 8, gfx950 permlane swaps for J = 16, 32; __shfl_xor
 // is an LDS round trip on every stage's dependent chain.
@@ -288,7 +293,7 @@ __device__ __forceinline__ uint32_t lane_xor(uint32_t v) {
     return (__lane_id() & 32) ? pair[0] : pair[1];
   }
 #endif
-  return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), static_cast<int>(J), 64));
+  return static_cast<uint32_t>(__shfl_xor(static_cast<int>(v), static_cast<int>(J), kWaveSize));
 }
 
 // One bitonic stage (merge size K, stride J); templated so the network unrolls with no stride switch.
@@ -297,7 +302,7 @@ __device__ __forceinline__ uint32_t bitonic_stage(uint32_t v, uint32_t* __restri
   const bool up = (tx & K) == 0;
   const bool lower = (tx & J) == 0;
   uint32_t w;
-  if constexpr (J >= 64) {
+  if constexpr (J >= kWaveSize) {
     __syncthreads();
     if (tx < n) s_vals[tx] = v;
     __syncthreads();
@@ -332,47 +337,21 @@ __device__ void bitonic_sort_fixed(uint32_t* __restrict__ s_vals) {
   __syncthreads();
 }
 
+// one value per thread: the block covers the largest top-k
+static_assert(kBlockSize >= kMaxTopK);
+
 __device__ void bitonic_sort_u32(uint32_t* __restrict__ s_vals, uint32_t n) {
-  const uint32_t tx = threadIdx.x;
-  if (n <= kBlockSize) {
-    switch (n) {
-      case 64:
-        bitonic_sort_fixed<64>(s_vals);
-        return;
-      case 128:
-        bitonic_sort_fixed<128>(s_vals);
-        return;
-      case 256:
-        bitonic_sort_fixed<256>(s_vals);
-        return;
-      case 512:
-        bitonic_sort_fixed<512>(s_vals);
-        return;
-      default:
-        if constexpr (kBlockSize >= 1024) {
-          bitonic_sort_fixed<1024>(s_vals);
-          return;
-        }
-        break;
-    }
-  }
-  // more values than threads (a smaller block than kMaxTopK): every stage through LDS
-  for (uint32_t k = 2; k <= n; k <<= 1) {
-    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
-      for (uint32_t i = tx; i < n; i += kBlockSize) {
-        const uint32_t partner = i ^ j;
-        if (partner > i) {
-          const uint32_t a = s_vals[i];
-          const uint32_t b = s_vals[partner];
-          const bool up = (i & k) == 0;
-          if ((a > b) == up) {
-            s_vals[i] = b;
-            s_vals[partner] = a;
-          }
-        }
-      }
-      __syncthreads();
-    }
+  switch (n) {
+    case 64:
+      return bitonic_sort_fixed<64>(s_vals);
+    case 128:
+      return bitonic_sort_fixed<128>(s_vals);
+    case 256:
+      return bitonic_sort_fixed<256>(s_vals);
+    case 512:
+      return bitonic_sort_fixed<512>(s_vals);
+    default:
+      return bitonic_sort_fixed<kMaxTopK>(s_vals);
   }
 }
 
