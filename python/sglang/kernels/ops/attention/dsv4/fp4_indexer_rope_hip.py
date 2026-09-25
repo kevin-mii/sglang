@@ -25,9 +25,9 @@ def _jit_index_k_split_module(
 ) -> Module:
     args = make_cpp_args(head_dim, rope_dim, page_size, ratio, is_arch_support_pdl())
     return load_jit(
-        make_name("fp4_rope_split_hip"),
+        make_name("index_k_rope_pack_split"),
         *args,
-        cuda_files=["deepseek_v4/fp4_rope_hip.cuh"],
+        cuda_files=["deepseek_v4/fp4_indexer_rope_hip.cuh"],
         cuda_wrappers=[("index_k_split", f"FlashIndexKSplitKernel<{args}>::run")],
     )
 

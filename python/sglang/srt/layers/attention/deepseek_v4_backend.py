@@ -2985,7 +2985,7 @@ class DeepseekV4AttnBackend(
             assert out_loc is not None
             if pool.low_ratio_index_k_is_split(layer_id):
                 # ROCm keeps the index-K payload and scales in two buffers
-                from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
                     index_k_norm_rope_pack_store_split,
                 )
 

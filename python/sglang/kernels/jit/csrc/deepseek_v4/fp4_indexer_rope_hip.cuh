@@ -5,7 +5,7 @@
 #pragma once
 
 #ifndef USE_ROCM
-#error "fp4_rope_hip.cuh writes the FlyDSL index-K layout, which exists on ROCm only"
+#error "fp4_indexer_rope_hip.cuh writes the FlyDSL index-K layout, which exists on ROCm only"
 #endif
 
 #include "fp4_indexer_rope.cuh"

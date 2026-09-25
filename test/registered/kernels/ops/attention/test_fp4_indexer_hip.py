@@ -992,7 +992,7 @@ def test_index_k_split_writer_matches_the_paged_writer(ratio: int) -> None:
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
         index_k_norm_rope_pack_store,
     )
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
         index_k_norm_rope_pack_store_split,
     )
 
