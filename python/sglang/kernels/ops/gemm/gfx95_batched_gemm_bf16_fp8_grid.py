@@ -296,7 +296,8 @@ def batched_gemm_bf16_fp8_grid(
     split_k: Optional[bool] = None,
 ) -> torch.Tensor:
     """x [T, G, D] bf16, w [G, R, D] bf16 -> [T, G * R] bf16 with out[t, g*R:(g+1)*R] =
-    x[t, g] @ w[g]^T, on the fp8 grid when fp8_grid; split_k forces a regime (tests)."""
+    x[t, g] @ w[g]^T, on the fp8 grid when fp8_grid; split_k=None picks the regime by shape,
+    False keeps the single launch at every T (deterministic inference)."""
     assert x.dim() == 3 and w.dim() == 3, (x.shape, w.shape)
     T, G, D = x.shape
     assert w.shape[0] == G and w.shape[2] == D, (x.shape, w.shape)

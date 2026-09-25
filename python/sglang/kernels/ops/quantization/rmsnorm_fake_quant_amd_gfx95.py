@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RMSNorm fused with the per-32 ue8m0 fp8 e4m3 fake-quant of the gfx950 bf16-dequant route; one
+"""RMSNorm fused with the per-32 ue8m0 fp8 e4m3 quantization the gfx950 dense routes consume; one
 program per row with a reduction tree fixed by the row width, so a row is batch-invariant."""
 
 from __future__ import annotations

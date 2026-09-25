@@ -5,8 +5,9 @@
   * dense GEMM via Triton ``tl.dot_scaled`` (consumes FP8 E4M3 weights + E8M0
     block scales directly, no dequant-to-BF16), lowering to the CDNA4 native MX
     matrix-core ops; ``K % 128 != 0`` falls back to dequant + ``F.linear``.
-  * the fp8 grid of the gfx950 native route (``fp8_grid_quant`` and the wrappers
-    fused producers hand it), and the bf16-dequant linear for shapes it does not tile.
+  * the fp8 grid of the gfx950 native route (``fp8_grid_quant`` and the activation
+    wrappers the fused producers emit), and the bf16-dequant linear for shapes it does
+    not tile.
 
 Replaces the FlyDSL ``v_mfma_scale_f32_32x32x64`` dense path with a single
 Triton ``dot_scaled`` GEMM: no load-time weight reformat (fp8 + E8M0 are
