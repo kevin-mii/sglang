@@ -1,9 +1,14 @@
 """The gfx950 native MXFP8 GEMV and dense route against fp64 and the bf16-dequant route: within one bf16 ulp, repeatable, batch-invariant."""
 
+import collections
+import json
+import os
+import re
 import unittest
 
 import torch
 
+from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
@@ -110,6 +115,12 @@ class TestMxfp8GemvGfx95(CustomTestCase):
             )
 
 
+def _wide_range(*shape: int) -> torch.Tensor:
+    """Values spanning 2^-12 .. 2^8, so fp32 partial sums round and their order shows."""
+    t = torch.randn(*shape, device="cuda")
+    return t * torch.exp2(torch.randint(-12, 8, shape, device="cuda").float())
+
+
 ROUTE_SHAPES = [(1792, 5120), (5120, 576)]
 # one M per kernel: the gemv, the dot_scaled tile of the 64-row bucket, that of the 4096-row bucket
 MS = (1, 33, 1025)
@@ -164,18 +175,40 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
     def test_repeatable_and_batch_invariant_inside_each_kernel(self):
         """Rows that share a kernel (the gemv up to 32 tokens; the dot_scaled GEMM in
         the 4096-row bucket) sum in the same order at every batch size, so a prefix of
-        a batch is bitwise the batch's prefix."""
-        n, k = 1792, 5120
-        w_sh, ws8, _ = self._weights(n, k, seed=1)
-        for m_lo, m_hi in ((1, 32), (1025, 1100)):
-            x = torch.randn(m_hi, k, device="cuda", dtype=torch.bfloat16)
-            full = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
-            self.assertTrue(
-                torch.equal(mxfp8_native_blockscaled_linear(x, w_sh, ws8), full)
-            )
-            for m in (m_lo, (m_lo + m_hi) // 2):
-                part = mxfp8_native_blockscaled_linear(x[:m].contiguous(), w_sh, ws8)
-                self.assertTrue(torch.equal(part, full[:m]), (m_hi, m))
+        a batch is bitwise the batch's prefix. Wide-range data, so a changed order shows."""
+        torch.manual_seed(1)
+        for n, k in ((1792, 5120), (5120, 2048)):
+            wq, ws = _quant_weight_block32(_wide_range(n, k))
+            w_sh, ws8 = prepare_mxfp8_native_weight(wq, ws, [32, 32])
+            # prefixes that stay in the batch's kernel: the gemv buckets 1 .. 32, and the
+            # dot_scaled 4096-row bucket
+            for m_hi, prefixes in ((32, (1, 4, 16)), (1100, (1025, 1062))):
+                x = _wide_range(m_hi, k).to(torch.bfloat16)
+                full = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
+                self.assertTrue(
+                    torch.equal(mxfp8_native_blockscaled_linear(x, w_sh, ws8), full)
+                )
+                for m in prefixes:
+                    part = mxfp8_native_blockscaled_linear(
+                        x[:m].contiguous(), w_sh, ws8
+                    )
+                    self.assertTrue(torch.equal(part, full[:m]), (n, k, m_hi, m))
+
+    def test_gemv_rows_of_a_shape_share_the_wave_count(self):
+        """The waves split K, so their count fixes a row's fp32 sum order: a table that
+        changes it between M buckets makes a row's bits depend on the batch size."""
+        path = os.path.join(
+            os.path.dirname(mxfp8_native_amd_gfx95.__file__),
+            "mxfp8_gemv_gfx95_configs.json",
+        )
+        with open(path) as f:
+            configs = json.load(f)["configs"]
+        waves = collections.defaultdict(set)
+        for key, config in configs.items():
+            shape = key.rsplit(":", 1)[0]
+            waves[shape].add(int(re.fullmatch(r"w(\d+)s\d+r\d+t\d+k", config)[1]))
+        mixed = {shape: sorted(w) for shape, w in waves.items() if len(w) > 1}
+        self.assertEqual(mixed, {})
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
