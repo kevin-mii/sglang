@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import swapab_attention
+from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -254,8 +255,6 @@ class TestSwapABAttention(CustomTestCase):
 
     @unittest.skipUnless(is_gfx95_supported(), "HIP fused inverse RoPE")
     def test_fused_inverse_rope(self):
-        from sglang.srt.layers.attention.hip_flash_mla import _apply_inverse_rope
-
         torch.manual_seed(103)
         q = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.25
         _, cache, _ = make_cache(32)
@@ -272,7 +271,13 @@ class TestSwapABAttention(CustomTestCase):
                 else {}
             )
             expected = swapab_attention(q, cache, indices, lengths, sink, **kwargs)
-            _apply_inverse_rope(expected, (freqs, positions))
+            fused_rope_inplace(
+                expected[..., -64:],
+                None,
+                torch.view_as_complex(freqs.view(16, 32, 2)),
+                positions,
+                inverse=True,
+            )
             actual = swapab_attention(
                 q, cache, indices, lengths, sink, inv_rope=(freqs, positions), **kwargs
             )
