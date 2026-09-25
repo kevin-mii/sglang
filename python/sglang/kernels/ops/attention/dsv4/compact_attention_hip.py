@@ -1,5 +1,7 @@
 """Sparse attention reading V4.1 FP8/FP4 pages directly on HIP."""
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import _qkpv_fp8
@@ -9,8 +11,12 @@ from triton.experimental.gluon import language as gl
 from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
     aiter_sparse_split_reduce,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
 RCP_LN2 = gl.constexpr(1.4426950408889634)  # exp(x) = exp2(x * RCP_LN2)
+TILE_SLOTS = 64
+MAX_SPLITS = 8
+PACKED_TOKEN_BYTES = (KVLayout.V41.bytes_per_token, KVLayout.V41_FP4.bytes_per_token)
 
 
 @gluon.jit
@@ -290,23 +296,27 @@ def _compact_attention_kernel(
 
 
 def compact_attention_hip(
-    q,
-    cache,
-    indices,
-    lengths,
-    sink,
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    sink: Optional[torch.Tensor],
     *,
-    extra_cache=None,
-    extra_indices=None,
-    extra_lengths=None,
-    softmax_scale=512**-0.5,
-    splits=None,
-    inv_rope=None,
-):
-    """Packed caches have shape [pages, page_size, 1, bytes_per_token]."""
+    extra_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lengths: Optional[torch.Tensor] = None,
+    softmax_scale: float = 512**-0.5,
+    splits: Optional[int] = None,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> torch.Tensor:
+    """q [n, h, 512] bf16 over the first lengths[t] slots of indices[t] (-1 skipped) in the
+    packed V41 / V41_FP4 cache [pages, page_size, 1, bytes_per_token], then those of
+    extra_indices[t] in extra_cache, the sink folded in once. inv_rope is
+    (freqs_real, positions): the tail of every head is inverse-rotated."""
     assert q.ndim == 3 and q.shape[-1] == 512 and q.dtype == torch.bfloat16
     assert q.stride(-1) == 1
-    assert cache.ndim == 4 and cache.shape[2] == 1 and cache.shape[-1] in (528, 288)
+    assert cache.ndim == 4 and cache.shape[2] == 1
+    assert cache.shape[-1] in PACKED_TOKEN_BYTES
     n, h, _ = q.shape
     if n == 0:
         return torch.empty_like(q)
@@ -317,15 +327,17 @@ def compact_attention_hip(
         extra_cache, extra_indices, extra_lengths = cache, indices, lengths
         ne = 0
     else:
-        assert extra_cache.shape[-1] in (528, 288)
+        assert extra_cache.shape[-1] in PACKED_TOKEN_BYTES
         extra_indices = extra_indices.reshape(n, -1)
         assert extra_indices.stride(-1) == 1 and extra_lengths.is_contiguous()
         ne = extra_indices.shape[1]
     if splits is None:
+        # enough splits to fill the CUs, none past the slots a row has
+        num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
         splits = min(
-            8,
-            triton.cdiv(indices.shape[1] + ne, 64),
-            triton.cdiv(256, max(1, n * triton.cdiv(h, 16))),
+            MAX_SPLITS,
+            triton.cdiv(indices.shape[1] + ne, TILE_SLOTS),
+            triton.cdiv(num_cus, n * triton.cdiv(h, 16)),
         )
     assert splits > 0
     out = torch.empty((n, h, 512), dtype=q.dtype, device=q.device) if splits == 1 else q
@@ -375,13 +387,13 @@ def compact_attention_hip(
         EIS=extra_indices.stride(0),
         NK=indices.shape[1],
         NE=ne,
-        KFP4=cache.shape[-1] == 288,
-        EFP4=extra_cache.shape[-1] == 288,
+        KFP4=cache.shape[-1] == KVLayout.V41_FP4.bytes_per_token,
+        EFP4=extra_cache.shape[-1] == KVLayout.V41_FP4.bytes_per_token,
         KBUFFER=cache.shape[0] * cache.stride(0) < 2**31,
         EBUFFER=extra_cache.shape[0] * extra_cache.stride(0) < 2**31,
         SPLITS=splits,
         SCALE=softmax_scale,
-        BLOCK=64,
+        BLOCK=TILE_SLOTS,
         num_warps=4,
     )
     if splits == 1:
