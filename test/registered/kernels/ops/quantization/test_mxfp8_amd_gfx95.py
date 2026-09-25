@@ -10,7 +10,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     fake_quant_fp8_activation,
-    mxfp8_e4m3_quantize,
+    fp8_grid_quantize,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
@@ -70,7 +70,7 @@ class TestMxfp8GemvGfx95(CustomTestCase):
             for m in (1, 17):
                 wq, ws, x = self._make(n, k, m)
                 w_sh, ws8 = shuffle_mxfp8_weight(wq), ue8m0_weight_scale(ws)
-                xq, xs = mxfp8_e4m3_quantize(x)
+                xq, xs = fp8_grid_quantize(x)
                 x_fq = fake_quant_fp8_activation(x)
                 w_deq = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
                 ref = x_fq.double() @ w_deq.double().t()
@@ -135,6 +135,8 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 # the fp8 entry points of one layer sum in the same order.
                 self.assertEqual(native_route_plan(m, n, k, has_bf16, True), plan, m)
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                # groups whose amax is below the 1e-10 floor, where a quantizer off the CUDA rule diverges
+                x[0] *= 1e-13
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
                 out = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
                 self.assertEqual(out.shape, ref.shape)
@@ -157,7 +159,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     x_fq, w_sh, ws8, w_small, input_on_fp8_grid=True
                 )
                 self.assertTrue(torch.equal(out_grid, out), (n, k, m))
-                xq, xs = mxfp8_e4m3_quantize(x)
+                xq, xs = fp8_grid_quantize(x)
                 out_q = mxfp8_native_blockscaled_linear(
                     xq, w_sh, ws8, w_small, input_scale=xs
                 )
@@ -225,7 +227,7 @@ class TestFp8LinearGfx95Routes(CustomTestCase):
                     x_grid = fake_quant_fp8_activation(x)
                     plain = layer(x)[0]
                     on_grid = layer(Fp8GridActivation(x_grid))[0]
-                    quantized = layer(Mxfp8Activation(*mxfp8_e4m3_quantize(x)))[0]
+                    quantized = layer(Mxfp8Activation(*fp8_grid_quantize(x)))[0]
                     self.assertTrue(torch.equal(on_grid, plain))
                     self.assertTrue(torch.equal(quantized, plain))
 

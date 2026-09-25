@@ -21,7 +21,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
     fake_quant_fp8_activation,
-    mxfp8_e4m3_quantize,
+    fp8_grid_quantize,
 )
 
 logger = logging.getLogger(__name__)
@@ -434,7 +434,7 @@ def mxfp8_native_blockscaled_linear(
         else:
             fp8_in = xq is not None
             if xq is None:
-                xq, xs = mxfp8_e4m3_quantize(input_2d)
+                xq, xs = fp8_grid_quantize(input_2d)
             # a weight without a bf16 copy has a row for every bucket, so the plan is never None here
             tile = _large_m_plan(m, n, k, fp8_in)
             assert tile is not None, (m, n, k, fp8_in)

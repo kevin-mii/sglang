@@ -380,18 +380,22 @@ def fp8_grid_round(xg, eps):
 
 
 @triton.jit
-def _fake_quant_fp8_kernel(
+def _fp8_grid_quant_kernel(
     x_ptr,
     out_ptr,
+    scale_ptr,
     M,
     K,
     stride_xm,
     stride_om,
+    stride_sm,
     eps,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
 ):
-    """Per-32 ue8m0 fp8 e4m3 quantize-dequantize, one program per [BLOCK_M, BLOCK_K]."""
+    """Per-32 ue8m0 fp8 e4m3 quantization, one program per [BLOCK_M, BLOCK_K]: the fp8
+    codes and ue8m0 exponents with EMIT_FP8, else their dequantized values."""
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -403,12 +407,51 @@ def _fake_quant_fp8_kernel(
         other=0.0,
     ).to(tl.float32)
     xg = tl.reshape(x, (BLOCK_M * (BLOCK_K // 32), 32))
-    q = fp8_grid_round(xg, eps)
-    out = tl.reshape(q, (BLOCK_M, BLOCK_K))
+    if EMIT_FP8:
+        q, exp = fp8_grid_quant(xg, eps)
+        out = tl.reshape(q, (BLOCK_M, BLOCK_K))
+        offs_g = pid_k * (BLOCK_K // 32) + tl.arange(0, BLOCK_K // 32)
+        tl.store(
+            scale_ptr + offs_m[:, None] * stride_sm + offs_g[None, :],
+            tl.reshape(exp, (BLOCK_M, BLOCK_K // 32)).to(tl.uint8),
+            mask=m_mask[:, None],
+        )
+    else:
+        out = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_M, BLOCK_K))
     tl.store(
         out_ptr + offs_m[:, None] * stride_om + offs_k[None, :],
         out.to(out_ptr.dtype.element_ty),
         mask=m_mask[:, None],
+    )
+
+
+def _launch_fp8_grid_quant(
+    x: torch.Tensor, out: torch.Tensor, scale: Optional[torch.Tensor], eps: float
+) -> None:
+    M, K = x.shape
+    if M == 0:
+        return
+    # per-element op, so the tile never changes the result
+    if M >= 1024 and K % 512 == 0:
+        BLOCK_M, BLOCK_K, num_warps = 32, 512, 8
+    else:
+        BLOCK_K = 256 if K % 256 == 0 else (128 if K % 128 == 0 else 32)
+        BLOCK_M, num_warps = (16 if M >= 1024 else 8), 4
+    grid = (triton.cdiv(M, BLOCK_M), K // BLOCK_K)
+    _fp8_grid_quant_kernel[grid](
+        x,
+        out,
+        scale if scale is not None else out,
+        M,
+        K,
+        x.stride(0),
+        out.stride(0),
+        scale.stride(0) if scale is not None else 0,
+        eps,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        EMIT_FP8=scale is not None,
+        num_warps=num_warps,
     )
 
 
@@ -417,30 +460,23 @@ def fake_quant_fp8_activation(x: torch.Tensor, eps: float = 1e-10) -> torch.Tens
     (the same rule as the CUDA path's sglang_per_token_group_quant_fp8(scale_ue8m0=True))."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     x = x.contiguous()
-    M, K = x.shape
     out = torch.empty_like(x)
-    if M == 0:
-        return out
-    # per-element op, so the tile never changes the result
-    if M >= 1024 and K % 512 == 0:
-        BLOCK_M, BLOCK_K, num_warps = 32, 512, 8
-    else:
-        BLOCK_K = 256 if K % 256 == 0 else (128 if K % 128 == 0 else 32)
-        BLOCK_M, num_warps = (16 if M >= 1024 else 8), 4
-    grid = (triton.cdiv(M, BLOCK_M), K // BLOCK_K)
-    _fake_quant_fp8_kernel[grid](
-        x,
-        out,
-        M,
-        K,
-        x.stride(0),
-        out.stride(0),
-        eps,
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-        num_warps=num_warps,
-    )
+    _launch_fp8_grid_quant(x, out, None, eps)
     return out
+
+
+def fp8_grid_quantize(
+    x: torch.Tensor, eps: float = 1e-10
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """bf16 [M, K] -> (fp8 e4m3 [M, K], ue8m0 exponents uint8 [M, K // 32]) under the rule
+    of fake_quant_fp8_activation, whose output they dequantize to exactly."""
+    assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
+    x = x.contiguous()
+    M, K = x.shape
+    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
+    _launch_fp8_grid_quant(x, q, scale, eps)
+    return q, scale
 
 
 def dequant_block_fp8_weight_to_bf16(
