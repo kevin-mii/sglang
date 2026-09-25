@@ -152,7 +152,7 @@ SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     // `cvt.rn.satfinite.e4m3x2` directly: |x / scale| <= 448 needs no clamp.
 #ifdef USE_ROCM
-    out[i] = fp8::rn::pack_fp8(v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale);
+    out[i] = fp8::pack_fp8(v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale);
 #else
     out[i] = fp8x2_e4m3_t{fp32x2_t{v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale}};
 #endif
@@ -175,7 +175,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   const float amax = warp::reduce_max<kTileLanes>(vec_amax(v));
 #ifdef USE_ROCM
   const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
-  const uint8_t scale_bits = static_cast<uint8_t>(std::bit_cast<uint16_t>(fp8::rn::pack_fp8(scale, scale)));
+  const auto scale_bits = static_cast<uint8_t>(fp8::pack_fp8(scale, scale));
 #else
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
