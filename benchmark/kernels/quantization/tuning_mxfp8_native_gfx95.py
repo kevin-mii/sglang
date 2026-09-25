@@ -5,8 +5,7 @@ Two tables: the scaled-MFMA GEMV config per M bucket (1 ... 32) and the dot_scal
 M bucket (64 ... 16384). Each candidate is timed by HIP-graph replay rotating over weight
 copies that together exceed the last-level cache, so the weight streams from HBM as it does
 in decode. The GEMV pick minimizes the fp8-input plus the bf16-input time: fused producers
-hand it fp8, other callers bf16. One wave count serves every M bucket of a shape: the waves
-split K, so changing it between buckets would make a row's bits depend on the batch size.
+hand it fp8, other callers bf16.
 
     python benchmark/kernels/quantization/tuning_mxfp8_native_gfx95.py --N 1792 --K 5120
 """
@@ -62,13 +61,14 @@ def make_weights(n: int, k: int):
 
 
 def tune_gemv(n: int, k: int, weights) -> dict:
-    times = {}  # (bucket, waves) -> {config key: fp8 + bf16 time}
+    rows = {}
     for bucket in native._M_BUCKETS:
         x = torch.randn(bucket, k, device="cuda", dtype=torch.bfloat16)
         xq, xs = fp8_grid_quantize(x)
         xq = xq.view(torch.uint8)
         no_scale = empty_sentinel(x.device, torch.uint8)
         out = torch.empty(bucket, n, dtype=torch.bfloat16, device="cuda")
+        times = {}
         for waves, steps, tile_rows, tokens in itertools.product(
             (4, 8, 16), (1, 2, 4), (16, 32), (16, 32)
         ):
@@ -88,18 +88,10 @@ def tune_gemv(n: int, k: int, weights) -> dict:
                 ],
                 replays=10,
             )
-            key = f"w{waves}s{steps}r{tile_rows}t{tokens}k"
-            times.setdefault((bucket, waves), {})[key] = fp8_us + bf16_us
-    waves = min(
-        (4, 8, 16),
-        key=lambda w: sum(min(times[(b, w)].values()) for b in native._M_BUCKETS),
-    )
-    rows = {}
-    for bucket in native._M_BUCKETS:
-        bucket_times = times[(bucket, waves)]
-        best = min(bucket_times, key=bucket_times.get)
+            times[f"w{waves}s{steps}r{tile_rows}t{tokens}k"] = fp8_us + bf16_us
+        best = min(times, key=times.get)
         rows[f"gfx950:{n}:{k}:{bucket}"] = best
-        print(f"gemv    M={bucket:5d}: {best} {bucket_times[best]:.2f} us (fp8 + bf16)")
+        print(f"gemv    M={bucket:5d}: {best} {times[best]:.2f} us (fp8 + bf16)")
     return rows
 
 

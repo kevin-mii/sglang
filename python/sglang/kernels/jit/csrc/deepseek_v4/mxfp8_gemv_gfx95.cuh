@@ -1,6 +1,7 @@
 // MXFP8 skinny GEMM for gfx950: out[M, N] bf16 = X[M, K] . W[N, K]^T, M <= 32, fp8 e4m3 operands,
 // one ue8m0 scale per 32 K on both sides, fp32 accumulation on v_mfma_scale_f32_16x16x128_f8f6f4.
-// The sum order is fixed by (tile, wave, step): repeated calls are bitwise equal, rows batch-invariant.
+// The sum order is fixed by (tile, wave, step): repeated calls are bitwise equal, and a row's bits depend
+// on the config (its wave count), not on M.
 //
 // Operand layout of the 16x16x128 scaled MFMA (undocumented):
 //   data:  lane l holds 32 bytes of row l % 16, g = l / 16: bytes 0..15 are K [32(g/2) + 16(g%2), +16),
