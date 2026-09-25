@@ -8,11 +8,6 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.srt.utils import is_hip
-
-# libdevice.exp / div_rn do not lower on HIP; tl.exp and / are exact against torch on gfx950
-_USE_LIBDEVICE = not is_hip()
-
 
 @triton.jit
 def _c2_decode_pool_kernel(
@@ -33,7 +28,6 @@ def _c2_decode_pool_kernel(
     STATE_SCORE_STRIDE: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    LIBDEVICE: tl.constexpr,
 ):
     row = tl.program_id(0)
 
@@ -89,23 +83,15 @@ def _c2_decode_pool_kernel(
             mask=mask,
         )
 
-    # CUDA takes libdevice.exp, not tl.exp: the approximate exponential changes the latent.
+    # libdevice.exp, not tl.exp: the approximate exponential changes the latent.
     m = tl.maximum(p_score, score)
-    if LIBDEVICE:
-        e0 = libdevice.exp(p_score - m)
-        e1 = libdevice.exp(score - m)
-    else:
-        e0 = tl.exp(p_score - m)
-        e1 = tl.exp(score - m)
+    e0 = libdevice.exp(p_score - m)
+    e1 = libdevice.exp(score - m)
     denom = e0 + e1
     # The + 0.0 below prevents FMA contraction: torch rounds both products first.
-    # CUDA: libdevice.div_rn matches torch division; Triton's / is an approximate reciprocal.
-    if LIBDEVICE:
-        t0 = p_kv * libdevice.div_rn(e0, denom)
-        t1 = kv * libdevice.div_rn(e1, denom)
-    else:
-        t0 = p_kv * (e0 / denom)
-        t1 = kv * (e1 / denom)
+    # tl.div_rn matches torch division; Triton's / is an approximate reciprocal on CUDA.
+    t0 = p_kv * tl.div_rn(e0, denom)
+    t1 = kv * tl.div_rn(e1, denom)
     t0 = t0 + 0.0
     t1 = t1 + 0.0
     pooled = t0 + t1
@@ -160,7 +146,6 @@ def c2_decode_pool(
         STATE_SCORE_STRIDE=state_score.stride(0),
         D=D,
         BLOCK_D=triton.next_power_of_2(D),
-        LIBDEVICE=_USE_LIBDEVICE,
         num_warps=4,
     )
     return pooled, group_pos, slots
