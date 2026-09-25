@@ -44,14 +44,12 @@ class TestRocmRouterGate(CustomTestCase):
             ROCM_ROUTER_MAX_TOKENS,
             rocm_router_gate,
             rocm_router_gemv_split_k,
-            rocm_router_max_tokens,
             rocm_router_reduce_partials,
         )
 
         self.max_tokens = ROCM_ROUTER_MAX_TOKENS
         self.gate = rocm_router_gate
         self.gemv = rocm_router_gemv_split_k
-        self.max_tokens_for = rocm_router_max_tokens
         self.reduce = rocm_router_reduce_partials
         self.device = torch.device("cuda")
         self.gen = torch.Generator(device=self.device).manual_seed(0)
@@ -63,41 +61,38 @@ class TestRocmRouterGate(CustomTestCase):
         return torch.randn(*shape, device=self.device, generator=self.gen) * scale
 
     def _assert_same_gate(self, logits, bias, renorm=True, rsf=ROUTED_SCALING, msg=""):
-        for topk in (TOPK,):
-            ref_w, ref_i = _aiter_gate(logits, bias, topk, renorm, rsf)
-            out_w, out_i = self.gate(logits, bias, topk, renorm, rsf)
-            self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg} topk {topk}")
-            self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg} topk {topk}")
+        ref_w, ref_i = _aiter_gate(logits, bias, TOPK, renorm, rsf)
+        out_w, out_i = self.gate(logits, bias, TOPK, renorm, rsf)
+        self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg}")
+        self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg}")
 
     def test_gate_matches_aiter_on_ties(self):
         zero_bias = torch.zeros(NUM_EXPERTS, device=self.device, dtype=torch.bfloat16)
-        for num_tokens in (512,):
-            levels = torch.randint(
-                0, 8, (num_tokens, NUM_EXPERTS), device=self.device, generator=self.gen
-            ).float()
-            self._assert_same_gate(levels - 3, self.bias_bf16, msg="8 levels")
-            self._assert_same_gate(
-                torch.zeros(num_tokens, NUM_EXPERTS, device=self.device),
-                zero_bias,
-                msg="all equal",
-            )
-            few = torch.full(
-                (num_tokens, NUM_EXPERTS), float("-inf"), device=self.device
-            )
-            few[:, :3] = 1.0
-            self._assert_same_gate(few, zero_bias, msg="3 finite experts")
+        num_tokens = 512
+        levels = torch.randint(
+            0, 8, (num_tokens, NUM_EXPERTS), device=self.device, generator=self.gen
+        ).float()
+        self._assert_same_gate(levels - 3, self.bias_bf16, msg="8 levels")
+        self._assert_same_gate(
+            torch.zeros(num_tokens, NUM_EXPERTS, device=self.device),
+            zero_bias,
+            msg="all equal",
+        )
+        few = torch.full((num_tokens, NUM_EXPERTS), float("-inf"), device=self.device)
+        few[:, :3] = 1.0
+        self._assert_same_gate(few, zero_bias, msg="3 finite experts")
 
     def test_gate_matches_aiter_non_finite(self):
-        for num_tokens in (16,):
-            logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-            logits[logits < 0] = float("-inf")
-            self._assert_same_gate(logits, self.bias_bf16, msg="-inf")
-            logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-            logits[:, ::7] = float("nan")
-            self._assert_same_gate(logits, self.bias_bf16, msg="nan")
-            logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-            logits[:, 5] = float("inf")
-            self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
+        num_tokens = 16
+        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
+        logits[logits < 0] = float("-inf")
+        self._assert_same_gate(logits, self.bias_bf16, msg="-inf")
+        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
+        logits[:, ::7] = float("nan")
+        self._assert_same_gate(logits, self.bias_bf16, msg="nan")
+        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
+        logits[:, 5] = float("inf")
+        self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
 
     def test_gemv_accuracy_batch_invariance_and_repeatability(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)

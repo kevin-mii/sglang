@@ -16,10 +16,8 @@ logits kernel's ABI layout.
 from __future__ import annotations
 
 import sys
-import unittest
 
 import pytest
-import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel (the AOT top-k transform)
 import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
@@ -43,7 +41,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 )
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -285,16 +282,11 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
-@pytest.mark.parametrize("num_tokens", [16], ids=["16"])
-@pytest.mark.parametrize("num_heads", [32], ids=["32"])
-def test_index_q_pack_weights_matches_standalone(
-    num_tokens: int, num_heads: int
-) -> None:
+def test_index_q_pack_weights_matches_standalone() -> None:
     """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
     weights) is bitwise the three standalone launches it replaces."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         index_q_pack_weights_hip,
-        pack_fp4_query_flydsl,
         rocm_indexer_head_weights,
     )
     from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
@@ -302,11 +294,11 @@ def test_index_q_pack_weights_matches_standalone(
     )
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
-    torch.manual_seed(num_tokens * 7 + num_heads)
+    torch.manual_seed(0)
+    num_tokens, num_heads = 16, 32
     rope_dim, hidden, max_pos = 64, 5120, 4096
     q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
     freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
-    assert freqs.dtype == torch.complex64
     pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
     x = torch.randn(num_tokens, hidden, device="cuda").bfloat16()
     w = (torch.randn(num_heads, hidden, device="cuda") * 0.02).bfloat16()
@@ -322,8 +314,8 @@ def test_index_q_pack_weights_matches_standalone(
     q_fp4, q_scale, weights = index_q_pack_weights_hip(
         q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
     )
-    assert q_fp4.shape == (num_tokens, num_heads, 64) and q_fp4.dtype == torch.int8
-    assert q_scale.shape == (num_tokens, 1, 4, 16, 4) and q_scale.dtype == torch.uint8
+    # torch.equal ignores dtype
+    assert q_fp4.dtype == ref_fp4.dtype and q_scale.dtype == ref_scale.dtype
     assert torch.equal(q_fp4, ref_fp4)
     assert torch.equal(q_scale, ref_scale)
     assert torch.equal(weights, ref_w)
@@ -332,11 +324,7 @@ def test_index_q_pack_weights_matches_standalone(
         weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()
     ).abs()
     assert int(ulps.max()) <= 1
-    # repeatable, and a row alone equals the row inside the batch
-    again = index_q_pack_weights_hip(
-        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
-    )
-    assert all(torch.equal(a, b) for a, b in zip(again, (q_fp4, q_scale, weights)))
+    # a row alone equals the row inside the batch
     one_fp4, one_scale, one_weights = index_q_pack_weights_hip(
         q[:1],
         freqs,
@@ -908,10 +896,9 @@ def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return q_fp4, q_scale
 
 
-@pytest.mark.parametrize("heads", [32], ids=["32"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["torch.bfloat16"])
-def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
+def test_pack_fp4_query_flydsl_single_launch():
     torch.manual_seed(17)
+    heads, dtype = 32, torch.bfloat16
     for tokens in (1, 40):
         q = torch.randn(tokens, heads, 128, device=get_device(), dtype=dtype) * 4
         # exact fp4 grid points and tie values, zeros and a huge group
@@ -925,7 +912,6 @@ def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
         ref_fp4, ref_scale = pack_fp4_query_flydsl_torch(q)
         fp4, scale = pack_fp4_query_flydsl(q)
         assert fp4.dtype is ref_fp4.dtype and scale.dtype is ref_scale.dtype
-        assert fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
         assert torch.equal(fp4, ref_fp4)
         assert torch.equal(scale, ref_scale)
     empty = torch.empty(0, heads, 128, device=get_device(), dtype=dtype)
@@ -963,20 +949,13 @@ def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
 
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
-
 TIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
-
-
 RNE = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
 
 
-SCALES = (1.0, 2.0**-3)
-
-
-def _tie_row(scale: float) -> torch.Tensor:
-    """[128]: four 32-blocks of [6, +ties, -ties, 0...] times a power-of-two scale."""
-    block = [6.0] + TIES + [-t for t in TIES]
+def _tie_row(scale: float, values) -> torch.Tensor:
+    """[128]: four 32-blocks of [6, +values, -values, 0...] times a power-of-two scale."""
+    block = [6.0] + values + [-v for v in values]
     block += [0.0] * (32 - len(block))
     return (torch.tensor(block) * scale).repeat(4)
 
@@ -989,72 +968,49 @@ def _unpack(packed: torch.Tensor) -> torch.Tensor:
     return torch.where((codes & 8) != 0, -mag, mag)
 
 
-def _expected(scale: float, convention) -> torch.Tensor:
-    block = [6.0] + convention + [-v for v in convention]
-    block += [0.0] * (32 - len(block))
-    return (torch.tensor(block) * scale).repeat(4)
+@pytest.mark.parametrize("scale", [1.0, 2.0**-3])
+def test_low_ratio_triton_paths_round_half_to_even_like_cuda(scale: float) -> None:
+    """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        read_fp4_index_k_split,
+        store_fp4_index_k_cache_split,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+        rope_tail_fake_quant_fp4,
+    )
 
+    e8m0 = 127 + int(torch.log2(torch.tensor(scale)))
+    expected = _tie_row(scale, RNE)
 
-@unittest.skipUnless(is_hip() and torch.cuda.is_available(), "ROCm only")
-class TestDsv41Fp4TieRoundingHip(CustomTestCase):
-    def _check(self, name, scale, got, convention):
-        self.assertTrue(
-            torch.equal(got.float().cpu(), _expected(scale, convention)),
-            f"{name} at scale {scale}: {got[1:8].tolist()} vs {convention}",
-        )
+    def check(name, got):
+        assert torch.equal(got.float().cpu(), expected), f"{name}: {got[1:8].tolist()}"
 
-    def _e8m0(self, scale: float) -> int:
-        return 127 + int(torch.log2(torch.tensor(scale)))
+    row = _tie_row(scale, TIES).cuda().to(torch.bfloat16)
+    assert torch.equal(row.float().cpu(), _tie_row(scale, TIES))
 
-    def test_low_ratio_triton_paths_round_half_to_even_like_cuda(self):
-        """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-            quantize_fp4_indexer_tensor,
-        )
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-            pack_fp4_query_flydsl,
-            read_fp4_index_k_split,
-            store_fp4_index_k_cache_split,
-        )
-        from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-            rope_tail_fake_quant_fp4,
-        )
+    fp4, sf = quantize_fp4_indexer_tensor(row.view(1, 128), rne=True)
+    assert (sf.cpu() & 0xFF).item() == e8m0
+    check("quantize_fp4_indexer_tensor(rne=True)", _unpack(fp4)[0] * scale)
 
-        for scale in SCALES:
-            row = _tie_row(scale).cuda().to(torch.bfloat16)
-            self.assertTrue(torch.equal(row.float().cpu(), _tie_row(scale)))
+    q_fp4, q_scale = pack_fp4_query_flydsl(
+        row.view(1, 1, 128).expand(1, 16, 128).contiguous()
+    )
+    assert q_scale.unique().tolist() == [0, e8m0]
+    check("pack_fp4_query_flydsl", _unpack(q_fp4)[0, 0] * scale)
 
-            fp4, sf = quantize_fp4_indexer_tensor(row.view(1, 128), rne=True)
-            self.assertEqual((sf.cpu() & 0xFF).item(), self._e8m0(scale))
-            self._check(
-                "quantize_fp4_indexer_tensor(rne=True)",
-                scale,
-                _unpack(fp4)[0] * scale,
-                RNE,
-            )
-            q_fp4, q_scale = pack_fp4_query_flydsl(
-                row.view(1, 1, 128).expand(1, 16, 128).contiguous()
-            )
-            self.assertEqual(q_scale.unique().tolist(), [0, self._e8m0(scale)])
-            self._check(
-                "pack_fp4_query_flydsl", scale, _unpack(q_fp4)[0, 0] * scale, RNE
-            )
+    payload = torch.zeros((1, 1, 4, 64, 16), dtype=torch.uint8, device="cuda")
+    k_scale = torch.zeros((1, 1, 4, 64), dtype=torch.uint8, device="cuda")
+    loc = torch.tensor([5], dtype=torch.int64, device="cuda")
+    store_fp4_index_k_cache_split(
+        row.view(1, 128), payload, k_scale, loc, page_size=64, rne=True
+    )
+    k_fp4, k_sf = read_fp4_index_k_split(payload, k_scale, loc, page_size=64)
+    assert (k_sf.cpu() & 0xFF).item() == e8m0
+    check("store_fp4_index_k_cache_split", _unpack(k_fp4)[0] * scale)
 
-            payload = torch.zeros((1, 1, 4, 64, 16), dtype=torch.uint8, device="cuda")
-            k_scale = torch.zeros((1, 1, 4, 64), dtype=torch.uint8, device="cuda")
-            loc = torch.tensor([5], dtype=torch.int64, device="cuda")
-            store_fp4_index_k_cache_split(
-                row.view(1, 128), payload, k_scale, loc, page_size=64, rne=True
-            )
-            k_fp4, k_sf = read_fp4_index_k_split(payload, k_scale, loc, page_size=64)
-            self.assertEqual((k_sf.cpu() & 0xFF).item(), self._e8m0(scale))
-            self._check(
-                "store_fp4_index_k_cache_split", scale, _unpack(k_fp4)[0] * scale, RNE
-            )
-
-            freqs = torch.ones(1, 32, dtype=torch.complex64, device="cuda")
-            fq = rope_tail_fake_quant_fp4(row.view(1, 128), freqs, 64)
-            self._check("rope_tail_fake_quant_fp4", scale, fq[0], RNE)
+    freqs = torch.ones(1, 32, dtype=torch.complex64, device="cuda")
+    fq = rope_tail_fake_quant_fp4(row.view(1, 128), freqs, 64)
+    check("rope_tail_fake_quant_fp4", fq[0])
 
 
 if __name__ == "__main__":

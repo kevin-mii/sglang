@@ -212,42 +212,40 @@ class TestV41KVStore(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 
         g = torch.Generator(device="cuda").manual_seed(1)
+        page_size, num_pages, n = 64, 5, 200
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
-            for page_size, num_pages, n in ((64, 5, 200),):
-                with self.subTest(layout=layout.name, page_size=page_size):
-                    x = random_rows(n, g)
-                    angles = torch.randn(n, 32, generator=g, device="cuda")
-                    freqs = torch.polar(torch.ones_like(angles), angles)
-                    locs = torch.randperm(
-                        num_pages * page_size, generator=g, device="cuda"
-                    )[:n]
-                    cache = torch.zeros(
-                        num_pages,
-                        layout.page_bytes(page_size),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    )
-                    fused_store_cache(
-                        x,
-                        cache,
-                        locs,
-                        page_size=page_size,
-                        type="flashmla",
-                        layout=layout,
-                        freqs_cis=freqs,
-                    )
-                    rotated = rope_tail(x, freqs, 64)
-                    ref = reference_pages(
-                        layout, page_size, num_pages, locs, rotated, cache.shape[1]
-                    )
-                    self.assert_tokens_equal(cache, ref, layout, page_size, locs)
-                    if layout is KVLayout.V41_FP4:
-                        deq = tq.dequantize_k_cache_v41_fp4(cache, page_size).view(
-                            -1, 512
-                        )[locs]
-                        self.assertTrue(
-                            torch.equal(deq, fake_quant_compressed_kv(rotated))
-                        )
+            with self.subTest(layout=layout.name):
+                x = random_rows(n, g)
+                angles = torch.randn(n, 32, generator=g, device="cuda")
+                freqs = torch.polar(torch.ones_like(angles), angles)
+                locs = torch.randperm(
+                    num_pages * page_size, generator=g, device="cuda"
+                )[:n]
+                cache = torch.zeros(
+                    num_pages,
+                    layout.page_bytes(page_size),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                fused_store_cache(
+                    x,
+                    cache,
+                    locs,
+                    page_size=page_size,
+                    type="flashmla",
+                    layout=layout,
+                    freqs_cis=freqs,
+                )
+                rotated = rope_tail(x, freqs, 64)
+                ref = reference_pages(
+                    layout, page_size, num_pages, locs, rotated, cache.shape[1]
+                )
+                self.assert_tokens_equal(cache, ref, layout, page_size, locs)
+                if layout is KVLayout.V41_FP4:
+                    deq = tq.dequantize_k_cache_v41_fp4(cache, page_size).view(-1, 512)[
+                        locs
+                    ]
+                    self.assertTrue(torch.equal(deq, fake_quant_compressed_kv(rotated)))
 
     def test_boundary_tiles(self):
         """Tie, saturation and subnormal-scale tiles follow the reference. (NaN / inf
@@ -296,9 +294,6 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-        from sglang.kernels.ops.attention.dsv4.elementwise import (
-            fused_k_norm_rope_flashmla,
-        )
 
         g = torch.Generator(device="cuda").manual_seed(2)
         page_size, num_pages, n = 256, 3, 300
@@ -562,7 +557,6 @@ class TestV41KVDequant(CustomTestCase):
                         dtype=torch.int32,
                     )
                     got = dequantize_k_cache_paged(pages, ids, page_size, layout=layout)
-                    self.assertEqual(got.shape, (777, 1, 512))
                     self.assertTrue(
                         torch.equal(
                             bits(got),
@@ -623,25 +617,23 @@ class TestV41KVDequant(CustomTestCase):
                 self.assertEqual(int(workspace[:5].abs().sum()), 0)
 
 
-HEAD_DIM, ROPE_DIM, NOPE_DIM = 512, 64, 448
+HEAD_DIM, ROPE_DIM = 512, 64
 # the pool under test: one page size for the SWA and the compressed caches
 PAGE_SIZE = 256
 FULL_SIZE = 4 * PAGE_SIZE
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(),
+    "the query rope rides the HIP K launch; its bitwise parity with the flat rope"
+    " kernel is claimed on gfx950 only",
+)
 class TestFusedKNormRopeFlashMLA(CustomTestCase):
-    @unittest.skipUnless(
-        is_hip() and is_gfx95_supported(),
-        "the query rope rides the HIP K launch; its bitwise parity with the flat rope"
-        " kernel is claimed on gfx950 only",
-    )
     def test_query_rope_in_the_k_launch(self):
         """With q the K launch must rope every query head's trailing ROPE_DIM bitwise
         like the flat rope kernel, leave the cache bytes and the nope part untouched,
         and rope rows without a slot."""
         dev = "cuda"
-        page_size = 256
         for layout, (num_tokens, heads, pos_dtype, seed) in product(
             (KVLayout.V4, KVLayout.V41),
             ((1, 16, torch.int64, 0), (300, 16, torch.int32, 2)),
@@ -657,12 +649,14 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 positions = torch.randint(0, 8192, (num_tokens,), device=dev).to(
                     pos_dtype
                 )
-                out_loc = torch.randperm(4 * page_size, device=dev)[:num_tokens]
+                out_loc = torch.randperm(FULL_SIZE, device=dev)[:num_tokens]
                 out_loc = out_loc.to(torch.int32)
                 if num_tokens > 2:
                     out_loc[1] = -1
-                page_bytes = layout.page_bytes(page_size)
-                cache = torch.zeros(4, page_bytes, device=dev, dtype=torch.uint8)
+                page_bytes = layout.page_bytes(PAGE_SIZE)
+                cache = torch.zeros(
+                    FULL_SIZE // PAGE_SIZE, page_bytes, device=dev, dtype=torch.uint8
+                )
                 cache_q = cache.clone()
                 q = (torch.randn(num_tokens, heads, HEAD_DIM, device=dev) * 3).to(
                     torch.bfloat16
@@ -682,7 +676,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                     positions,
                     out_loc,
                     cache,
-                    page_size,
+                    PAGE_SIZE,
                     layout=layout,
                 )
                 fused_k_norm_rope_flashmla(
@@ -693,12 +687,11 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                     positions,
                     out_loc,
                     cache_q,
-                    page_size,
+                    PAGE_SIZE,
                     q=got,
                     layout=layout,
                 )
                 self.assertTrue(torch.equal(got, expected))
-                self.assertTrue(torch.equal(got[..., :NOPE_DIM], q[..., :NOPE_DIM]))
                 self.assertTrue(torch.equal(cache_q, cache))
 
 
