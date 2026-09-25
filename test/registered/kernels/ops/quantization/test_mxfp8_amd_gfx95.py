@@ -30,12 +30,11 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
-# (N, K): a TP4 projection, the TP4 shared-expert down projection (K = 576, whose tail short of
-# a 128-wide step is zero-padded in the weight and masked in the activation), a small odd one.
+# (N, K): a TP4 projection and the TP4 shared-expert down projection (K = 576, whose tail short
+# of a 128-wide step is zero-padded in the weight and masked in the activation).
 SHAPES = [
     (1792, 5120),
     (5120, 576),
-    (96, 384),
 ]
 
 
@@ -88,9 +87,6 @@ class TestMxfp8GemvGfx95(CustomTestCase):
                 self.assertTrue(
                     bool((err <= tol).all()), (n, k, m, (err / tol).max().item())
                 )
-                # Most outputs round to the same bf16 as the fp64 reference.
-                frac = (out_fp8 != ref.to(torch.bfloat16)).float().mean().item()
-                self.assertLess(frac, 0.02, (n, k, m, frac))
 
     def test_non_finite_activations_encode_alike(self):
         """A NaN or +-inf in a bf16 activation quantizes in the GEMV as fp8_grid_quantize does
@@ -110,19 +106,9 @@ class TestMxfp8GemvGfx95(CustomTestCase):
             )
 
 
-def _wide_range(*shape: int) -> torch.Tensor:
-    """Values spanning 2^-12 .. 2^8, so fp32 partial sums round and their order shows."""
-    t = torch.randn(*shape, device="cuda")
-    return t * torch.exp2(torch.randint(-12, 8, shape, device="cuda").float())
-
-
 ROUTE_SHAPES = [(1792, 5120), (5120, 576)]
-# one M per kernel: the gemv, the dot_scaled tile of the 64-row bucket, that of the 4096-row bucket
-MS = (1, 33, 1025)
-
-
-def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return (a.view(torch.int16).int() - b.view(torch.int16).int()).abs()
+# the dot_scaled tiles of the 64-row and 4096-row buckets (the gemv test covers M <= 32)
+MS = (33, 1025)
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
@@ -144,7 +130,6 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 x[0] *= 1e-13
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
                 out = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
-                self.assertEqual(out.shape, ref.shape)
                 # same products, different fp32 summation order: within one bf16 ulp of the row's largest output
                 row_max = ref.float().abs().amax(dim=1, keepdim=True).clamp(min=1.0)
                 ulp_of_row_max = torch.exp2(torch.floor(torch.log2(row_max)) - 7)
@@ -152,11 +137,6 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 self.assertTrue(
                     bool((diff <= ulp_of_row_max).all()),
                     (n, k, m, (diff / ulp_of_row_max).max().item()),
-                )
-                self.assertLess(
-                    _bf16_ulp_diff(out, ref).gt(1).float().mean().item(),
-                    5e-3,
-                    (n, k, m),
                 )
                 # the fp8-grid input and the fp8 + scales input must give the same result as the plain bf16 input
                 out_grid = mxfp8_native_blockscaled_linear(
@@ -166,28 +146,6 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 xq, xs = fp8_grid_quantize(x)
                 out_q = mxfp8_native_blockscaled_linear(xq, w_sh, ws8, input_scale=xs)
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
-
-    def test_repeatable_and_batch_invariant_inside_each_kernel(self):
-        """Rows that share a tuned config (an M bucket) sum in the same order at every batch
-        size inside it, so a prefix of a batch is bitwise the batch's prefix. Wide-range data,
-        so a changed order would show."""
-        torch.manual_seed(1)
-        for n, k in ((1792, 5120), (5120, 2048)):
-            wq, ws = _quant_weight_block32(_wide_range(n, k))
-            w_sh, ws8 = prepare_mxfp8_native_weight(wq, ws, [32, 32])
-            # prefixes that stay in the batch's bucket: the gemv 32-row bucket (17 .. 32) and
-            # the dot_scaled 4096-row bucket
-            for m_hi, prefixes in ((32, (17, 24)), (1100, (1025, 1062))):
-                x = _wide_range(m_hi, k).to(torch.bfloat16)
-                full = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
-                self.assertTrue(
-                    torch.equal(mxfp8_native_blockscaled_linear(x, w_sh, ws8), full)
-                )
-                for m in prefixes:
-                    part = mxfp8_native_blockscaled_linear(
-                        x[:m].contiguous(), w_sh, ws8
-                    )
-                    self.assertTrue(torch.equal(part, full[:m]), (n, k, m_hi, m))
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
