@@ -83,9 +83,13 @@ class TestRocmRouterGate(CustomTestCase):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
         x = self._randn(ROCM_ROUTER_MAX_TOKENS, HIDDEN).to(torch.bfloat16)
         partials = rocm_router_gemv_split_k(x, weight)
-        ref_logits = torch.empty(ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device)
+        ref_logits = torch.empty(
+            ROCM_ROUTER_MAX_TOKENS, NUM_EXPERTS, device=self.device
+        )
         rocm_router_reduce_partials(partials, ref_logits)
-        ref_w, ref_i = rocm_router_gate(ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING)
+        ref_w, ref_i = rocm_router_gate(
+            ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING
+        )
         logits = torch.full_like(ref_logits, float("nan"))
         out_w, out_i = rocm_router_gate(
             logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
