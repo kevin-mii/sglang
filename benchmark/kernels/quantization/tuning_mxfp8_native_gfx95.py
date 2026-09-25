@@ -15,6 +15,7 @@ import itertools
 import json
 
 import torch
+from triton.runtime.errors import OutOfResources
 
 from sglang.kernels.jit.utils import empty_sentinel
 from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as native
@@ -110,15 +111,18 @@ def tune_large_m(n: int, k: int, weights) -> dict:
             if split_k > 1 and bucket > 1024:
                 continue
             tile = (bm, bn, bk, warps)
-            times[f"{bm},{bn},{bk},{warps},{split_k}"] = graph_time_us(
-                [
-                    lambda w=w: native._mxfp8_shuffled_gemm(
-                        xq, xs, w[0], w[1], tile, split_k
-                    )
-                    for w in weights
-                ],
-                replays=5,
-            )
+            try:
+                times[f"{bm},{bn},{bk},{warps},{split_k}"] = graph_time_us(
+                    [
+                        lambda w=w: native._mxfp8_shuffled_gemm(
+                            xq, xs, w[0], w[1], tile, split_k
+                        )
+                        for w in weights
+                    ],
+                    replays=5,
+                )
+            except OutOfResources:
+                continue  # the tile's LDS footprint exceeds the CU's
         best = min(times, key=times.get)
         rows[f"gfx950:{n}:{k}:{bucket}"] = best
         print(f"large_m M={bucket:5d}: {best} {times[best]:.2f} us")
