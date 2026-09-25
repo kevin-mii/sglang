@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
 from .kv_layout import KVLayout
 
 LAYOUT = KVLayout.V4
@@ -98,7 +100,7 @@ def swapab_attention(
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once."""
-    if torch.version.hip:
+    if is_hip():
         from .swapab_gluon_hip import partial_gluon
     else:
         from .decode_attention_sm100_gluon import partial_gluon
