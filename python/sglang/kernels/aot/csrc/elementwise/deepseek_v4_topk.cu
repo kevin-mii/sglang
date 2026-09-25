@@ -375,7 +375,7 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_kernel(
   __shared__ int32_t s_topk_indices[kMaxTopK];
   __shared__ uint32_t s_sort_vals[kMaxTopK];
 
-  // key: the position when the row has raw indices, else the slot (sort_selection_rows' order)
+  // key: the position when the row has raw indices, else the slot
   const bool key_is_position = raw_indices_ptr != nullptr;
   uint32_t count = topk;
   if (seq_len <= static_cast<int32_t>(topk)) {

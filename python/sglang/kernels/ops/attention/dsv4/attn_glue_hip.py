@@ -125,7 +125,7 @@ def expand_index_page_table(
 ) -> torch.Tensor:
     """(page_table.to(int64) * bpp).unsqueeze(-1) + arange(bpp) reshaped to
     [bs, n * bpp] int32: the block table of a low-ratio indexer-K pool that
-    pages at a fraction of a FULL page (see _expand_index_page_table)."""
+    pages at a fraction of a FULL page (candidate_indexer.expand_index_page_table)."""
     if blocks_per_page == 1:
         return page_table
     assert blocks_per_page & (blocks_per_page - 1) == 0, blocks_per_page
