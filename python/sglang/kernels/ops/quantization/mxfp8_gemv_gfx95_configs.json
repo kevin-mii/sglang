@@ -87,7 +87,7 @@
  },
  "meta": {
   "gfx": "gfx950",
-  "key": "gfx:N:K:M_bucket -> w<waves>s<steps>r<rows>t<tokens><k|n>",
+  "key": "gfx:N:K:M_bucket -> w<waves>s<steps>r<rows>t<tokens>k",
   "large_m_fp8in_picked_by": "hipblaslt_bf16 unless the dot_scaled tile alone is faster: the producer already handed over fp8 + ue8m0",
   "large_m_picked_by": "hipblaslt_bf16 unless the dot_scaled tile plus the Triton activation quant of a bf16 input is faster (HIP-graph replay)",
   "picked_by": "fastest HIP-graph replay time with the bf16 (fp8-grid) activation input"

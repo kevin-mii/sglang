@@ -5,6 +5,8 @@
   * dense GEMM via Triton ``tl.dot_scaled`` (consumes FP8 E4M3 weights + E8M0
     block scales directly, no dequant-to-BF16), lowering to the CDNA4 native MX
     matrix-core ops; ``K % 128 != 0`` falls back to dequant + ``F.linear``.
+  * the fp8 grid of the gfx950 native route (``fp8_grid_quant`` and the wrappers
+    fused producers hand it), and the bf16-dequant linear for shapes it does not tile.
 
 Replaces the FlyDSL ``v_mfma_scale_f32_32x32x64`` dense path with a single
 Triton ``dot_scaled`` GEMM: no load-time weight reformat (fp8 + E8M0 are
@@ -336,6 +338,10 @@ def dot_scaled_mxfp8_blockscaled_linear(
     return out.to(output_dtype).view(*output_shape)
 
 
+# CUDA's per_token_group_quant amax floor (LOCAL_ABSMAX_ABS); mxfp8_gemv_gfx95.cuh hard-codes it too
+FP8_GRID_AMAX_FLOOR = 1e-10
+
+
 class Fp8GridActivation(msgspec.Struct, frozen=True):
     """A bf16 activation already on the fp8 e4m3 grid with a per-32 ue8m0 scale; the bf16-dequant
     linear skips fake_quant_fp8_activation for it, every other consumer unwraps .x. Not a
@@ -455,7 +461,9 @@ def _launch_fp8_grid_quant(
     )
 
 
-def fake_quant_fp8_activation(x: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+def fake_quant_fp8_activation(
+    x: torch.Tensor, eps: float = FP8_GRID_AMAX_FLOOR
+) -> torch.Tensor:
     """bf16 [M, K] -> bf16 [M, K] on the fp8 e4m3 grid with a per-32 ue8m0 scale
     (the same rule as the CUDA path's sglang_per_token_group_quant_fp8(scale_ue8m0=True))."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
@@ -466,7 +474,7 @@ def fake_quant_fp8_activation(x: torch.Tensor, eps: float = 1e-10) -> torch.Tens
 
 
 def fp8_grid_quantize(
-    x: torch.Tensor, eps: float = 1e-10
+    x: torch.Tensor, eps: float = FP8_GRID_AMAX_FLOOR
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """bf16 [M, K] -> (fp8 e4m3 [M, K], ue8m0 exponents uint8 [M, K // 32]) under the rule
     of fake_quant_fp8_activation, whose output they dequantize to exactly."""
@@ -492,7 +500,7 @@ def dequant_block_fp8_weight_to_bf16(
 
 
 # at one or two rows aiter's wvSpltK (fixed-order split-K) beats hipBLASLt's small-M kernels
-SKINNY_GEMM_MAX_TOKENS = 2
+_SKINNY_GEMM_MAX_TOKENS = 2
 
 
 @cache_once
@@ -523,7 +531,7 @@ def bf16_dequant_blockscaled_linear(
     cu_count = _skinny_cu_count()
     if (
         bias is None
-        and x.shape[0] <= SKINNY_GEMM_MAX_TOKENS
+        and x.shape[0] <= _SKINNY_GEMM_MAX_TOKENS
         and cu_count > 0
         and weight.is_contiguous()
         and weight.shape[1] % 8 == 0

@@ -27,28 +27,28 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
 logger = logging.getLogger(__name__)
 
 # M <= 32: the scaled-MFMA skinny kernel (deepseek_v4/mxfp8_gemv_gfx95.cuh)
-MXFP8_GEMV_MAX_TOKENS = 32
+_GEMV_MAX_TOKENS = 32
 _TILE_N = 16
 _STEP_K = 128
 _LANES = 64
 _LANE_BYTES = 32
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "mxfp8_gemv_gfx95_configs.json")
+_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "mxfp8_gemv_gfx95_configs.json")
 # Token-count buckets of the config table: a config tuned at the bucket's upper bound.
-M_BUCKETS = (1, 2, 4, 8, 16, 32)
+_M_BUCKETS = (1, 2, 4, 8, 16, 32)
 
 
-class GemvConfig(msgspec.Struct, frozen=True):
-    waves: int = 8  # waves per workgroup: 4, 8, 16
-    steps: int = 1  # 128-K steps in flight per wave: 1, 2, 4
-    rows: int = 16  # weight rows per wave tile: 16, 32
-    tokens: int = 16  # token columns per wave tile: 16, 32 (M <= tokens)
+class _GemvConfig(msgspec.Struct, frozen=True):
+    waves: int  # waves per workgroup: 4, 8, 16
+    steps: int  # 128-K steps in flight per wave: 1, 2, 4
+    rows: int  # weight rows per wave tile: 16, 32
+    tokens: int  # token columns per wave tile: 16, 32 (M <= tokens)
 
     @staticmethod
-    def parse(key: str) -> GemvConfig:
-        # the trailing k: the waves split K and reduce through LDS (the only regime)
+    def parse(key: str) -> _GemvConfig:
+        # trailing k: the waves split K and reduce through LDS, the regime the kernel implements
         m = re.fullmatch(r"w(\d+)s(\d+)r(\d+)t(\d+)k", key)
         assert m, key
-        return GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]))
+        return _GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]))
 
     def valid_for(self, m: int, n: int) -> bool:
         return (
@@ -61,34 +61,32 @@ class GemvConfig(msgspec.Struct, frozen=True):
         )
 
 
-def default_config(m: int, k: int) -> GemvConfig:
+def _default_config(m: int, k: int) -> _GemvConfig:
     """Heuristic for shapes without a tuned row."""
     tokens = 16 if m <= 16 else 32
     if k // _STEP_K > 40:
-        return GemvConfig(4, 2, 16, tokens)
-    return GemvConfig(8, 1, 16, tokens)
+        return _GemvConfig(4, 2, 16, tokens)
+    return _GemvConfig(8, 1, 16, tokens)
 
 
 def _m_bucket(m: int) -> int:
-    for b in M_BUCKETS:
+    for b in _M_BUCKETS:
         if m <= b:
             return b
-    raise ValueError(
-        f"M={m} exceeds the skinny kernel's {MXFP8_GEMV_MAX_TOKENS} tokens"
-    )
+    raise ValueError(f"M={m} exceeds the skinny kernel's {_GEMV_MAX_TOKENS} tokens")
 
 
 @cache_once
 def _config_table(section: str) -> Dict[str, str]:
-    """One {'gfx950:N:K:M_bucket': entry} section of CONFIG_FILE."""
+    """One {'gfx950:N:K:M_bucket': entry} section of _CONFIG_FILE."""
     try:
-        with open(CONFIG_FILE) as f:
+        with open(_CONFIG_FILE) as f:
             table = json.load(f)
     except (OSError, ValueError) as err:
         # every shape then takes the heuristic, so say so instead of silently losing the tuning
         logger.warning(
             "mxfp8 gfx95 tile table %s unreadable (%s); using heuristics",
-            CONFIG_FILE,
+            _CONFIG_FILE,
             err,
         )
         return {}
@@ -100,24 +98,24 @@ def _gfx_name() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
-def select_config(m: int, n: int, k: int) -> GemvConfig:
+def _select_config(m: int, n: int, k: int) -> _GemvConfig:
     """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
-    return _select_config(_m_bucket(m), n, k)
+    return _select_bucket_config(_m_bucket(m), n, k)
 
 
 @cache_once
-def _select_config(bucket: int, n: int, k: int) -> GemvConfig:
+def _select_bucket_config(bucket: int, n: int, k: int) -> _GemvConfig:
     table = _config_table("configs")
     key = f"{_gfx_name()}:{n}:{k}:{bucket}"
     if key in table:
-        cfg = GemvConfig.parse(table[key])
+        cfg = _GemvConfig.parse(table[key])
         if cfg.valid_for(bucket, n):
             return cfg
-    return default_config(bucket, k)
+    return _default_config(bucket, k)
 
 
 @cache_once
-def _jit_mxfp8_gemv_module(cfg: GemvConfig, x_bf16: bool):
+def _jit_mxfp8_gemv_module(cfg: _GemvConfig, x_bf16: bool):
     args = make_cpp_args(cfg.waves, cfg.steps, cfg.rows, cfg.tokens, x_bf16)
     return load_jit(
         "dpsk_v4_mxfp8_gemv_gfx95",
@@ -158,10 +156,9 @@ def mxfp8_gemv(
     weight_shuffled: torch.Tensor,
     weight_scale_ue8m0: torch.Tensor,
     x_scale: Optional[torch.Tensor] = None,
-    config: Optional[GemvConfig] = None,
 ) -> torch.Tensor:
     """out[M, N] bf16 = x[M, K] . W^T on the gfx950 scaled matrix core; x is fp8 e4m3 with
-    x_scale ue8m0 [M, K/32] or bf16 quantized in-kernel; config overrides the table."""
+    x_scale ue8m0 [M, K/32] or bf16 quantized in-kernel."""
     # shapes, contiguity and the M range are checked by the launcher's TensorMatcher
     m, k = x.shape
     n = weight_shuffled.shape[0] * _TILE_N
@@ -174,10 +171,7 @@ def mxfp8_gemv(
         x_scale = x_scale.contiguous()
         x = x.view(torch.uint8)
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
-    if config is None:
-        config = select_config(m, n, k)
-    else:
-        assert config.valid_for(m, n), (config, m, n, k)
+    config = _select_config(m, n, k)
     _jit_mxfp8_gemv_module(config, x_bf16).run(
         weight_shuffled, weight_scale_ue8m0, x, x_scale, out
     )
@@ -185,15 +179,15 @@ def mxfp8_gemv(
 
 
 # M > 32: hipBLASLt bf16 on the bf16 copy or the Triton dot_scaled tile, per the table's "large_m"
-LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
-HIPBLASLT_BF16 = "hipblaslt_bf16"
+_LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
+_HIPBLASLT_BF16 = "hipblaslt_bf16"
 
 
 def _large_m_bucket(m: int) -> int:
-    for b in LARGE_M_BUCKETS:
+    for b in _LARGE_M_BUCKETS:
         if m <= b:
             return b
-    return LARGE_M_BUCKETS[-1]
+    return _LARGE_M_BUCKETS[-1]
 
 
 def _large_m_table(fp8_in: bool) -> Dict[str, str]:
@@ -208,7 +202,7 @@ def _large_m_plan(
     bf16 is the measured winner or the shape has no row (the caller then needs a bf16 copy).
     fp8_in: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
     entry = _large_m_table(fp8_in).get(f"{_gfx_name()}:{n}:{k}:{_large_m_bucket(m)}")
-    if entry is None or entry == HIPBLASLT_BF16:
+    if entry is None or entry == _HIPBLASLT_BF16:
         return None
     assert entry.startswith("ds:"), entry
     bm, bn, bk, warps, sk = (int(v) for v in entry[3:].split(","))
@@ -218,12 +212,12 @@ def _large_m_plan(
 def _weight_needs_bf16_copy(n: int, k: int) -> bool:
     """Some M > 32 bucket of this shape runs hipBLASLt bf16 for either activation encoding
     (or the shape is untuned)."""
-    keys = [f"{_gfx_name()}:{n}:{k}:{b}" for b in LARGE_M_BUCKETS]
+    keys = [f"{_gfx_name()}:{n}:{k}:{b}" for b in _LARGE_M_BUCKETS]
     for fp8_in in (False, True):
         table = _large_m_table(fp8_in)
         if not all(key in table for key in keys):
             return True
-        if any(table[key] == HIPBLASLT_BF16 for key in keys):
+        if any(table[key] == _HIPBLASLT_BF16 for key in keys):
             return True
     return False
 
@@ -232,7 +226,7 @@ def native_consumer_wants_fp8(m: int, n: int, k: int) -> bool:
     """Whether a fused producer should hand the native route fp8 + ue8m0 for m tokens of
     a consumer with weight [n, k]: the skinny kernel's range, or an M bucket whose measured
     winner with a free fp8 input is the dot_scaled tile (hipBLASLt bf16 wants bf16)."""
-    if m <= MXFP8_GEMV_MAX_TOKENS:
+    if m <= _GEMV_MAX_TOKENS:
         return True
     return _large_m_plan(m, n, k, fp8_in=True) is not None
 
@@ -384,10 +378,10 @@ def native_route_plan(
     m: int, n: int, k: int, has_bf16_copy: bool, fp8_in: bool = False
 ) -> str:
     """Which kernel serves m tokens: 'gemv', 'hipblaslt_bf16' or 'dot_scaled'."""
-    if m <= MXFP8_GEMV_MAX_TOKENS:
+    if m <= _GEMV_MAX_TOKENS:
         return "gemv"
     if has_bf16_copy and _large_m_plan(m, n, k, fp8_in) is None:
-        return HIPBLASLT_BF16
+        return _HIPBLASLT_BF16
     return "dot_scaled"
 
 
@@ -423,7 +417,7 @@ def mxfp8_native_blockscaled_linear(
                 out = mxfp8_gemv(xq, weight_shuffled, weight_scale_ue8m0, xs)
             else:
                 out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_ue8m0)
-        elif plan == HIPBLASLT_BF16:
+        elif plan == _HIPBLASLT_BF16:
             if xq is not None:
                 x = dequant_mxfp8_to_bf16(xq, xs)
             elif input_on_fp8_grid:

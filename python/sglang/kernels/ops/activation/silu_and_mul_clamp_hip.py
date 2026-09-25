@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    FP8_GRID_AMAX_FLOOR,
     Fp8GridActivation,
     Mxfp8Activation,
     fp8_grid_quant,
@@ -76,7 +77,7 @@ def silu_and_mul_clamp_triton(
     gate_up: torch.Tensor,
     swiglu_limit: float,
     fp8_grid: bool = False,
-    eps: float = 1e-10,
+    eps: float = FP8_GRID_AMAX_FLOOR,
     emit_fp8: bool = False,
 ):
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as

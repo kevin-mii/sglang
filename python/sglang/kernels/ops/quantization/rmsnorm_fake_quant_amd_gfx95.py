@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    FP8_GRID_AMAX_FLOOR,
     Fp8GridActivation,
     Mxfp8Activation,
     fp8_grid_quant,
@@ -166,7 +167,7 @@ def rmsnorm_fake_quant_fp8(
     eps: float,
     residual: Optional[torch.Tensor] = None,
     return_norm: bool = True,
-    quant_eps: float = 1e-10,
+    quant_eps: float = FP8_GRID_AMAX_FLOOR,
     emit_fp8: bool = False,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation], Optional[torch.Tensor]]:
     """fake_quant_fp8_activation(RMSNorm(x)) in one launch: (Fp8GridActivation, norm), or
