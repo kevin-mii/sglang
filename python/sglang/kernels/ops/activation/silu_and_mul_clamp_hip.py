@@ -82,6 +82,7 @@ def silu_and_mul_clamp_triton(
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
     Fp8GridActivation with fp8_grid or Mxfp8Activation with emit_fp8."""
     assert gate_up.dim() == 2 and gate_up.shape[1] % 2 == 0, gate_up.shape
+    assert gate_up.stride(1) == 1, "the kernel reads the up half at gate + inter_size"
     M, N = gate_up.shape
     inter_size = N // 2
     fp8_grid = fp8_grid or emit_fp8
