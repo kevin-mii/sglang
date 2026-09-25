@@ -6,13 +6,62 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     TensorMemoryLayout,
     allocate_tensor_memory,
     fence_async_shared,
-    get_tmem_reg_layout,
     mbarrier,
     tcgen05_commit,
     tcgen05_mma,
 )
 
-from .swapab_common import load_v4
+try:
+    # Triton 3.7.1 API
+    from triton.experimental.gluon.language.nvidia.blackwell import get_tmem_reg_layout
+except ImportError:
+    # Triton 3.8 moved this onto the descriptor type (triton-lang/triton#9594)
+    # TODO(tmorris): After we update to triton 3.8 (torch 2.15), use new API directly
+    # instead of this compatibility wrapper.
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        tensor_memory_descriptor_type,
+    )
+    from triton.runtime.jit import constexpr_function
+
+    @constexpr_function
+    def get_tmem_reg_layout(element_ty, shape, layout, num_warps):
+        ty = tensor_memory_descriptor_type(element_ty, shape, layout, shape)
+        return ty.get_reg_layout(num_warps=num_warps)
+
+
+@gluon.jit
+def _load_v4(
+    CACHE,
+    ids,
+    valid,
+    PAGE: gl.constexpr,
+    STRIDE: gl.constexpr,
+    KV_LAYOUT: gl.constexpr,
+    DATA_BYTES: gl.constexpr,
+    SCALE_BYTES: gl.constexpr,
+    TILE: gl.constexpr,
+):
+    # V4 row: 448 fp8 nope + 64 bf16 rope = DATA_BYTES, plus one ue8m0 scale per
+    # TILE values in the page's scale rows.
+    d = gl.arange(0, 512, gl.SliceLayout(0, KV_LAYOUT))
+    base = (ids // PAGE).to(gl.int64)[:, None] * STRIDE
+    slot = (ids % PAGE)[:, None]
+    mask = valid[:, None] & (d[None, :] < 448)
+    bits = gl.load(CACHE + base + slot * DATA_BYTES + d[None, :], mask, 0)
+    fp8 = bits.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+    exponent = gl.load(
+        CACHE + base + PAGE * DATA_BYTES + slot * SCALE_BYTES + d[None, :] // TILE,
+        mask,
+        0,
+    ).to(gl.int32)
+    scale = gl.where(exponent == 0, 0x00400000, exponent << 23).to(
+        gl.float32, bitcast=True
+    )
+    rope_ptr = (CACHE + base + slot * DATA_BYTES + 448 + (d[None, :] - 448) * 2).to(
+        gl.pointer_type(gl.bfloat16)
+    )
+    rope = gl.load(rope_ptr, valid[:, None] & (d[None, :] >= 448), 0)
+    return gl.where(d[None, :] < 448, fp8 * scale, rope.to(gl.float32)).to(gl.bfloat16)
 
 
 @gluon.jit
@@ -59,7 +108,7 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = load_v4(
+        kv = _load_v4(
             K,
             gl.maximum(ids, 0),
             valid,
@@ -75,7 +124,7 @@ def partial_gluon(
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = load_v4(
+        kv = _load_v4(
             E,
             gl.maximum(ids, 0),
             valid,

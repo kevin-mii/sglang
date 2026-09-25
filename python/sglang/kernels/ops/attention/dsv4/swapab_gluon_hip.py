@@ -3,7 +3,8 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from .swapab_common import load_v4
+# the V4 page load is plain gluon (no Blackwell ops), so the SM100 kernel's serves gfx950 too
+from .decode_attention_sm100_gluon import _load_v4
 
 
 @gluon.jit
@@ -50,7 +51,7 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = load_v4(
+        kv = _load_v4(
             K,
             gl.maximum(ids, 0),
             valid,
@@ -66,7 +67,7 @@ def partial_gluon(
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = load_v4(
+        kv = _load_v4(
             E,
             gl.maximum(ids, 0),
             valid,
