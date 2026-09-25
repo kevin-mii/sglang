@@ -174,7 +174,8 @@ def _low_ratio_compression_metadata_kernel(
         tl.store(c1_clamp1_ptr + r, tl.maximum(seq_len, 1), mask=m)
     if HAS_C2:
         completes = (seq_len % 2) == 0
-        tl.store(c2_out_loc_ptr + r, tl.where(completes, raw_out_loc // 2, -1), mask=mw)
+        # >> 1 floors as torch's // does; Triton's // rounds toward zero on a negative loc
+        tl.store(c2_out_loc_ptr + r, tl.where(completes, raw_out_loc >> 1, -1), mask=mw)
         tl.store(c2_clamp1_ptr + r, tl.maximum(seq_len // 2, 1), mask=m)
 
 
