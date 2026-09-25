@@ -101,7 +101,7 @@ struct FlashIndexKSplitKernel {
   template <typename PosT>
   static constexpr auto kernel = flash_index_k_split_kernel<kUsePDL, kHeadDim, kRopeDim, kPageSize, kRatio, PosT>;
 
-  /// `FlashIndexKKernel::run_index_k`'s arguments, the cache replaced by
+  /// `IndexKKernel::run_index_k`'s arguments, the cache replaced by
   /// \param payload `[npages, 1, 4, kPageSize, 16]` uint8 (the pool's
   ///        `float4_e2m1fn_x2` buffer viewed as bytes).
   /// \param scale `[npages, 1, 4, kPageSize]` uint8.

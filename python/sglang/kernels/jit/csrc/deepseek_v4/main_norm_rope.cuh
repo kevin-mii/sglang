@@ -335,10 +335,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     }
   }
 
-  // A negative out_loc marks a slot with no KV write target (e.g. the -1
-  // sentinel from the full->SWA translation for out-of-window tokens or
-  // padded rows); skip the row instead of writing out of bounds. Checked
-  // here, not at the load, so the out_loc prefetch overlaps the norm above.
+  // Before the out_loc check: a row without a KV slot still ropes its query heads.
   if constexpr (kRopeQ) {
     // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
     // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
@@ -362,6 +359,10 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     }
   }
 
+  // A negative out_loc marks a slot with no KV write target (e.g. the -1
+  // sentinel from the full->SWA translation for out-of-window tokens or
+  // padded rows); skip the row instead of writing out of bounds. Checked
+  // here, not at the load, so the out_loc prefetch overlaps the norm above.
   if (out_loc < 0) return;
 
   const auto row = Paged::row(params.kvcache, out_loc);

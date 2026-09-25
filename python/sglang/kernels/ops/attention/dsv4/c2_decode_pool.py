@@ -89,7 +89,7 @@ def _c2_decode_pool_kernel(
             mask=mask,
         )
 
-    # libdevice.exp, not tl.exp: the approximate exponential changes the latent.
+    # CUDA takes libdevice.exp, not tl.exp: the approximate exponential changes the latent.
     m = tl.maximum(p_score, score)
     if LIBDEVICE:
         e0 = libdevice.exp(p_score - m)
@@ -99,7 +99,7 @@ def _c2_decode_pool_kernel(
         e1 = tl.exp(score - m)
     denom = e0 + e1
     # The + 0.0 below prevents FMA contraction: torch rounds both products first.
-    # libdevice.div_rn matches torch division; Triton's / is an approximate reciprocal.
+    # CUDA: libdevice.div_rn matches torch division; Triton's / is an approximate reciprocal.
     if LIBDEVICE:
         t0 = p_kv * libdevice.div_rn(e0, denom)
         t1 = kv * libdevice.div_rn(e1, denom)
