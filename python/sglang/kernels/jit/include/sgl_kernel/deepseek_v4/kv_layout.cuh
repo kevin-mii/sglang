@@ -8,6 +8,7 @@
 #include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <bit>
 #include <cstdint>
 #ifndef USE_ROCM
 #include <cuda_fp4.h>
@@ -175,7 +176,8 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   const float amax = warp::reduce_max<kTileLanes>(vec_amax(v));
 #ifdef USE_ROCM
   const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
-  const auto scale_bits = static_cast<uint8_t>(fp8::pack_fp8(scale, scale));
+  // the low byte of the pack's 16-bit storage, whether fp8x2_e4m3_t is an integer or HIP's fp8 pair
+  const auto scale_bits = static_cast<uint8_t>(std::bit_cast<uint16_t>(fp8::pack_fp8(scale, scale)));
 #else
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
