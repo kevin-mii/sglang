@@ -10,9 +10,6 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_fp8_grid_supported,
     silu_and_mul_clamp_triton,
 )
-from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-    native_consumer_wants_fp8,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
@@ -34,22 +31,13 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
         and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and silu_and_mul_clamp_fp8_grid_supported(half_width)
     )
-    # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue at decode token counts
+    # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue
     mlp._hip_act_native_consumer = bool(
         mlp._hip_act_fp8_grid
         and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and mlp.down_proj.mxfp8_native_ready
     )
     mlp._fused_clamp_fp8_checked = True
-
-
-def _emit_fp8(mlp, num_tokens: int) -> bool:
-    """The silu fp8-grid epilogue hands down_proj fp8 + ue8m0 when its native kernel for
-    this token count consumes it directly (skinny range, or a measured dot_scaled bucket)."""
-    if not mlp._hip_act_native_consumer:
-        return False
-    tiles, steps, _ = mlp.down_proj.weight.shape  # lane-order [N/16, K/128, 2048]
-    return native_consumer_wants_fp8(num_tokens, tiles * 16, steps * 128)
 
 
 def silu_and_mul_clamp(mlp, gate_up: torch.Tensor):
@@ -60,5 +48,5 @@ def silu_and_mul_clamp(mlp, gate_up: torch.Tensor):
         gate_up,
         float(mlp.swiglu_limit),
         fp8_grid=mlp._hip_act_fp8_grid,
-        emit_fp8=_emit_fp8(mlp, gate_up.shape[0]),
+        emit_fp8=mlp._hip_act_native_consumer,
     )

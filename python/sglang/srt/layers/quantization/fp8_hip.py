@@ -29,18 +29,15 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
     n, k = layer.weight.shape
     layer.mxfp8_native_ready = False
     if native_route_supports(n, k):
-        # same bytes in scaled-MFMA lane order; a bf16 copy only where hipBLASLt serves M > 32
-        shuffled, scale_ue8m0, weight_bf16 = prepare_mxfp8_native_weight(
+        # same bytes in scaled-MFMA lane order
+        shuffled, scale_ue8m0 = prepare_mxfp8_native_weight(
             layer.weight.data,
             layer.weight_scale_inv.data,
             method.weight_block_size,
         )
         copy_or_rebind_param(layer, "weight", shuffled.view(torch.float8_e4m3fn))
         copy_or_rebind_param(layer, "weight_scale_mx_e8m0", scale_ue8m0)
-        if weight_bf16 is not None:
-            copy_or_rebind_param(layer, "weight_bf16", weight_bf16)
-        else:
-            layer.weight_bf16 = None
+        layer.weight_bf16 = None
         layer.mxfp8_native_ready = True
     else:
         # a shape the native kernels do not tile keeps the bf16-dequant route
@@ -61,7 +58,7 @@ def apply_dense(
     """Fp8LinearMethod.apply on the gfx950 route. x is a bf16 tensor, an (fp8, scale)
     tuple from a fused quant kernel, or one of the wrappers the fused producers emit."""
     native_route = layer.block_fp8_mxfp8_ready
-    # the native route takes the producer's fp8 + scales or fp8-grid bf16 directly
+    # the native route takes the producer's fp8 + scales directly; its fp8-grid bf16 re-encodes exactly
     input_scale, on_fp8_grid = None, False
     if isinstance(x, Mxfp8Activation):
         if native_route:
@@ -100,10 +97,8 @@ def _apply_native(
             input=x,
             weight_shuffled=layer.weight.view(torch.uint8),
             weight_scale_ue8m0=layer.weight_scale_mx_e8m0,
-            weight_bf16=layer.weight_bf16,
             input_scale=input_scale,
             bias=bias,
-            input_on_fp8_grid=input_on_fp8_grid,
         )
     if input_scale is not None:
         x = dequant_mxfp8_to_bf16(x, input_scale)

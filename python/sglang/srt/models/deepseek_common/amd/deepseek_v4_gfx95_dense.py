@@ -30,9 +30,6 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
 )
-from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-    native_consumer_wants_fp8,
-)
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     rmsnorm_fake_quant_fp8,
 )
@@ -76,31 +73,19 @@ def fused_rmsnorm_fake_quant_eligible(
     )
 
 
-def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> Optional[Tuple[int, int]]:
-    """(N, K) of linear when it runs the gfx950 native MXFP8 route with a weight the
-    native kernels tile (it then consumes fp8 + ue8m0 scales directly), else None."""
+def _is_native_mxfp8_consumer(linear: Optional[nn.Module]) -> bool:
+    """Whether linear runs the gfx950 native MXFP8 route with a weight the native kernels
+    tile, so a fused producer hands it fp8 + ue8m0 scales directly."""
     if linear is None:
-        return None
+        return False
     quant_method = linear.quant_method
-    if not (
+    return bool(
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_fp8_as_mxfp8
         and linear.block_fp8_mxfp8_ready
         and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and linear.mxfp8_native_ready
-    ):
-        return None
-    tiles, steps, _ = linear.weight.shape  # the lane-order layout [N/16, K/128, 2048]
-    return tiles * 16, steps * 128
-
-
-def _emit_native_fp8(consumer: Optional[Tuple[int, int]], num_tokens: int) -> bool:
-    """Whether the fused producer hands the native route fp8 + ue8m0 for this token count:
-    the skinny kernel's range, or an M bucket served by the dot_scaled tile (hipBLASLt
-    buckets keep the fp8-grid bf16 operand)."""
-    if consumer is None:
-        return False
-    return native_consumer_wants_fp8(num_tokens, consumer[0], consumer[1])
+    )
 
 
 def _fake_quant_applies(norm: nn.Module, x: torch.Tensor) -> bool:
@@ -115,13 +100,13 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
         q_lora = attn.q_norm(q_lora)
         return q_lora, q_lora
     if not attn._wq_b_native_consumer_checked:
-        attn._wq_b_native_consumer = _native_mxfp8_consumer(attn.wq_b)
+        attn._wq_b_native_consumer = _is_native_mxfp8_consumer(attn.wq_b)
         attn._wq_b_native_consumer_checked = True
     q_for_wq_b, q_lora = rmsnorm_fake_quant_fp8(
         q_lora,
         attn.q_norm.weight.data,
         attn.q_norm.variance_epsilon,
-        emit_fp8=_emit_native_fp8(attn._wq_b_native_consumer, q_lora.shape[0]),
+        emit_fp8=attn._wq_b_native_consumer,
     )
     return q_lora, q_for_wq_b
 
@@ -139,11 +124,11 @@ def input_norm_fake_quant(
         return norm(hidden_states), None
     if not layer._wqkv_a_native_consumer_checked:
         # wqkv_a exists only when the q / kv projections are fused
-        layer._wqkv_a_native_consumer = _native_mxfp8_consumer(
+        layer._wqkv_a_native_consumer = _is_native_mxfp8_consumer(
             layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
         )
         layer._wqkv_a_native_consumer_checked = True
-    emit_fp8 = _emit_native_fp8(layer._wqkv_a_native_consumer, hidden_states.shape[0])
+    emit_fp8 = layer._wqkv_a_native_consumer
     if coefficients is not None and not coefficients.materialized:
         x_quant, hidden_states = rmsnorm_with_sinkhorn(
             hidden_states,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints: the weight stays fp8 in
 scaled-MFMA lane order; M <= 32 runs the skinny gemv kernel, larger M the tl.dot_scaled GEMM
-or hipBLASLt bf16 per the tuned table in mxfp8_gemv_gfx95_configs.json."""
+with the tiles tuned in mxfp8_gemv_gfx95_configs.json."""
 
 from __future__ import annotations
 
@@ -17,12 +17,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    dequant_block_fp8_weight_to_bf16,
-    dequant_mxfp8_to_bf16,
-    fake_quant_fp8_activation,
-    fp8_grid_quantize,
-)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quantize
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +173,12 @@ def mxfp8_gemv(
     return out
 
 
-# M > 32: hipBLASLt bf16 on the bf16 copy or the Triton dot_scaled tile, per the table's "large_m"
+# M > 32: the Triton dot_scaled GEMM with the tile the "large_m" table gives the M bucket
 _LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
-_HIPBLASLT_BF16 = "hipblaslt_bf16"
+# Shapes without a tuned row. BK 128 divides every K the route admits; the large-M tile won
+# every tuned shape from 4096 rows up, the small-M one is untuned.
+_DEFAULT_SMALL_M_TILE = (128, 64, 128, 4, 1)
+_DEFAULT_LARGE_M_TILE = (128, 256, 128, 8, 1)
 
 
 def _large_m_bucket(m: int) -> int:
@@ -190,45 +188,14 @@ def _large_m_bucket(m: int) -> int:
     return _LARGE_M_BUCKETS[-1]
 
 
-def _large_m_table(fp8_in: bool) -> Dict[str, str]:
-    """{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}."""
-    return _config_table("large_m_fp8in" if fp8_in else "large_m")
-
-
-def _large_m_plan(
-    m: int, n: int, k: int, fp8_in: bool = False
-) -> Optional[Tuple[int, int, int, int, int]]:
-    """The dot_scaled tile (BM, BN, BK, warps, split_k) for m rows, or None when hipBLASLt
-    bf16 is the measured winner or the shape has no row (the caller then needs a bf16 copy).
-    fp8_in: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
-    entry = _large_m_table(fp8_in).get(f"{_gfx_name()}:{n}:{k}:{_large_m_bucket(m)}")
-    if entry is None or entry == _HIPBLASLT_BF16:
-        return None
-    assert entry.startswith("ds:"), entry
-    bm, bn, bk, warps, sk = (int(v) for v in entry[3:].split(","))
-    return bm, bn, bk, warps, sk
-
-
-def _weight_needs_bf16_copy(n: int, k: int) -> bool:
-    """Some M > 32 bucket of this shape runs hipBLASLt bf16 for either activation encoding
-    (or the shape is untuned)."""
-    keys = [f"{_gfx_name()}:{n}:{k}:{b}" for b in _LARGE_M_BUCKETS]
-    for fp8_in in (False, True):
-        table = _large_m_table(fp8_in)
-        if not all(key in table for key in keys):
-            return True
-        if any(table[key] == _HIPBLASLT_BF16 for key in keys):
-            return True
-    return False
-
-
-def native_consumer_wants_fp8(m: int, n: int, k: int) -> bool:
-    """Whether a fused producer should hand the native route fp8 + ue8m0 for m tokens of
-    a consumer with weight [n, k]: the skinny kernel's range, or an M bucket whose measured
-    winner with a free fp8 input is the dot_scaled tile (hipBLASLt bf16 wants bf16)."""
-    if m <= _GEMV_MAX_TOKENS:
-        return True
-    return _large_m_plan(m, n, k, fp8_in=True) is not None
+def _large_m_tile(m: int, n: int, k: int) -> Tuple[int, int, int, int, int]:
+    """The dot_scaled tile (BM, BN, BK, warps, split_k) of m's bucket."""
+    bucket = _large_m_bucket(m)
+    entry = _config_table("large_m").get(f"{_gfx_name()}:{n}:{k}:{bucket}")
+    if entry is None:
+        return _DEFAULT_SMALL_M_TILE if bucket <= 1024 else _DEFAULT_LARGE_M_TILE
+    bm, bn, bk, warps, split_k = (int(v) for v in entry.split(","))
+    return bm, bn, bk, warps, split_k
 
 
 def native_route_supports(n: int, k: int) -> bool:
@@ -238,18 +205,13 @@ def native_route_supports(n: int, k: int) -> bool:
 
 def prepare_mxfp8_native_weight(
     weight: torch.Tensor, weight_scale: torch.Tensor, block_size
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp8 [N, K] + fp32 block scales -> (shuffled fp8 bytes [N/16, K/128, 2048],
-    ue8m0 scale bytes [N/32, K/32], bf16 copy or None)."""
+    ue8m0 scale bytes [N/32, K/32])."""
     n, k = weight.shape
     assert tuple(block_size) == (32, 32), block_size
     assert native_route_supports(n, k), (n, k)
-    shuffled = shuffle_mxfp8_weight(weight.contiguous())
-    scale_ue8m0 = ue8m0_weight_scale(weight_scale)
-    weight_bf16 = None
-    if _weight_needs_bf16_copy(n, k):
-        weight_bf16 = dequant_block_fp8_weight_to_bf16(weight, weight_scale, block_size)
-    return shuffled, scale_ue8m0, weight_bf16
+    return shuffle_mxfp8_weight(weight.contiguous()), ue8m0_weight_scale(weight_scale)
 
 
 @triton.jit
@@ -374,67 +336,38 @@ def _mxfp8_shuffled_gemm(
     return out
 
 
-def native_route_plan(
-    m: int, n: int, k: int, has_bf16_copy: bool, fp8_in: bool = False
-) -> str:
-    """Which kernel serves m tokens: 'gemv', 'hipblaslt_bf16' or 'dot_scaled'."""
-    if m <= _GEMV_MAX_TOKENS:
-        return "gemv"
-    if has_bf16_copy and _large_m_plan(m, n, k, fp8_in) is None:
-        return _HIPBLASLT_BF16
-    return "dot_scaled"
-
-
 def mxfp8_native_blockscaled_linear(
     input: torch.Tensor,
     weight_shuffled: torch.Tensor,
     weight_scale_ue8m0: torch.Tensor,
-    weight_bf16: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
-    input_on_fp8_grid: bool = False,
 ) -> torch.Tensor:
-    """Dense linear of the native route. input is bf16 (plain, or on the fp8 grid
-    when input_on_fp8_grid), or fp8 e4m3 with input_scale ue8m0 [M, K/32]."""
+    """Dense linear of the native route. input is bf16 (a bf16 input already on the fp8 grid
+    re-encodes exactly), or fp8 e4m3 with input_scale ue8m0 [M, K/32]."""
     input_2d = input.view(-1, input.shape[-1])
     m, k = input_2d.shape
     n = weight_shuffled.shape[0] * 16
+    if input_scale is not None:
+        assert input_2d.dtype == torch.float8_e4m3fn, input_2d.dtype
+        xq, xs = input_2d.contiguous(), input_scale
+    else:
+        input_2d = input_2d.to(torch.bfloat16).contiguous()
     if m == 0:
         out = input_2d.new_empty((0, n), dtype=torch.bfloat16)
-    else:
-        plan = native_route_plan(
-            m, n, k, weight_bf16 is not None, input_scale is not None
-        )
+    elif m <= _GEMV_MAX_TOKENS:
         if input_scale is not None:
-            assert input_2d.dtype == torch.float8_e4m3fn, input_2d.dtype
-            xq, xs = input_2d.contiguous(), input_scale
+            out = mxfp8_gemv(xq, weight_shuffled, weight_scale_ue8m0, xs)
         else:
-            xq = xs = None
-            input_2d = input_2d.to(torch.bfloat16).contiguous()
-        if plan == "gemv":
-            if xq is not None:
-                out = mxfp8_gemv(xq, weight_shuffled, weight_scale_ue8m0, xs)
-            else:
-                out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_ue8m0)
-        elif plan == _HIPBLASLT_BF16:
-            if xq is not None:
-                x = dequant_mxfp8_to_bf16(xq, xs)
-            elif input_on_fp8_grid:
-                x = input_2d
-            else:
-                x = fake_quant_fp8_activation(input_2d)
-            out = torch.nn.functional.linear(x, weight_bf16)
-        else:
-            fp8_in = xq is not None
-            if xq is None:
-                xq, xs = fp8_grid_quantize(input_2d)
-            # a weight without a bf16 copy has a row for every bucket, so the plan is never None here
-            tile = _large_m_plan(m, n, k, fp8_in)
-            assert tile is not None, (m, n, k, fp8_in)
-            out = _mxfp8_shuffled_gemm(
-                xq, xs, weight_shuffled, weight_scale_ue8m0, tile[:4], tile[4]
-            )
+            out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_ue8m0)
+    else:
+        if input_scale is None:
+            xq, xs = fp8_grid_quantize(input_2d)
+        tile = _large_m_tile(m, n, k)
+        out = _mxfp8_shuffled_gemm(
+            xq, xs, weight_shuffled, weight_scale_ue8m0, tile[:4], tile[4]
+        )
     if bias is not None:
         out = out + bias
     if output_dtype is not None and out.dtype != output_dtype:

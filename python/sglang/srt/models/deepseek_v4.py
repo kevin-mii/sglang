@@ -1237,7 +1237,7 @@ class MQALayer(MqaAttentionBase):
             _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
         )
         self._wq_b_native_consumer_checked = False
-        self._wq_b_native_consumer = None
+        self._wq_b_native_consumer = False
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -2801,7 +2801,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
         )
         self._wqkv_a_native_consumer_checked = False
-        self._wqkv_a_native_consumer = None
+        self._wqkv_a_native_consumer = False
         # ROCm: hc_post, pre-collapse and mixing stats in one launch; the kernel only
         # supports hc_mult 4
         self.hc_boundary_fused = (

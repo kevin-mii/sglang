@@ -15,7 +15,6 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
-    native_route_plan,
     prepare_mxfp8_native_weight,
     shuffle_mxfp8_weight,
     ue8m0_weight_scale,
@@ -92,21 +91,8 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 
 
 ROUTE_SHAPES = [(1856, 5120)]
-
-
-# The plan each tested M takes on the TP4 dense shape, read off the tuned tables: a
-# decode row through the gemv, the 64-row bucket through hipBLASLt (bf16 mirror) or the
-# dot_scaled GEMM without one, the 4096-row bucket through the dot_scaled GEMM. Pinned
-# so a routing change shows up here instead of only as a numerics drift elsewhere.
-def _expected_plan(m: int, has_bf16: bool) -> str:
-    if m <= 32:
-        return "gemv"
-    if m <= 64:
-        return "hipblaslt_bf16" if has_bf16 else "dot_scaled"
-    assert 1024 < m <= 4096, m
-    return "dot_scaled"
-
-
+# one M per kernel on the TP4 dense shape: the gemv, the split-K dot_scaled tile of the
+# 64-row bucket, the single-launch tile of the 4096-row bucket
 MS = (1, 33, 1025)
 
 
@@ -120,25 +106,19 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
         torch.manual_seed(seed)
         w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
         wq, ws = _quant_weight_block32(w)
-        w_sh, ws8, w_bf16_small = prepare_mxfp8_native_weight(wq, ws, [32, 32])
+        w_sh, ws8 = prepare_mxfp8_native_weight(wq, ws, [32, 32])
         w_bf16 = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
-        return wq, ws, w_sh, ws8, w_bf16_small, w_bf16
+        return w_sh, ws8, w_bf16
 
     def test_within_one_bf16_ulp_of_the_bf16_route(self):
         for n, k in ROUTE_SHAPES:
-            wq, ws, w_sh, ws8, w_small, w_bf16 = self._weights(n, k)
-            has_bf16 = w_small is not None
+            w_sh, ws8, w_bf16 = self._weights(n, k)
             for m in MS:
-                plan = _expected_plan(m, has_bf16)
-                self.assertEqual(native_route_plan(m, n, k, has_bf16), plan, m)
-                # At these M the fp8-input table picks the same kernel, so the bf16 and
-                # the fp8 entry points of one layer sum in the same order.
-                self.assertEqual(native_route_plan(m, n, k, has_bf16, True), plan, m)
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 # groups whose amax is below the 1e-10 floor, where a quantizer off the CUDA rule diverges
                 x[0] *= 1e-13
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
-                out = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
+                out = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
                 self.assertEqual(out.shape, ref.shape)
                 # same products, different fp32 summation order: within one bf16 ulp of the row's largest output
                 row_max = ref.float().abs().amax(dim=1, keepdim=True).clamp(min=1.0)
@@ -146,7 +126,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 diff = (out.float() - ref.float()).abs()
                 self.assertTrue(
                     bool((diff <= ulp_of_row_max).all()),
-                    (n, k, m, plan, (diff / ulp_of_row_max).max().item()),
+                    (n, k, m, (diff / ulp_of_row_max).max().item()),
                 )
                 self.assertLess(
                     _bf16_ulp_diff(out, ref).gt(1).float().mean().item(),
@@ -154,15 +134,12 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     (n, k, m),
                 )
                 # the fp8-grid input and the fp8 + scales input must give the same result as the plain bf16 input
-                x_fq = fake_quant_fp8_activation(x)
                 out_grid = mxfp8_native_blockscaled_linear(
-                    x_fq, w_sh, ws8, w_small, input_on_fp8_grid=True
+                    fake_quant_fp8_activation(x), w_sh, ws8
                 )
                 self.assertTrue(torch.equal(out_grid, out), (n, k, m))
                 xq, xs = fp8_grid_quantize(x)
-                out_q = mxfp8_native_blockscaled_linear(
-                    xq, w_sh, ws8, w_small, input_scale=xs
-                )
+                out_q = mxfp8_native_blockscaled_linear(xq, w_sh, ws8, input_scale=xs)
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
     def test_repeatable_and_batch_invariant_inside_each_kernel(self):
@@ -170,23 +147,16 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
         the 4096-row bucket) sum in the same order at every batch size, so a prefix of
         a batch is bitwise the batch's prefix."""
         n, k = 1856, 5120
-        _, _, w_sh, ws8, w_small, _ = self._weights(n, k, seed=1)
-        has_bf16 = w_small is not None
-        for plan, m_lo, m_hi in (("gemv", 1, 32), ("dot_scaled", 1025, 1100)):
-            for m in (m_lo, m_hi):
-                self.assertEqual(native_route_plan(m, n, k, has_bf16), plan, m)
+        w_sh, ws8, _ = self._weights(n, k, seed=1)
+        for m_lo, m_hi in ((1, 32), (1025, 1100)):
             x = torch.randn(m_hi, k, device="cuda", dtype=torch.bfloat16)
-            full = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
+            full = mxfp8_native_blockscaled_linear(x, w_sh, ws8)
             self.assertTrue(
-                torch.equal(
-                    mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small), full
-                )
+                torch.equal(mxfp8_native_blockscaled_linear(x, w_sh, ws8), full)
             )
             for m in (m_lo, (m_lo + m_hi) // 2):
-                part = mxfp8_native_blockscaled_linear(
-                    x[:m].contiguous(), w_sh, ws8, w_small
-                )
-                self.assertTrue(torch.equal(part, full[:m]), (plan, m_hi, m))
+                part = mxfp8_native_blockscaled_linear(x[:m].contiguous(), w_sh, ws8)
+                self.assertTrue(torch.equal(part, full[:m]), (m_hi, m))
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
