@@ -24,6 +24,8 @@ _GATE_NUM_EXPERTS = _WARP * 6
 _MAX_TOPK = 16
 
 _FLT_MAX = tl.constexpr(3.4028234663852886e38)
+_LOG2_E = tl.constexpr(1.4426950408889634)
+_LN_2 = tl.constexpr(0.6931471805599453)
 
 
 def rocm_gemv_split_k_max_tokens(*, n: int, k: int, weight_dtype: torch.dtype) -> int:
@@ -176,8 +178,8 @@ def rocm_router_reduce_partials(partials: torch.Tensor, out: torch.Tensor) -> No
 def _score(x):
     # aiter compute_score<SQRTSOFTPLUS>: +inf clamps to FLT_MAX, NaN passes, sqrt correctly rounded
     x = tl.where(x > _FLT_MAX, _FLT_MAX, x)
-    t = tl.exp2(x * 1.4426950408889634)
-    sp = tl.where(x > 20.0, x, tl.log2(1.0 + t) * 0.6931471805599453)
+    t = tl.exp2(x * _LOG2_E)
+    sp = tl.where(x > 20.0, x, tl.log2(1.0 + t) * _LN_2)
     return tl.sqrt_rn(sp)
 
 

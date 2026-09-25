@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
+from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -792,7 +793,7 @@ def _index_q_pack_weights_kernel(
         # scale bytes: chunk c of head h at [t, 0, c, h % 16, h // 16]
         c = tl.arange(0, 4)
         sf_bytes = ((packed_sf >> (8 * c)) & 0xFF).to(tl.uint8)
-        base = q_scale_ptr + t.to(tl.int64) * 256 + c * 64 + (h % 16) * 4
+        base = q_scale_ptr + t.to(tl.int64) * (4 * 16 * 4) + c * (16 * 4) + (h % 16) * 4
         tl.store(base + h // 16, sf_bytes)
         if h < 16:
             # groups this head count does not have stay zero
@@ -879,8 +880,6 @@ def indexer_head_weights(
     """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the layout the
     FlyDSL logits kernels take. x bf16 [M, K] and weight bf16 [N, K], with
     M <= rocm_gemv_split_k_max_tokens(n=N, k=K, weight_dtype=torch.bfloat16)."""
-    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
-
     partials = rocm_router_gemv_split_k(x, weight)
     split_k, M, N = partials.shape
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
