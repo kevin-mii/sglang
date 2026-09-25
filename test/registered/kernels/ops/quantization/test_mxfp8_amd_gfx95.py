@@ -16,8 +16,6 @@ from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
     prepare_mxfp8_native_weight,
-    shuffle_mxfp8_weight,
-    ue8m0_weight_scale,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -32,21 +30,26 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
-# (N, K) of the TP4 dense projections plus a small odd one.
+# (N, K): a TP4 projection, the TP4 shared-expert down projection (K = 576, whose tail short of
+# a 128-wide step is zero-padded in the weight and masked in the activation), a small odd one.
 SHAPES = [
-    (1856, 5120),
+    (1792, 5120),
+    (5120, 576),
     (96, 384),
 ]
 
 
 def _quant_weight_block32(w: torch.Tensor):
-    """fp8 e4m3 weight with one ue8m0 (power of two, fp32) scale per 32x32 block, ceil rule."""
+    """fp8 e4m3 weight with one ue8m0 (power of two, fp32) scale per 32x32 block, ceil rule;
+    a last row block short of 32 rows gets its own scale, as in a checkpoint."""
     n, k = w.shape
-    blocks = w.float().view(n // 32, 32, k // 32, 32)
+    row_blocks = -(-n // 32)
+    padded = torch.nn.functional.pad(w.float(), (0, 0, 0, row_blocks * 32 - n))
+    blocks = padded.view(row_blocks, 32, k // 32, 32)
     amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-30)
     e = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
-    q = (blocks / torch.exp2(e)).clamp(-448, 448).to(torch.float8_e4m3fn).view(n, k)
-    return q, torch.exp2(e).view(n // 32, k // 32)
+    q = (blocks / torch.exp2(e)).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q.view(row_blocks * 32, k)[:n], torch.exp2(e).view(row_blocks, k // 32)
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 scaled-MFMA kernel")
@@ -68,7 +71,7 @@ class TestMxfp8GemvGfx95(CustomTestCase):
         for n, k in SHAPES:
             for m in (1, 17):
                 wq, ws, x = self._make(n, k, m)
-                w_sh, ws8 = shuffle_mxfp8_weight(wq), ue8m0_weight_scale(ws)
+                w_sh, ws8 = prepare_mxfp8_native_weight(wq, ws, [32, 32])
                 xq, xs = fp8_grid_quantize(x)
                 x_fq = fake_quant_fp8_activation(x)
                 w_deq = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
@@ -90,9 +93,8 @@ class TestMxfp8GemvGfx95(CustomTestCase):
                 self.assertLess(frac, 0.02, (n, k, m, frac))
 
 
-ROUTE_SHAPES = [(1856, 5120)]
-# one M per kernel on the TP4 dense shape: the gemv, the split-K dot_scaled tile of the
-# 64-row bucket, the single-launch tile of the 4096-row bucket
+ROUTE_SHAPES = [(1792, 5120), (5120, 576)]
+# one M per kernel: the gemv, the dot_scaled tile of the 64-row bucket, that of the 4096-row bucket
 MS = (1, 33, 1025)
 
 
@@ -146,7 +148,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
         """Rows that share a kernel (the gemv up to 32 tokens; the dot_scaled GEMM in
         the 4096-row bucket) sum in the same order at every batch size, so a prefix of
         a batch is bitwise the batch's prefix."""
-        n, k = 1856, 5120
+        n, k = 1792, 5120
         w_sh, ws8, _ = self._weights(n, k, seed=1)
         for m_lo, m_hi in ((1, 32), (1025, 1100)):
             x = torch.randn(m_hi, k, device="cuda", dtype=torch.bfloat16)
@@ -187,8 +189,13 @@ class TestFp8LinearGfx95Routes(CustomTestCase):
         return layer
 
     def test_wrapped_inputs_match_the_plain_input(self):
-        # K = 5152 is a 32-block width the 128-wide native K steps do not tile
-        for n, k, native in ((1856, 5120, True), (1856, 5152, False)):
+        # K = 5152 takes the native route through its K tail; N = 1872 ends in half a
+        # 32-row scale block, which only the bf16-dequant route serves
+        for n, k, native in (
+            (1856, 5120, True),
+            (1856, 5152, True),
+            (1872, 5120, False),
+        ):
             layer = self._linear(n, k)
             self.assertEqual(layer.mxfp8_native_ready, native, (n, k))
             for m in (1, 33, 1025):

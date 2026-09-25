@@ -7,7 +7,8 @@
 //          bytes 16..31 the same 16 K positions 64 later.
 //   scale: lane 16s + row supplies the ue8m0 scale of its row's 32-block s (byte op_sel 0).
 //   acc:   acc[r] of lane l is D[row 4g + r][col l % 16].
-// The weight is stored in this lane order at load (`shuffle_mxfp8_weight`): [N/16][K/128][64][32 B].
+// The weight is stored in this lane order at load (`shuffle_mxfp8_weight`): [N/16][KP/128][64][32 B],
+// KP = K rounded up to 128 with zero padding; the activation's K tail (K % 32 == 0) is masked.
 //
 // X_BF16 = false: X is fp8 e4m3 [M, K] with ue8m0 scales XS [M, K/32].
 // X_BF16 = true:  X is bf16 [M, K], quantized per 32 values in registers (scale = smallest power of
@@ -100,8 +101,8 @@ __device__ __forceinline__ int ue8m0_of_amax(float amax) {
 // in flight, ROWS / TOKENS per wave tile (16 or 32); the waves split K and reduce through LDS.
 template <int WAVES, int STEPS, int ROWS, int TOKENS, bool X_BF16>
 __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
-    const uint8_t* __restrict__ W,   // [N/16, K/128, 2048] fp8 e4m3 in MFMA lane order
-    const uint8_t* __restrict__ WS,  // [N/32, K/32] ue8m0 (the checkpoint's 32x32 block scales)
+    const uint8_t* __restrict__ W,   // [N/16, KP/128, 2048] fp8 e4m3 in MFMA lane order
+    const uint8_t* __restrict__ WS,  // [N/32, KP/32] ue8m0 (the checkpoint's 32x32 block scales)
     const uint8_t* __restrict__ X,   // X_BF16 ? bf16 [M, K] : fp8 e4m3 [M, K] (uint8 view)
     const uint8_t* __restrict__ XS,  // fp8 mode only: [M, K/32] ue8m0 per-token scales
     uint16_t* __restrict__ out,      // [M, N] bf16
@@ -120,18 +121,21 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
   const int lane = tid & 63;
   const int row_in_tile = lane & 15;
   const int g = lane >> 4;
-  const int nsteps = K / kStepK;
+  const int nsteps = (K + kStepK - 1) / kStepK;
   // The block's first 16-row tile (the grid covers N exactly) and this wave's K range in 128-steps.
   const int tile = blockIdx.x * AT;
   const int steps_per_wave = (nsteps + WAVES - 1) / WAVES;
   const int w_step0 = wave * steps_per_wave;
   const int w_step1 = min(nsteps, w_step0 + steps_per_wave);
   const int n = tile * kTileN + row_in_tile;
-  const int KS = K >> 5;
+  const int KSW = nsteps * (kStepK / 32);  // weight scale columns, padded like the weight
+  const int KSX = K >> 5;                  // activation scale columns
+  // a 4-byte scale load needs every row of XS 4-byte aligned and the step inside K
+  const bool xs_word_loads = (KSX & 3) == 0;
 
   const uint8_t* wtile = W + static_cast<size_t>(tile) * nsteps * kStepBytes + lane * kLaneBytes;
   const size_t a2_off = static_cast<size_t>(nsteps) * kStepBytes;  // the next 16-row tile
-  const uint8_t* wsrow = WS + static_cast<size_t>(n / kScaleRows) * KS;
+  const uint8_t* wsrow = WS + static_cast<size_t>(n / kScaleRows) * KSW;
   // Token rows beyond M read token M-1 (no divergence); their D columns are never stored.
   const int half_off = 32 * (g >> 1) + 16 * (g & 1);  // K offset of this lane's first half-block
   const uint8_t* xrow[BT];
@@ -140,7 +144,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
   for (int b = 0; b < BT; ++b) {
     const int tok = min(row_in_tile + 16 * b, M - 1);
     xrow[b] = X + (static_cast<size_t>(tok) * K + half_off) * (X_BF16 ? 2 : 1);
-    xsrow[b] = XS + static_cast<size_t>(tok) * KS;
+    xsrow[b] = XS + static_cast<size_t>(tok) * KSX;
   }
   const int shift = 8 * g;
 
@@ -166,18 +170,31 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
         a_hi[s][t] = load16(wp + t * a2_off + 16);
       }
       ws4[s] = *reinterpret_cast<const uint32_t*>(wsrow + (k >> 5));
+      // K % 32 == 0, so each 16-value chunk is wholly inside K or wholly in the zero tail
+      const bool lo_in = k + half_off < K;
+      const bool hi_in = k + half_off + 64 < K;
+      const v4i zero = {0, 0, 0, 0};
 #pragma unroll
       for (int b = 0; b < BT; ++b) {
         if constexpr (X_BF16) {
           const uint8_t* xp = xrow[b] + static_cast<size_t>(k) * 2;
-          xb[s][b][0] = load16(xp);
-          xb[s][b][1] = load16(xp + 16);
-          xb[s][b][2] = load16(xp + 128);
-          xb[s][b][3] = load16(xp + 144);
+          xb[s][b][0] = lo_in ? load16(xp) : zero;
+          xb[s][b][1] = lo_in ? load16(xp + 16) : zero;
+          xb[s][b][2] = hi_in ? load16(xp + 128) : zero;
+          xb[s][b][3] = hi_in ? load16(xp + 144) : zero;
         } else {
-          b_lo[s][b] = load16(xrow[b] + k);
-          b_hi[s][b] = load16(xrow[b] + k + 64);
-          xs4[s][b] = *reinterpret_cast<const uint32_t*>(xsrow[b] + (k >> 5));
+          b_lo[s][b] = lo_in ? load16(xrow[b] + k) : zero;
+          b_hi[s][b] = hi_in ? load16(xrow[b] + k + 64) : zero;
+          const int ks = k >> 5;
+          if (xs_word_loads && k + kStepK <= K) {
+            xs4[s][b] = *reinterpret_cast<const uint32_t*>(xsrow[b] + ks);
+          } else {
+            uint32_t word = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+              word |= static_cast<uint32_t>(ks + j < KSX ? xsrow[b][ks + j] : 127) << (8 * j);
+            xs4[s][b] = word;
+          }
         }
       }
     }
@@ -276,8 +293,8 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
  * \tparam ROWS    Weight rows per wave tile: 16 or 32
  * \tparam TOKENS  Token columns per wave tile: 16 or 32 (num_tokens <= TOKENS)
  * \tparam X_BF16  Whether `x` is bf16 (quantized in-kernel) or fp8 e4m3 with `x_scale`
- * \param weight        [N/16, K/128, 2048] uint8, fp8 e4m3 in MFMA lane order
- * \param weight_scale  [N/32, K/32] uint8 ue8m0 block scales
+ * \param weight        [N/16, ceil(K/128), 2048] uint8, fp8 e4m3 in MFMA lane order (K zero-padded)
+ * \param weight_scale  [N/32, ceil(K/128) * 4] uint8 ue8m0 block scales
  * \param x             [M, K] bf16, or its fp8 e4m3 codes as uint8
  * \param x_scale       [M, K/32] uint8 ue8m0 per-token scales; unused when X_BF16
  * \param out           [M, N] bf16
@@ -302,6 +319,7 @@ struct Mxfp8GemvGfx950Kernel {
     auto SSize = SymbolicSize{"weight_steps"};
     auto RSize = SymbolicSize{"scale_rows"};
     auto CSize = SymbolicSize{"scale_cols"};
+    auto XCSize = SymbolicSize{"x_scale_cols"};
 
     // the kernel loads operands 16 bytes and scales 4 bytes at a time
     TensorMatcher({TSize, SSize, kStepBytes})
@@ -315,7 +333,7 @@ struct Mxfp8GemvGfx950Kernel {
     } else {
       // fp8 e4m3 arrives as its uint8 view: the kernel reads bytes
       TensorMatcher({MSize, KSize}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(x);
-      TensorMatcher({MSize, CSize}).with_dtype<uint8_t>().with_device(device).ensure_alignment(4).verify(x_scale);
+      TensorMatcher({MSize, XCSize}).with_dtype<uint8_t>().with_device(device).verify(x_scale);
     }
     TensorMatcher({MSize, NSize}).with_dtype<bf16_t>().with_device(device).verify(out);
 
@@ -323,13 +341,17 @@ struct Mxfp8GemvGfx950Kernel {
     const auto N = NSize.unwrap();
     const auto K = KSize.unwrap();
     CHECK_HOST(M >= 1 && M <= TOKENS) << "mxfp8_gemv: num_tokens " << M << " not in [1, " << TOKENS << "]";
-    CHECK_HOST(K % kStepK == 0) << "mxfp8_gemv: in_features " << K << " is not a multiple of 128";
+    CHECK_HOST(K % 32 == 0) << "mxfp8_gemv: in_features " << K << " is not a multiple of 32";
+    const auto steps = (K + kStepK - 1) / kStepK;
     CHECK_HOST(N % kScaleRows == 0 && N % ROWS == 0)
         << "mxfp8_gemv: out_features " << N << " is not a multiple of 32 and of " << ROWS;
-    CHECK_HOST(TSize.unwrap() == N / kTileN && SSize.unwrap() == K / kStepK)
-        << "mxfp8_gemv: weight must be shuffled [N/16, K/128, 2048]";
-    CHECK_HOST(RSize.unwrap() == N / kScaleRows && CSize.unwrap() == K / 32)
-        << "mxfp8_gemv: weight_scale must be ue8m0 [N/32, K/32]";
+    CHECK_HOST(TSize.unwrap() == N / kTileN && SSize.unwrap() == steps)
+        << "mxfp8_gemv: weight must be shuffled [N/16, ceil(K/128), 2048]";
+    CHECK_HOST(RSize.unwrap() == N / kScaleRows && CSize.unwrap() == steps * (kStepK / 32))
+        << "mxfp8_gemv: weight_scale must be ue8m0 [N/32, ceil(K/128) * 4]";
+    if constexpr (!X_BF16) {
+      CHECK_HOST(XCSize.unwrap() == K / 32) << "mxfp8_gemv: x_scale must be ue8m0 [M, K/32]";
+    }
 
     const uint8_t* xs_ptr = X_BF16 ? nullptr : static_cast<const uint8_t*>(x_scale.data_ptr());
     const int grid = static_cast<int>(N / ROWS);

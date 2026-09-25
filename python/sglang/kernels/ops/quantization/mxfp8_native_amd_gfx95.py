@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints: the weight stays fp8 in
-scaled-MFMA lane order; M <= 32 runs the skinny gemv kernel, larger M the tl.dot_scaled GEMM
-with the tiles tuned in mxfp8_gemv_gfx95_configs.json."""
+scaled-MFMA lane order, K zero-padded to a multiple of 128; M <= 32 runs the skinny gemv kernel,
+larger M the tl.dot_scaled GEMM with the tiles tuned in mxfp8_gemv_gfx95_configs.json."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import msgspec
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -179,19 +180,27 @@ def _large_m_tile(m: int, n: int, k: int) -> Tuple[int, int, int, int, int]:
 
 
 def native_route_supports(n: int, k: int) -> bool:
-    """Shapes the native route serves: 16-row tiles, 32-row block scales, 128-wide K steps."""
-    return n % 32 == 0 and k % 128 == 0
+    """Shapes the native route serves: whole 32-row / 32-column scale blocks (a K tail short
+    of the 128-wide step is zero-padded in the weight and masked in the activation)."""
+    return n % 32 == 0 and k % 32 == 0
 
 
 def prepare_mxfp8_native_weight(
     weight: torch.Tensor, weight_scale: torch.Tensor, block_size: Sequence[int]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """fp8 [N, K] + fp32 block scales -> (shuffled fp8 bytes [N/16, K/128, 2048],
-    ue8m0 scale bytes [N/32, K/32])."""
+    """fp8 [N, K] + fp32 block scales -> (shuffled fp8 bytes [N/16, KP/128, 2048],
+    ue8m0 scale bytes [N/32, KP/32]), KP = K rounded up to 128 with zero weight."""
     n, k = weight.shape
     assert tuple(block_size) == (32, 32), block_size
     assert native_route_supports(n, k), (n, k)
-    return shuffle_mxfp8_weight(weight.contiguous()), ue8m0_weight_scale(weight_scale)
+    pad = -k % _STEP_K
+    weight = F.pad(weight.contiguous().view(torch.uint8), (0, pad))
+    # a padded block's weight is zero, so its scale only needs to be finite
+    weight_scale = F.pad(weight_scale.float(), (0, pad // 32), value=1.0)
+    return (
+        shuffle_mxfp8_weight(weight.view(torch.float8_e4m3fn)),
+        ue8m0_weight_scale(weight_scale),
+    )
 
 
 @triton.jit
@@ -209,10 +218,12 @@ def _mxfp8_shuffled_gemm_kernel(
     stride_wsn,
     stride_om,
     k_per_split,
+    K_PAD,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     OUT_F32: tl.constexpr,
+    K_TAIL: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -230,7 +241,7 @@ def _mxfp8_shuffled_gemm_kernel(
     # K [32 g1 + 16 g0 + 64 half, +16); put it back into row-major [BLOCK_N, BLOCK_K] in registers
     T: tl.constexpr = BLOCK_N // 16
     S: tl.constexpr = BLOCK_K // 128
-    nsteps = K // 128
+    nsteps = K_PAD // 128
     blk = tl.arange(0, T * S)
     blk_tile = pid_n * T + blk // S
     blk_mask = blk_tile < N // 16  # the last N block may hold fewer 16-row tiles
@@ -244,13 +255,21 @@ def _mxfp8_shuffled_gemm_kernel(
     )
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(0, k_per_split // BLOCK_K):
-        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0)
+    for it in range(0, k_per_split // BLOCK_K):
+        if K_TAIL:
+            # the weight's zero-padded K tail meets a masked activation
+            k_cur = k0 + it * BLOCK_K
+            x_mask = m_mask[:, None] & (k_cur + offs_k < K)[None, :]
+            xs_mask = m_mask[:, None] & (k_cur // 32 + offs_sk < K // 32)[None, :]
+        else:
+            x_mask = m_mask[:, None]
+            xs_mask = m_mask[:, None]
+        x = tl.load(x_ptrs, mask=x_mask, other=0)
         w_raw = tl.load(w_ptrs, mask=blk_mask[:, None], other=0)  # [T * S, 2048]
         w7 = tl.reshape(w_raw, (T, S, 2, 2, 16, 2, 16))  # (t, s, g1, g0, row, half, e)
         w7 = tl.permute(w7, (0, 4, 1, 5, 2, 3, 6))  # (t, row, s, half, g1, g0, e)
         w = tl.reshape(w7, (BLOCK_N, BLOCK_K))
-        xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=127)
+        xs = tl.load(xs_ptrs, mask=xs_mask, other=127)
         ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=127)
         acc = tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3", acc)
         x_ptrs += BLOCK_K
@@ -283,8 +302,9 @@ def _mxfp8_shuffled_gemm(
     summed in partition order (deterministic)."""
     m, k = xq.shape
     n = weight_shuffled.shape[0] * 16
+    k_pad = weight_shuffled.shape[1] * _STEP_K
     bm, bn, bk, warps = tile
-    assert k % bk == 0 and (k // bk) % split_k == 0, (k, bk, split_k)
+    assert k_pad % bk == 0 and (k_pad // bk) % split_k == 0, (k_pad, bk, split_k)
     grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), split_k)
     if split_k == 1:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=xq.device)
@@ -303,11 +323,13 @@ def _mxfp8_shuffled_gemm(
         xs.stride(0),
         weight_scale_ue8m0.stride(0),
         n,
-        k // split_k,
+        k_pad // split_k,
+        k_pad,
         BLOCK_M=bm,
         BLOCK_N=bn,
         BLOCK_K=bk,
         OUT_F32=split_k > 1,
+        K_TAIL=k != k_pad,
         num_warps=warps,
         num_stages=2,
     )
@@ -329,6 +351,9 @@ def mxfp8_native_blockscaled_linear(
     input_2d = input.view(-1, input.shape[-1])
     m, k = input_2d.shape
     n = weight_shuffled.shape[0] * 16
+    assert k % 32 == 0 and weight_shuffled.shape[1] == -(-k // _STEP_K), (
+        f"input K {k} does not match the weight's {weight_shuffled.shape[1]} K steps"
+    )
     if input_scale is not None:
         assert input_2d.dtype == torch.float8_e4m3fn, input_2d.dtype
         xq, xs = input_2d.contiguous(), input_scale
