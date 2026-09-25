@@ -56,7 +56,7 @@ class _GemvConfig(msgspec.Struct, frozen=True):
 
 def _default_config(m: int) -> _GemvConfig:
     """Shapes without a tuned row. Measured on gfx950 over K 2048 to 16384 and M 1 to 32:
-    8 waves, 1 step stays within ~10% of each shape's best config."""
+    8 waves, 1 step stays within ~10% of each shape's best 16-row config."""
     return _GemvConfig(8, 1, 16, 16 if m <= 16 else 32)
 
 
