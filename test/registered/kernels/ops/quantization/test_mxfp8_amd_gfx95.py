@@ -27,7 +27,7 @@ from sglang.test.layer_ut_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 # (N, K): a TP4 projection, the TP4 shared-expert down projection (K = 576, whose tail short of
