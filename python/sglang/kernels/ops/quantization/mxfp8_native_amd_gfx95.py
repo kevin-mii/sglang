@@ -53,12 +53,10 @@ class _GemvConfig(msgspec.Struct, frozen=True):
         )
 
 
-def _default_config(m: int, k: int) -> _GemvConfig:
-    """Heuristic for shapes without a tuned row."""
-    tokens = 16 if m <= 16 else 32
-    if k // _STEP_K > 40:
-        return _GemvConfig(4, 2, 16, tokens)
-    return _GemvConfig(8, 1, 16, tokens)
+def _default_config(m: int) -> _GemvConfig:
+    """Shapes without a tuned row. Measured on gfx950 over K 2048 to 16384 and M 1 to 32:
+    8 waves, 1 step stays within ~10% of each shape's best config."""
+    return _GemvConfig(8, 1, 16, 16 if m <= 16 else 32)
 
 
 def _m_bucket(m: int) -> int:
@@ -86,7 +84,7 @@ def _select_config(bucket: int, n: int, k: int) -> _GemvConfig:
     key = f"{_gfx_name()}:{n}:{k}:{bucket}"
     entry = _config_table("configs").get(key)
     if entry is None:
-        return _default_config(bucket, k)
+        return _default_config(bucket)
     cfg = _GemvConfig.parse(entry)
     assert cfg.valid_for(bucket, n), f"tuned entry {key}: {entry} cannot serve it"
     return cfg
