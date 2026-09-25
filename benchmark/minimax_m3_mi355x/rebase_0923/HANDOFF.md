@@ -76,8 +76,11 @@ GSM8K-500: 0.892 (maxrun 48) and 0.878 (maxrun 64).
 | cache_aware router (default), maxrun 48 | 5,557 / 9,400, 218 | 7,280 / 11,886, 306 | 17,170 / 21,487, 363 |
 | round_robin, maxrun 48 | 327 / 3,737, 391 | 434 / 4,737, 416 | 5,381 / 9,491, 434 |
 | **round_robin, maxrun 64** | **317** / 3,713, 390 | **410** / 4,713, 417 | **680** / 7,555, **469** |
+| round_robin, maxrun 64, **TOPK_FREQ=1** (production-safe) | 306 / 4,016, 347 | 389 / 5,053, 372 | 699 / 8,255, 423 |
 
-Files: `results/node2_0924/bench_{baseline,rr,rr_maxrun64}.{json,log}` and per-replica load every 2 s in `load_*.csv` (`load_sampler.py`).
+With TOPK_FREQ=1, TTFT is unchanged and throughput drops about 10% (acc.len 2.67-2.78). Total tokens/min/GPU (input incl. cached + output): 2.39M / 2.57M / 2.92M at c=64/80/128, vs 2.69M / 2.88M / 3.24M with TOPK_FREQ=4.
+
+Files: `results/node2_0924/bench_{baseline,rr,rr_maxrun64,rr_maxrun64_topk1}.{json,log}` and per-replica load every 2 s in `load_*.csv` (`load_sampler.py`).
 
 - **Why the router mattered:** under `cache_aware`, c=64 put all requests on 30002 (48 running + 16 queued) while 30001 sat idle. c=80 gave 30001
   about 8 requests, and c=128 about 32 (30002: 47 running + 48 queued). The defaults `--balance-abs-threshold 64 --balance-rel-threshold 1.5` never
