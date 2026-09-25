@@ -339,7 +339,7 @@ def dot_scaled_mxfp8_blockscaled_linear(
 
 
 # CUDA's per_token_group_quant amax floor (LOCAL_ABSMAX_ABS); mxfp8_gemv_gfx95.cuh hard-codes it too
-FP8_GRID_AMAX_FLOOR = 1e-10
+_FP8_GRID_AMAX_FLOOR = tl.constexpr(1e-10)
 
 
 class Fp8GridActivation(msgspec.Struct, frozen=True):
@@ -360,12 +360,12 @@ class Mxfp8Activation(msgspec.Struct, frozen=True):
 
 
 @triton.jit
-def fp8_grid_quant(xg, eps):
+def fp8_grid_quant(xg):
     """xg is fp32 [G, 32]; returns (q, exp): the fp8 e4m3 codes of each
     group scaled by the smallest power of two >= amax / 448, and that scale's
     ue8m0 exponent per group (the same rule as fp8_grid_round)."""
     amax = tl.max(tl.abs(xg), axis=1)
-    amax = tl.maximum(amax, eps)
+    amax = tl.maximum(amax, _FP8_GRID_AMAX_FLOOR)
     # Smallest power of two >= amax / 448, on the IEEE bits (exact at powers of two).
     raw = amax * (1.0 / 448.0)
     bits = raw.to(tl.int32, bitcast=True)
@@ -378,10 +378,10 @@ def fp8_grid_quant(xg, eps):
 
 
 @triton.jit
-def fp8_grid_round(xg, eps):
+def fp8_grid_round(xg):
     """xg is fp32 [G, 32], one ue8m0 group per row; returns it rounded to the
     fp8 e4m3 grid of its group scale (smallest power of two >= amax / 448)."""
-    q, exp = fp8_grid_quant(xg, eps)
+    q, exp = fp8_grid_quant(xg)
     return q.to(tl.float32) * (exp << 23).to(tl.float32, bitcast=True)[:, None]
 
 
@@ -395,7 +395,6 @@ def _fp8_grid_quant_kernel(
     stride_xm,
     stride_om,
     stride_sm,
-    eps,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     EMIT_FP8: tl.constexpr,
@@ -414,7 +413,7 @@ def _fp8_grid_quant_kernel(
     ).to(tl.float32)
     xg = tl.reshape(x, (BLOCK_M * (BLOCK_K // 32), 32))
     if EMIT_FP8:
-        q, exp = fp8_grid_quant(xg, eps)
+        q, exp = fp8_grid_quant(xg)
         out = tl.reshape(q, (BLOCK_M, BLOCK_K))
         offs_g = pid_k * (BLOCK_K // 32) + tl.arange(0, BLOCK_K // 32)
         tl.store(
@@ -423,7 +422,7 @@ def _fp8_grid_quant_kernel(
             mask=m_mask[:, None],
         )
     else:
-        out = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_M, BLOCK_K))
+        out = tl.reshape(fp8_grid_round(xg), (BLOCK_M, BLOCK_K))
     tl.store(
         out_ptr + offs_m[:, None] * stride_om + offs_k[None, :],
         out.to(out_ptr.dtype.element_ty),
@@ -432,7 +431,7 @@ def _fp8_grid_quant_kernel(
 
 
 def _launch_fp8_grid_quant(
-    x: torch.Tensor, out: torch.Tensor, scale: Optional[torch.Tensor], eps: float
+    x: torch.Tensor, out: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> None:
     M, K = x.shape
     if M == 0:
@@ -453,7 +452,6 @@ def _launch_fp8_grid_quant(
         x.stride(0),
         out.stride(0),
         scale.stride(0) if scale is not None else 0,
-        eps,
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         EMIT_FP8=scale is not None,
@@ -461,21 +459,17 @@ def _launch_fp8_grid_quant(
     )
 
 
-def fake_quant_fp8_activation(
-    x: torch.Tensor, eps: float = FP8_GRID_AMAX_FLOOR
-) -> torch.Tensor:
+def fake_quant_fp8_activation(x: torch.Tensor) -> torch.Tensor:
     """bf16 [M, K] -> bf16 [M, K] on the fp8 e4m3 grid with a per-32 ue8m0 scale
     (the same rule as the CUDA path's sglang_per_token_group_quant_fp8(scale_ue8m0=True))."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     x = x.contiguous()
     out = torch.empty_like(x)
-    _launch_fp8_grid_quant(x, out, None, eps)
+    _launch_fp8_grid_quant(x, out, None)
     return out
 
 
-def fp8_grid_quantize(
-    x: torch.Tensor, eps: float = FP8_GRID_AMAX_FLOOR
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def fp8_grid_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """bf16 [M, K] -> (fp8 e4m3 [M, K], ue8m0 exponents uint8 [M, K // 32]) under the rule
     of fake_quant_fp8_activation, whose output they dequantize to exactly."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
@@ -483,7 +477,7 @@ def fp8_grid_quantize(
     M, K = x.shape
     q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     scale = torch.empty((M, K // 32), dtype=torch.uint8, device=x.device)
-    _launch_fp8_grid_quant(x, q, scale, eps)
+    _launch_fp8_grid_quant(x, q, scale)
     return q, scale
 
 

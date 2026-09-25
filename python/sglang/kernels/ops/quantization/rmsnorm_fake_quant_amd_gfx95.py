@@ -11,7 +11,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    FP8_GRID_AMAX_FLOOR,
     Fp8GridActivation,
     Mxfp8Activation,
     fp8_grid_quant,
@@ -35,7 +34,6 @@ def rmsnorm_fake_quant_row(
     stride_nm,
     stride_sm,
     eps,
-    quant_eps,
     HAS_RESIDUAL: tl.constexpr,
     WRITE_NORM: tl.constexpr,
     EMIT_FP8: tl.constexpr,
@@ -80,7 +78,7 @@ def rmsnorm_fake_quant_row(
             yg = tl.reshape(y.to(tl.float32), (CHUNK // 32, 32))
             if EMIT_FP8:
                 # native MXFP8 operand (fp8 codes + ue8m0); dequantizes to the fake-quant below
-                q8, e8 = fp8_grid_quant(yg, quant_eps)
+                q8, e8 = fp8_grid_quant(yg)
                 tl.store(
                     out_fq_ptr + row * stride_fm + offs,
                     tl.reshape(q8, (CHUNK,)),
@@ -93,7 +91,7 @@ def rmsnorm_fake_quant_row(
                     mask=goffs < K // 32,
                 )
             else:
-                q = fp8_grid_round(yg, quant_eps)
+                q = fp8_grid_round(yg)
                 tl.store(
                     out_fq_ptr + row * stride_fm + offs,
                     tl.reshape(q, (CHUNK,)).to(out_fq_ptr.dtype.element_ty),
@@ -116,7 +114,6 @@ def _rmsnorm_fake_quant_fp8_kernel(
     stride_nm,
     stride_sm,
     eps,
-    quant_eps,
     HAS_RESIDUAL: tl.constexpr,
     WRITE_NORM: tl.constexpr,
     EMIT_FP8: tl.constexpr,
@@ -139,7 +136,6 @@ def _rmsnorm_fake_quant_fp8_kernel(
         stride_nm,
         stride_sm,
         eps,
-        quant_eps,
         HAS_RESIDUAL=HAS_RESIDUAL,
         WRITE_NORM=WRITE_NORM,
         EMIT_FP8=EMIT_FP8,
@@ -167,7 +163,6 @@ def rmsnorm_fake_quant_fp8(
     eps: float,
     residual: Optional[torch.Tensor] = None,
     return_norm: bool = True,
-    quant_eps: float = FP8_GRID_AMAX_FLOOR,
     emit_fp8: bool = False,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation], Optional[torch.Tensor]]:
     """fake_quant_fp8_activation(RMSNorm(x)) in one launch: (Fp8GridActivation, norm), or
@@ -213,7 +208,6 @@ def rmsnorm_fake_quant_fp8(
         out_norm.stride(0) if out_norm is not None else 0,
         out_scale.stride(0) if out_scale is not None else 0,
         eps,
-        quant_eps,
         HAS_RESIDUAL=residual is not None,
         WRITE_NORM=out_norm is not None,
         EMIT_FP8=emit_fp8,

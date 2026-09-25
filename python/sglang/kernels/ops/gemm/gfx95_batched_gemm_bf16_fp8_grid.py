@@ -38,7 +38,6 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     stride_cb,
     stride_cm,
     stride_cn,
-    eps,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -110,7 +109,7 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     if FP8_GRID:
         # the consumer's fake-quant on the bf16-rounded output: one ue8m0 group per 32 N elements
         xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
-        c = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_SIZE_M, BLOCK_SIZE_N))
+        c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
         c = c.to(c_ptr.type.element_ty)
 
     offs_cm = tl.cast(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64)
@@ -197,7 +196,6 @@ def _batched_gemm_split_k_reduce_kernel(
     N,
     stride_cb,
     stride_cm,
-    eps,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -224,7 +222,7 @@ def _batched_gemm_split_k_reduce_kernel(
     c = acc.to(c_ptr.type.element_ty)
     if FP8_GRID:
         xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
-        c = tl.reshape(fp8_grid_round(xg, eps), (BLOCK_SIZE_M, BLOCK_SIZE_N))
+        c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
         c = c.to(c_ptr.type.element_ty)
     c_ptrs = (
         c_ptr
@@ -245,7 +243,7 @@ def _split_k_applies(T: int, D: int, R: int) -> bool:
 
 
 def _batched_gemm_split_k(
-    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fp8_grid: bool, eps: float
+    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fp8_grid: bool
 ) -> None:
     T, G, D = x.shape
     R = w.shape[1]
@@ -283,7 +281,6 @@ def _batched_gemm_split_k(
         R,
         R,
         G * R,
-        eps,
         BLOCK_SIZE_M=_BLOCK_M,
         BLOCK_SIZE_N=_BLOCK_N,
         SPLIT_K=_SPLIT_K,
@@ -296,7 +293,6 @@ def batched_gemm_bf16_fp8_grid(
     x: torch.Tensor,
     w: torch.Tensor,
     fp8_grid: bool = True,
-    eps: float = 1e-10,
     split_k: Optional[bool] = None,
 ) -> torch.Tensor:
     """x [T, G, D] bf16, w [G, R, D] bf16 -> [T, G * R] bf16 with out[t, g*R:(g+1)*R] =
@@ -315,7 +311,7 @@ def batched_gemm_bf16_fp8_grid(
         split_k = _split_k_applies(T, D, R)
     if split_k:
         assert _split_k_applies(T, D, R), (T, D, R)
-        _batched_gemm_split_k(x, w, out, fp8_grid, eps)
+        _batched_gemm_split_k(x, w, out, fp8_grid)
         return out
     grid = (G, triton.cdiv(T, _BLOCK_M) * triton.cdiv(R, _BLOCK_N))
     _batched_gemm_bf16_fp8_grid_kernel[grid](
@@ -334,7 +330,6 @@ def batched_gemm_bf16_fp8_grid(
         R,
         G * R,
         1,
-        eps,
         BLOCK_SIZE_M=_BLOCK_M,
         BLOCK_SIZE_N=_BLOCK_N,
         BLOCK_SIZE_K=_BLOCK_K,

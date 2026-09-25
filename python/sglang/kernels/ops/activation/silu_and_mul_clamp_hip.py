@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    FP8_GRID_AMAX_FLOOR,
     Fp8GridActivation,
     Mxfp8Activation,
     fp8_grid_quant,
@@ -25,7 +24,6 @@ def _silu_and_mul_clamp_kernel(
     stride_om,
     stride_sm,
     limit,
-    eps,
     BLOCK_I: tl.constexpr,
     FP8_GRID: tl.constexpr,
     EMIT_FP8: tl.constexpr,
@@ -44,7 +42,7 @@ def _silu_and_mul_clamp_kernel(
     if EMIT_FP8:
         # per-32 fp8 codes plus ue8m0 exponent: the native MXFP8 route's operand
         y = y.to(tl.bfloat16).to(tl.float32)
-        q8, e8 = fp8_grid_quant(tl.reshape(y, (BLOCK_I // 32, 32)), eps)
+        q8, e8 = fp8_grid_quant(tl.reshape(y, (BLOCK_I // 32, 32)))
         tl.store(
             out_ptr + pid_m * stride_om + offs, tl.reshape(q8, (BLOCK_I,)), mask=mask
         )
@@ -59,7 +57,7 @@ def _silu_and_mul_clamp_kernel(
             # output dtype first, then the fp8 grid (the unfused order); padding never shares a group
             y = y.to(out_ptr.dtype.element_ty).to(tl.float32)
             y = tl.reshape(
-                fp8_grid_round(tl.reshape(y, (BLOCK_I // 32, 32)), eps), (BLOCK_I,)
+                fp8_grid_round(tl.reshape(y, (BLOCK_I // 32, 32))), (BLOCK_I,)
             )
         tl.store(
             out_ptr + pid_m * stride_om + offs,
@@ -77,7 +75,6 @@ def silu_and_mul_clamp_triton(
     gate_up: torch.Tensor,
     swiglu_limit: float,
     fp8_grid: bool = False,
-    eps: float = FP8_GRID_AMAX_FLOOR,
     emit_fp8: bool = False,
 ):
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
@@ -115,7 +112,6 @@ def silu_and_mul_clamp_triton(
         out.stride(0),
         scale.stride(0) if scale is not None else 0,
         float(swiglu_limit),
-        float(eps),
         BLOCK_I=block_i,
         FP8_GRID=fp8_grid,
         EMIT_FP8=emit_fp8,
