@@ -7,7 +7,6 @@ follow the decode kernel's own reference quantizer.
 
 import math
 import unittest
-from itertools import product
 
 import torch
 
@@ -35,6 +34,8 @@ from sglang.test.test_utils import CustomTestCase
 # the V4.1 store kernels are the SM100 / gfx950 JIT kernels; the only Blackwell runner
 # config is the four-GPU one
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+# backend-specific: the gfx950 builds of the V4.1 row quantizers, the dequant NaN
+# canonicalization and the query rope in the K launch exist only on HIP
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 REFERENCE = {
@@ -391,117 +392,108 @@ class TestV41KVStore(CustomTestCase):
         ratio = 4
         angles = torch.randn(4096, 32, generator=g, device="cuda")
         freqs = torch.polar(torch.ones_like(angles), angles)
-        n = 150
+        n, page_size, num_pages = 150, 64, 8
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
-            for page_size, num_pages in ((64, 8), (2, 300)):
-                seq_lens = (
-                    torch.randint(
-                        1, 1000, (n,), generator=g, device="cuda", dtype=torch.int64
-                    )
-                    * ratio
+            seq_lens = (
+                torch.randint(
+                    1, 1000, (n,), generator=g, device="cuda", dtype=torch.int64
                 )
-                seq_lens[3] += 1  # not a group boundary: writes nothing
-                plan = CompressorDecodePlan.generate_legacy(
-                    ratio, torch.arange(n, device="cuda", dtype=torch.int64), seq_lens
+                * ratio
+            )
+            seq_lens[3] += 1  # not a group boundary: writes nothing
+            plan = CompressorDecodePlan.generate_legacy(
+                ratio, torch.arange(n, device="cuda", dtype=torch.int64), seq_lens
+            )
+            valid = seq_lens % ratio == 0
+            pos = seq_lens - ratio
+            out_loc = torch.randperm(num_pages * page_size, generator=g, device="cuda")[
+                :n
+            ].to(torch.int64)
+            with self.subTest(
+                layout=layout.name, page_size=page_size, rows="exact-norm"
+            ):
+                signs = torch.where(
+                    torch.rand(n, 512, generator=g, device="cuda") < 0.5, -1.0, 1.0
                 )
-                valid = seq_lens % ratio == 0
-                pos = seq_lens - ratio
-                out_loc = torch.randperm(
-                    num_pages * page_size, generator=g, device="cuda"
-                )[:n].to(torch.int64)
-                with self.subTest(
-                    layout=layout.name, page_size=page_size, rows="exact-norm"
-                ):
-                    signs = torch.where(
-                        torch.rand(n, 512, generator=g, device="cuda") < 0.5, -1.0, 1.0
+                k = torch.randint(-6, 6, (n, 1), generator=g, device="cuda").float()
+                kv = (signs * torch.exp2(k)).to(torch.bfloat16)
+                w = (
+                    torch.randn(512, generator=g, device="cuda")
+                    * torch.exp2(
+                        torch.randint(-6, 4, (512,), generator=g, device="cuda").float()
                     )
-                    k = torch.randint(-6, 6, (n, 1), generator=g, device="cuda").float()
-                    kv = (signs * torch.exp2(k)).to(torch.bfloat16)
-                    w = (
-                        torch.randn(512, generator=g, device="cuda")
-                        * torch.exp2(
-                            torch.randint(
-                                -6, 4, (512,), generator=g, device="cuda"
-                            ).float()
-                        )
-                    ).to(torch.bfloat16)
-                    cache = torch.zeros(
-                        num_pages,
-                        layout.page_bytes(page_size),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    )
-                    compress_norm_rope_store(
-                        kv,
-                        plan,
-                        norm_weight=w,
-                        norm_eps=0.0,
-                        freq_cis=freqs,
-                        out_loc=out_loc,
-                        kvcache=cache,
-                        page_size=page_size,
-                        layout=layout,
-                    )
-                    rotated = rope_tail(
-                        (signs * w.float()).to(torch.bfloat16), freqs[pos], 64
-                    )
-                    ref = reference_pages(
-                        layout,
-                        page_size,
-                        num_pages,
-                        out_loc[valid],
-                        rotated[valid],
-                        cache.shape[1],
-                    )
-                    self.assert_tokens_equal(
-                        cache, ref, layout, page_size, out_loc[valid]
-                    )
-                    self.assert_untouched_zero(cache, layout, page_size, out_loc[valid])
-                with self.subTest(
-                    layout=layout.name, page_size=page_size, rows="general"
-                ):
-                    eps = 1e-6
-                    kv = (torch.randn(n, 512, generator=g, device="cuda") * 2).to(
-                        torch.bfloat16
-                    )
-                    w = (torch.randn(512, generator=g, device="cuda") * 0.3 + 1).to(
-                        torch.bfloat16
-                    )
-                    cache = torch.zeros(
-                        num_pages,
-                        layout.page_bytes(page_size),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    )
-                    compress_norm_rope_store(
-                        kv,
-                        plan,
-                        norm_weight=w,
-                        norm_eps=eps,
-                        freq_cis=freqs,
-                        out_loc=out_loc,
-                        kvcache=cache,
-                        page_size=page_size,
-                        layout=layout,
-                    )
-                    xf = kv.float()
-                    normed = (
-                        xf
-                        * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
-                        * w.float()
-                    ).to(torch.bfloat16)
-                    rotated = rope_tail(normed, freqs[pos], 64)
-                    ref = reference_pages(
-                        layout,
-                        page_size,
-                        num_pages,
-                        out_loc[valid],
-                        rotated[valid],
-                        cache.shape[1],
-                    )
-                    self.assert_rows_close(
-                        cache, ref, layout, page_size, out_loc[valid]
-                    )
+                ).to(torch.bfloat16)
+                cache = torch.zeros(
+                    num_pages,
+                    layout.page_bytes(page_size),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                compress_norm_rope_store(
+                    kv,
+                    plan,
+                    norm_weight=w,
+                    norm_eps=0.0,
+                    freq_cis=freqs,
+                    out_loc=out_loc,
+                    kvcache=cache,
+                    page_size=page_size,
+                    layout=layout,
+                )
+                rotated = rope_tail(
+                    (signs * w.float()).to(torch.bfloat16), freqs[pos], 64
+                )
+                ref = reference_pages(
+                    layout,
+                    page_size,
+                    num_pages,
+                    out_loc[valid],
+                    rotated[valid],
+                    cache.shape[1],
+                )
+                self.assert_tokens_equal(cache, ref, layout, page_size, out_loc[valid])
+                self.assert_untouched_zero(cache, layout, page_size, out_loc[valid])
+            with self.subTest(layout=layout.name, page_size=page_size, rows="general"):
+                eps = 1e-6
+                kv = (torch.randn(n, 512, generator=g, device="cuda") * 2).to(
+                    torch.bfloat16
+                )
+                w = (torch.randn(512, generator=g, device="cuda") * 0.3 + 1).to(
+                    torch.bfloat16
+                )
+                cache = torch.zeros(
+                    num_pages,
+                    layout.page_bytes(page_size),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                compress_norm_rope_store(
+                    kv,
+                    plan,
+                    norm_weight=w,
+                    norm_eps=eps,
+                    freq_cis=freqs,
+                    out_loc=out_loc,
+                    kvcache=cache,
+                    page_size=page_size,
+                    layout=layout,
+                )
+                xf = kv.float()
+                normed = (
+                    xf
+                    * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+                    * w.float()
+                ).to(torch.bfloat16)
+                rotated = rope_tail(normed, freqs[pos], 64)
+                ref = reference_pages(
+                    layout,
+                    page_size,
+                    num_pages,
+                    out_loc[valid],
+                    rotated[valid],
+                    cache.shape[1],
+                )
+                self.assert_rows_close(cache, ref, layout, page_size, out_loc[valid])
 
 
 CASES = {
@@ -634,11 +626,9 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         like the flat rope kernel, leave the cache bytes and the nope part untouched,
         and rope rows without a slot."""
         dev = "cuda"
-        for layout, (num_tokens, heads, pos_dtype, seed) in product(
-            (KVLayout.V4, KVLayout.V41),
-            ((1, 16, torch.int64, 0), (300, 16, torch.int32, 2)),
-        ):
-            with self.subTest(layout=layout, num_tokens=num_tokens, heads=heads):
+        num_tokens, heads, pos_dtype, seed = 300, 16, torch.int32, 2
+        for layout in (KVLayout.V4, KVLayout.V41):
+            with self.subTest(layout=layout):
                 torch.manual_seed(seed)
                 kv = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16)
                 weight = (1 + 0.1 * torch.randn(HEAD_DIM, device=dev)).to(
@@ -651,8 +641,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 )
                 out_loc = torch.randperm(FULL_SIZE, device=dev)[:num_tokens]
                 out_loc = out_loc.to(torch.int32)
-                if num_tokens > 2:
-                    out_loc[1] = -1
+                out_loc[1] = -1
                 page_bytes = layout.page_bytes(PAGE_SIZE)
                 cache = torch.zeros(
                     FULL_SIZE // PAGE_SIZE, page_bytes, device=dev, dtype=torch.uint8

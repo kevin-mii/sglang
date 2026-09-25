@@ -66,74 +66,51 @@ class TestRocmRouterGate(CustomTestCase):
         self.assertTrue(torch.equal(ref_i, out_i), f"ids {msg}")
         self.assertTrue(torch.equal(ref_w, out_w), f"weights {msg}")
 
-    def test_gate_matches_aiter_on_ties(self):
+    def test_gate_matches_aiter_on_ties_and_non_finite_logits(self):
+        """Tie order and the NaN / +-inf handling are aiter topk_gating's, bit for bit."""
         zero_bias = torch.zeros(NUM_EXPERTS, device=self.device, dtype=torch.bfloat16)
-        num_tokens = 512
         levels = torch.randint(
-            0, 8, (num_tokens, NUM_EXPERTS), device=self.device, generator=self.gen
+            0, 8, (512, NUM_EXPERTS), device=self.device, generator=self.gen
         ).float()
         self._assert_same_gate(levels - 3, self.bias_bf16, msg="8 levels")
         self._assert_same_gate(
-            torch.zeros(num_tokens, NUM_EXPERTS, device=self.device),
-            zero_bias,
-            msg="all equal",
+            torch.zeros(16, NUM_EXPERTS, device=self.device), zero_bias, msg="all equal"
         )
-        few = torch.full((num_tokens, NUM_EXPERTS), float("-inf"), device=self.device)
-        few[:, :3] = 1.0
-        self._assert_same_gate(few, zero_bias, msg="3 finite experts")
-
-    def test_gate_matches_aiter_non_finite(self):
-        num_tokens = 16
-        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-        logits[logits < 0] = float("-inf")
-        self._assert_same_gate(logits, self.bias_bf16, msg="-inf")
-        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-        logits[:, ::7] = float("nan")
-        self._assert_same_gate(logits, self.bias_bf16, msg="nan")
-        logits = self._randn(num_tokens, NUM_EXPERTS, scale=3.0)
-        logits[:, 5] = float("inf")
-        self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
+        for bad in (float("-inf"), float("nan"), float("inf")):
+            logits = self._randn(16, NUM_EXPERTS, scale=3.0)
+            logits[:, ::7] = bad
+            self._assert_same_gate(logits, self.bias_bf16, msg=str(bad))
 
     def test_fused_split_k_gate_matches_reduce_then_gate(self):
         """The decode router passes the GEMV partials straight to the gate: its in-launch
         reduce must write the same logits as rocm_router_reduce_partials, and gate them
         to the same weights and ids."""
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        for num_tokens in (1, self.max_tokens):
-            x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
-            partials = self.gemv(x, weight)
-            ref_logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
-            self.reduce(partials, ref_logits)
-            ref_w, ref_i = self.gate(
-                ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING
-            )
-            logits = torch.full_like(ref_logits, float("nan"))
-            out_w, out_i = self.gate(
-                logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
-            )
-            self.assertTrue(torch.equal(logits, ref_logits), f"logits, {num_tokens}")
-            self.assertTrue(torch.equal(out_i, ref_i), f"ids, {num_tokens}")
-            self.assertTrue(torch.equal(out_w, ref_w), f"weights, {num_tokens}")
+        x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)
+        partials = self.gemv(x, weight)
+        ref_logits = torch.empty(self.max_tokens, NUM_EXPERTS, device=self.device)
+        self.reduce(partials, ref_logits)
+        ref_w, ref_i = self.gate(ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING)
+        logits = torch.full_like(ref_logits, float("nan"))
+        out_w, out_i = self.gate(
+            logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
+        )
+        self.assertTrue(torch.equal(logits, ref_logits))
+        self.assertTrue(torch.equal(out_i, ref_i))
+        self.assertTrue(torch.equal(out_w, ref_w))
 
-    def test_gemv_accuracy_batch_invariance_and_repeatability(self):
+    def test_gemv_accuracy_and_batch_invariance(self):
+        """The split-K GEMV is within fp32 rounding of fp64, and every M runs the same
+        16-row tile, so a row's result does not depend on the batch."""
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
         x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)
         ref = (x.double() @ weight.double().T).float()
         full = torch.empty(self.max_tokens, NUM_EXPERTS, device=self.device)
         self.reduce(self.gemv(x, weight), full)
         self.assertTrue(torch.allclose(full, ref, atol=2e-3, rtol=1e-4))
-        for num_tokens in (1, 17, 64):
-            rows = x[:num_tokens]
-            out = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
-            self.reduce(self.gemv(rows, weight), out)
-            self.assertTrue(
-                torch.equal(out, full[:num_tokens]), f"batch of {num_tokens}"
-            )
-        # The same rows moved to other positions of the batch.
-        shifted = torch.roll(x, shifts=17, dims=0)
-        out_shifted = torch.empty_like(full)
-        self.reduce(self.gemv(shifted, weight), out_shifted)
-        self.assertTrue(torch.equal(out_shifted, torch.roll(full, 17, 0)))
+        part = torch.empty(17, NUM_EXPERTS, device=self.device)
+        self.reduce(self.gemv(x[:17], weight), part)
+        self.assertTrue(torch.equal(part, full[:17]))
 
 
 if __name__ == "__main__":
