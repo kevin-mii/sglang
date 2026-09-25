@@ -948,6 +948,64 @@ def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
             assert torch.equal(out, ref)
 
 
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_index_k_split_writer_matches_the_paged_writer(ratio: int) -> None:
+    """index_k_norm_rope_pack_store_split writes the bytes of the paged
+    index_k_norm_rope_pack_store, moved to the split FlyDSL layout; slot 0 stays empty."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        read_fp4_index_k_split,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+        index_k_norm_rope_pack_store,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
+        index_k_norm_rope_pack_store_split,
+    )
+
+    torch.manual_seed(ratio)
+    num_tokens, page_size, num_pages, max_pos = 100, 64, 4, 4096
+    x = (torch.randn(num_tokens, 128, device="cuda") * 3).bfloat16()
+    norm_weight = (1 + 0.1 * torch.randn(128, device="cuda")).bfloat16()
+    freqs = torch.view_as_real(
+        precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    ).flatten(-2)
+    positions = torch.randint(0, max_pos, (num_tokens,), device="cuda")
+    loc = torch.randperm(num_pages * page_size - 1, device="cuda")[:num_tokens] + 1
+    loc[:3] = 0
+
+    paged = torch.zeros(num_pages, page_size * 68, dtype=torch.uint8, device="cuda")
+    index_k_norm_rope_pack_store(
+        x, norm_weight, 1e-6, freqs, positions, loc, paged, ratio=ratio
+    )
+    payload = torch.zeros(
+        num_pages, 1, 4, page_size, 16, dtype=torch.uint8, device="cuda"
+    )
+    scale = torch.zeros(num_pages, 1, 4, page_size, dtype=torch.uint8, device="cuda")
+    index_k_norm_rope_pack_store_split(
+        x, norm_weight, 1e-6, freqs, positions, loc, payload, scale, ratio=ratio
+    )
+
+    slots = torch.arange(num_pages * page_size, device="cuda")
+    page, off = slots // page_size, slots % page_size
+    paged_payload = paged[
+        page[:, None], off[:, None] * 64 + torch.arange(64, device="cuda")
+    ]
+    paged_scale = paged[
+        page[:, None],
+        page_size * 64 + off[:, None] * 4 + torch.arange(4, device="cuda"),
+    ]
+    split_payload, split_scale = read_fp4_index_k_split(
+        payload, scale, slots, page_size=page_size
+    )
+    assert torch.equal(split_payload.view(torch.uint8), paged_payload)
+    assert torch.equal(split_scale.view(torch.uint8).view(-1, 4), paged_scale)
+    assert (
+        int(paged[0, :64].sum())
+        + int(paged[0, page_size * 64 : page_size * 64 + 4].sum())
+        == 0
+    )
+
+
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 TIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 RNE = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]

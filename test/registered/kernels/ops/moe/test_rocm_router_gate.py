@@ -94,6 +94,27 @@ class TestRocmRouterGate(CustomTestCase):
         logits[:, 5] = float("inf")
         self._assert_same_gate(logits, self.bias_bf16, msg="+inf")
 
+    def test_fused_split_k_gate_matches_reduce_then_gate(self):
+        """The decode router passes the GEMV partials straight to the gate: its in-launch
+        reduce must write the same logits as rocm_router_reduce_partials, and gate them
+        to the same weights and ids."""
+        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
+        for num_tokens in (1, self.max_tokens):
+            x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
+            partials = self.gemv(x, weight)
+            ref_logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
+            self.reduce(partials, ref_logits)
+            ref_w, ref_i = self.gate(
+                ref_logits, self.bias_bf16, TOPK, True, ROUTED_SCALING
+            )
+            logits = torch.full_like(ref_logits, float("nan"))
+            out_w, out_i = self.gate(
+                logits, self.bias_bf16, TOPK, True, ROUTED_SCALING, partials=partials
+            )
+            self.assertTrue(torch.equal(logits, ref_logits), f"logits, {num_tokens}")
+            self.assertTrue(torch.equal(out_i, ref_i), f"ids, {num_tokens}")
+            self.assertTrue(torch.equal(out_w, ref_w), f"weights, {num_tokens}")
+
     def test_gemv_accuracy_batch_invariance_and_repeatability(self):
         weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
         x = self._randn(self.max_tokens, HIDDEN).to(torch.bfloat16)
