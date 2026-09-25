@@ -92,6 +92,23 @@ class TestMxfp8GemvGfx95(CustomTestCase):
                 frac = (out_fp8 != ref.to(torch.bfloat16)).float().mean().item()
                 self.assertLess(frac, 0.02, (n, k, m, frac))
 
+    def test_non_finite_activations_encode_alike(self):
+        """A NaN or +-inf in a bf16 activation quantizes in the GEMV as fp8_grid_quantize does
+        (codes clamped to +-448, NaN to -448), so the input encoding cannot decide whether
+        the row turns into NaN."""
+        n, k = 96, 384
+        wq, ws, _ = self._make(n, k, 1)
+        w_sh, ws8 = prepare_mxfp8_native_weight(wq, ws, [32, 32])
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            x = torch.randn(4, k, device="cuda", dtype=torch.bfloat16)
+            x[0, 5] = bad
+            xq, xs = fp8_grid_quantize(x)
+            out_bf16 = mxfp8_gemv(x, w_sh, ws8)
+            out_fp8 = mxfp8_gemv(xq, w_sh, ws8, xs)
+            self.assertTrue(
+                torch.equal(out_bf16.view(torch.int16), out_fp8.view(torch.int16)), bad
+            )
+
 
 ROUTE_SHAPES = [(1792, 5120), (5120, 576)]
 # one M per kernel: the gemv, the dot_scaled tile of the 64-row bucket, that of the 4096-row bucket

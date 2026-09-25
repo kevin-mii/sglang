@@ -16,6 +16,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -38,25 +39,25 @@ constexpr int kScaleRows = 32;               // rows sharing one checkpoint bloc
 
 #if defined(__gfx950__)
 
-__device__ __forceinline__ v4i load16(const uint8_t* p) {
+SGL_DEVICE v4i load16(const uint8_t* p) {
   return *reinterpret_cast<const v4i*>(p);
 }
 
-__device__ __forceinline__ uint16_t f32_to_bf16_rne(float f) {
-  uint32_t u = __float_as_uint(f);
-  u += 0x7FFFu + ((u >> 16) & 1u);
-  return static_cast<uint16_t>(u >> 16);
-}
-
-__device__ __forceinline__ float bf16_lo(uint32_t w) {
+SGL_DEVICE float bf16_lo(uint32_t w) {
   return __uint_as_float(w << 16);
 }
-__device__ __forceinline__ float bf16_hi(uint32_t w) {
+SGL_DEVICE float bf16_hi(uint32_t w) {
   return __uint_as_float(w & 0xFFFF0000u);
 }
 
-// 16 bf16 (x0, x1) -> 16 fp8 e4m3 (out) scaled by inv_scale, a power of two (exact product), RNE
-__device__ __forceinline__ void quant_half(const v4i& x0, const v4i& x1, float inv_scale, v4i& out) {
+// fmaxf returns the non-NaN operand, so NaN lands on -448
+SGL_DEVICE float clamp_fp8(float v) {
+  return fminf(fmaxf(v, -448.0f), 448.0f);
+}
+
+// 16 bf16 (x0, x1) -> 16 fp8 e4m3 (out) scaled by inv_scale, a power of two (exact product), RNE;
+// clamped to +-448 first like fp8_grid_quant's tl.clamp, so NaN -> -448 and +-inf -> +-448
+SGL_DEVICE void quant_half(const v4i& x0, const v4i& x1, float inv_scale, v4i& out) {
   const uint32_t words[8] = {
       static_cast<uint32_t>(x0[0]),
       static_cast<uint32_t>(x0[1]),
@@ -68,8 +69,10 @@ __device__ __forceinline__ void quant_half(const v4i& x0, const v4i& x1, float i
       static_cast<uint32_t>(x1[3])};
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
-    const float a = bf16_lo(words[2 * q]) * inv_scale, b = bf16_hi(words[2 * q]) * inv_scale;
-    const float c = bf16_lo(words[2 * q + 1]) * inv_scale, d = bf16_hi(words[2 * q + 1]) * inv_scale;
+    const float a = clamp_fp8(bf16_lo(words[2 * q]) * inv_scale);
+    const float b = clamp_fp8(bf16_hi(words[2 * q]) * inv_scale);
+    const float c = clamp_fp8(bf16_lo(words[2 * q + 1]) * inv_scale);
+    const float d = clamp_fp8(bf16_hi(words[2 * q + 1]) * inv_scale);
     // v_cvt_pk_fp8_f32: RNE of two floats into the low / high 16 bits of the destination word
     int packed = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
     packed = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, packed, true);
@@ -77,7 +80,7 @@ __device__ __forceinline__ void quant_half(const v4i& x0, const v4i& x1, float i
   }
 }
 
-__device__ __forceinline__ float half_amax(const v4i& x0, const v4i& x1) {
+SGL_DEVICE float half_amax(const v4i& x0, const v4i& x1) {
   float m = 0.f;
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
@@ -88,7 +91,7 @@ __device__ __forceinline__ float half_amax(const v4i& x0, const v4i& x1) {
 }
 
 // smallest power of two >= amax / 448 via the IEEE bits; amax floored at 1e-10 (the CUDA quant's floor)
-__device__ __forceinline__ int ue8m0_of_amax(float amax) {
+SGL_DEVICE int ue8m0_of_amax(float amax) {
   amax = fmaxf(amax, 1e-10f);
   const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
   const int e = static_cast<int>((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0 ? 1 : 0);
@@ -105,7 +108,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
     const uint8_t* __restrict__ WS,  // [N/32, KP/32] ue8m0 (the checkpoint's 32x32 block scales)
     const uint8_t* __restrict__ X,   // X_BF16 ? bf16 [M, K] : fp8 e4m3 [M, K] (uint8 view)
     const uint8_t* __restrict__ XS,  // fp8 mode only: [M, K/32] ue8m0 per-token scales
-    uint16_t* __restrict__ out,      // [M, N] bf16
+    bf16_t* __restrict__ out,        // [M, N]
     int32_t M,
     int32_t N,
     int32_t K) {
@@ -212,8 +215,9 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
           m_hi = fmaxf(m_hi, __shfl_xor(m_hi, 16));
           const int e_lo = ue8m0_of_amax(m_lo);  // block g/2     (this lane's first half)
           const int e_hi = ue8m0_of_amax(m_hi);  // block 2 + g/2 (this lane's second half)
-          quant_half(xb[s][b][0], xb[s][b][1], __uint_as_float(static_cast<uint32_t>(254 - e_lo) << 23), b_lo[s][b]);
-          quant_half(xb[s][b][2], xb[s][b][3], __uint_as_float(static_cast<uint32_t>(254 - e_hi) << 23), b_hi[s][b]);
+          // ldexpf keeps the inverse exact at e == 254 (an inf amax), where 2^-127 is subnormal
+          quant_half(xb[s][b][0], xb[s][b][1], ldexpf(1.0f, 127 - e_lo), b_lo[s][b]);
+          quant_half(xb[s][b][2], xb[s][b][3], ldexpf(1.0f, 127 - e_hi), b_hi[s][b]);
           // The scale of block g lives in lane row + 32 * (g % 2).
           const int src_lane = row_in_tile + 16 * (2 * (g & 1));
           const int e_h0 = __shfl(e_lo, src_lane);
@@ -275,7 +279,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
 #pragma unroll
     for (int w = 1; w < WAVES; ++w)
       v += red[w][t][b][i][j];
-    out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + i] = f32_to_bf16_rne(v);
+    out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + i] = device::cast<bf16_t>(v);
   }
 #elif defined(__HIP_DEVICE_COMPILE__)
 // the JIT compiles one --offload-arch; an empty body here would launch and return `out` unwritten
@@ -361,7 +365,7 @@ struct Mxfp8GemvGfx950Kernel {
         static_cast<const uint8_t*>(weight_scale.data_ptr()),
         static_cast<const uint8_t*>(x.data_ptr()),
         xs_ptr,
-        static_cast<uint16_t*>(out.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
         static_cast<int32_t>(M),
         static_cast<int32_t>(N),
         static_cast<int32_t>(K));
