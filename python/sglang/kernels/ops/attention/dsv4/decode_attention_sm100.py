@@ -40,6 +40,23 @@ def can_use_swapab_attention(
 
 
 @triton.jit
+def inverse_rope_tail(
+    out, d, FREQS, pos, freq_stride, HEAD_DIM: tl.constexpr, ROPE_DIM: tl.constexpr
+):
+    """out (head dims d) with its last ROPE_DIM dims inverse-rotated at position pos. It
+    rotates the rounded values, as the model's standalone RoPE kernel reads them."""
+    x = out.to(tl.float32)
+    is_rope = d >= HEAD_DIM - ROPE_DIM
+    freq_index = ((d - (HEAD_DIM - ROPE_DIM)) // 2) * 2
+    cos = tl.load(FREQS + pos * freq_stride + freq_index, is_rope, 0)
+    sin = tl.load(FREQS + pos * freq_stride + freq_index + 1, is_rope, 0)
+    signed = tl.where(d % 2 == 0, -x * sin, x * sin)
+    swapped = tl.reshape(tl.flip(tl.reshape(signed, (d.shape[0] // 2, 2)), 1), d.shape)
+    rotated = tl.fma(x, cos, swapped)
+    return tl.where(is_rope, rotated.to(out.dtype), out)
+
+
+@triton.jit
 def _combine(
     PART,
     MAX,
@@ -74,16 +91,8 @@ def _combine(
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
     out = out.to(OUT.dtype.element_ty)
     if ROPE_DIM > 0:
-        x = out.to(tl.float32)
         pos = tl.load(POSITIONS + b)
-        is_rope = d >= 512 - ROPE_DIM
-        freq_index = ((d - (512 - ROPE_DIM)) // 2) * 2
-        cos = tl.load(FREQS + pos * FREQ_STRIDE + freq_index, is_rope, 0)
-        sin = tl.load(FREQS + pos * FREQ_STRIDE + freq_index + 1, is_rope, 0)
-        signed = tl.where(d % 2 == 0, -x * sin, x * sin)
-        swapped = tl.reshape(tl.flip(tl.reshape(signed, (BD // 2, 2)), 1), (BD,))
-        rotated = tl.fma(x, cos, swapped)
-        out = tl.where(is_rope, rotated.to(OUT.dtype.element_ty), out)
+        out = inverse_rope_tail(out, d, FREQS, pos, FREQ_STRIDE, 512, ROPE_DIM)
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 

@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import inverse_rope_tail
+
 
 @triton.jit
 def _aiter_sparse_decode_reduce_kernel(
@@ -68,23 +70,8 @@ def _aiter_sparse_decode_reduce_kernel(
 
     out = (acc / l_final).to(out_ptr.dtype.element_ty)
     if INV_ROPE:
-        # the model's standalone kernel reads the bf16-rounded output, so rotate the rounded values
-        x = out.to(tl.float32)
         pos = tl.load(pos_ptr + t)
-        is_rope = d >= D - RD
-        cos_idx = ((d - (D - RD)) // 2) * 2
-        cos = tl.load(fr_ptr + pos * fr_stride_pos + cos_idx, mask=is_rope, other=0.0)
-        sin = tl.load(
-            fr_ptr + pos * fr_stride_pos + cos_idx + 1, mask=is_rope, other=0.0
-        )
-        x_sin = x * sin
-        even = d % 2 == 0
-        x_neg = tl.where(even, -x_sin, x_sin)
-        x_neg = tl.reshape(x_neg, (D // 2, 2))
-        x_neg = tl.flip(x_neg, 1)
-        x_rot = tl.reshape(x_neg, (D,))
-        roped = tl.fma(x, cos, x_rot)
-        out = tl.where(is_rope, roped.to(out_ptr.dtype.element_ty), out)
+        out = inverse_rope_tail(out, d, fr_ptr, pos, fr_stride_pos, D, RD)
     tl.store(out_ptr + t * out_stride_t + h * out_stride_h + d, out)
 
 
@@ -135,7 +122,7 @@ def aiter_sparse_split_reduce(
         part_acc.stride(2),
         out.stride(0),
         out.stride(1),
-        freqs_real.stride(0) if inv_rope is not None else 0,
+        freqs_real.stride(0),
         NUM_SPLITS=S,
         D=D,
         RD=rope_dim,
