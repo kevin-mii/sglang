@@ -10,7 +10,7 @@ from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
     aiter_sparse_split_reduce,
 )
 
-RCP_LN2: gl.constexpr = 1.4426950408889634  # exp(x) = exp2(x * RCP_LN2)
+RCP_LN2 = gl.constexpr(1.4426950408889634)  # exp(x) = exp2(x * RCP_LN2)
 
 
 @gluon.jit
