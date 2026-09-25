@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Union
+
 import torch
 import triton
 import triton.language as tl
@@ -76,7 +78,7 @@ def silu_and_mul_clamp_triton(
     swiglu_limit: float,
     fp8_grid: bool = False,
     emit_fp8: bool = False,
-):
+) -> Union[torch.Tensor, Fp8GridActivation, Mxfp8Activation]:
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
     Fp8GridActivation with fp8_grid or Mxfp8Activation with emit_fp8."""
     assert gate_up.dim() == 2 and gate_up.shape[1] % 2 == 0, gate_up.shape
@@ -96,12 +98,12 @@ def silu_and_mul_clamp_triton(
         scale = torch.empty(
             (M, inter_size // 32), dtype=torch.uint8, device=gate_up.device
         )
-        result = Mxfp8Activation(out, scale)
+        activation = Mxfp8Activation(out, scale)
     else:
         scale = None
-        result = Fp8GridActivation(out) if fp8_grid else out
+        activation = Fp8GridActivation(out) if fp8_grid else out
     if M == 0:
-        return result
+        return activation
     block_i = 1024 if inter_size >= 1024 else triton.next_power_of_2(inter_size)
     _silu_and_mul_clamp_kernel[(M, triton.cdiv(inter_size, block_i))](
         gate_up,
@@ -117,4 +119,4 @@ def silu_and_mul_clamp_triton(
         EMIT_FP8=emit_fp8,
         num_warps=4,
     )
-    return result
+    return activation

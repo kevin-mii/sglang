@@ -294,7 +294,7 @@ struct Mxfp8GemvGfx950Kernel {
     using namespace mxfp8_gemv;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     auto MSize = SymbolicSize{"num_tokens"};
     auto NSize = SymbolicSize{"out_features"};
     auto KSize = SymbolicSize{"in_features"};

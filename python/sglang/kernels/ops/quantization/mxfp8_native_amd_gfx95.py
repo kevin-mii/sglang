@@ -6,10 +6,9 @@ with the tiles tuned in mxfp8_gemv_gfx95_configs.json."""
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -18,8 +17,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quantize
-
-logger = logging.getLogger(__name__)
 
 # M <= 32: the scaled-MFMA skinny kernel (deepseek_v4/mxfp8_gemv_gfx95.cuh)
 _GEMV_MAX_TOKENS = 32
@@ -74,18 +71,8 @@ def _m_bucket(m: int) -> int:
 @cache_once
 def _config_table(section: str) -> Dict[str, str]:
     """One {'gfx950:N:K:M_bucket': entry} section of _CONFIG_FILE."""
-    try:
-        with open(_CONFIG_FILE) as f:
-            table = json.load(f)
-    except (OSError, ValueError) as err:
-        # every shape then takes the heuristic, so say so instead of silently losing the tuning
-        logger.warning(
-            "mxfp8 gfx95 tile table %s unreadable (%s); using heuristics",
-            _CONFIG_FILE,
-            err,
-        )
-        return {}
-    return {str(key): str(value) for key, value in table.get(section, {}).items()}
+    with open(_CONFIG_FILE) as f:
+        return json.load(f)[section]
 
 
 @cache_once
@@ -93,20 +80,16 @@ def _gfx_name() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
-def _select_config(m: int, n: int, k: int) -> _GemvConfig:
-    """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
-    return _select_bucket_config(_m_bucket(m), n, k)
-
-
 @cache_once
-def _select_bucket_config(bucket: int, n: int, k: int) -> _GemvConfig:
-    table = _config_table("configs")
+def _select_config(bucket: int, n: int, k: int) -> _GemvConfig:
+    """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
     key = f"{_gfx_name()}:{n}:{k}:{bucket}"
-    if key in table:
-        cfg = _GemvConfig.parse(table[key])
-        if cfg.valid_for(bucket, n):
-            return cfg
-    return _default_config(bucket, k)
+    entry = _config_table("configs").get(key)
+    if entry is None:
+        return _default_config(bucket, k)
+    cfg = _GemvConfig.parse(entry)
+    assert cfg.valid_for(bucket, n), f"tuned entry {key}: {entry} cannot serve it"
+    return cfg
 
 
 @cache_once
@@ -166,7 +149,7 @@ def mxfp8_gemv(
         x_scale = x_scale.contiguous()
         x = x.view(torch.uint8)
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
-    config = _select_config(m, n, k)
+    config = _select_config(_m_bucket(m), n, k)
     _jit_mxfp8_gemv_module(config, x_bf16).run(
         weight_shuffled, weight_scale_ue8m0, x, x_scale, out
     )
@@ -194,8 +177,7 @@ def _large_m_tile(m: int, n: int, k: int) -> Tuple[int, int, int, int, int]:
     entry = _config_table("large_m").get(f"{_gfx_name()}:{n}:{k}:{bucket}")
     if entry is None:
         return _DEFAULT_SMALL_M_TILE if bucket <= 1024 else _DEFAULT_LARGE_M_TILE
-    bm, bn, bk, warps, split_k = (int(v) for v in entry.split(","))
-    return bm, bn, bk, warps, split_k
+    return tuple(int(v) for v in entry.split(","))
 
 
 def native_route_supports(n: int, k: int) -> bool:
@@ -204,7 +186,7 @@ def native_route_supports(n: int, k: int) -> bool:
 
 
 def prepare_mxfp8_native_weight(
-    weight: torch.Tensor, weight_scale: torch.Tensor, block_size
+    weight: torch.Tensor, weight_scale: torch.Tensor, block_size: Sequence[int]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp8 [N, K] + fp32 block scales -> (shuffled fp8 bytes [N/16, K/128, 2048],
     ue8m0 scale bytes [N/32, K/32])."""
@@ -364,9 +346,9 @@ def mxfp8_native_blockscaled_linear(
     else:
         if input_scale is None:
             xq, xs = fp8_grid_quantize(input_2d)
-        tile = _large_m_tile(m, n, k)
+        *tile, split_k = _large_m_tile(m, n, k)
         out = _mxfp8_shuffled_gemm(
-            xq, xs, weight_shuffled, weight_scale_ue8m0, tile[:4], tile[4]
+            xq, xs, weight_shuffled, weight_scale_ue8m0, tuple(tile), split_k
         )
     if bias is not None:
         out = out + bias

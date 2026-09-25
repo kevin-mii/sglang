@@ -16,7 +16,7 @@ consumed as-is) and the activation is MXFP8-quantized in one fused pass.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -483,7 +483,7 @@ def fp8_grid_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def dequant_block_fp8_weight_to_bf16(
-    weight: torch.Tensor, weight_scale: torch.Tensor, block_size
+    weight: torch.Tensor, weight_scale: torch.Tensor, block_size: Sequence[int]
 ) -> torch.Tensor:
     """fp8 e4m3 [N, K] with fp32 power-of-two block scales [ceil(N / bn), K // bk]
     -> bf16 [N, K], exact (an e4m3 value times a power of two fits bf16)."""
