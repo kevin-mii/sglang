@@ -1,8 +1,9 @@
 """Byte-exactness of the V4.1 (fp8 / fp4) FlashMLA KV cache store kernels.
 
 Every store kernel is compared byte for byte with the pure-torch quantizers of
-the two formats (torch_quant.quantize_k_cache_v41 / _v41_fp4), which
-follow the decode kernel's own reference quantizer.
+the two formats (torch_quant.quantize_k_cache_v41 and
+dsv41_kv_quant_reference.quantize_k_cache_v41_fp4), which follow the decode
+kernel's own reference quantizer.
 """
 
 import math
@@ -662,6 +663,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 expected = q.clone()
                 # The model's standalone query rope (batched flat kernel).
                 set_batched_rope(True)
+                self.addCleanup(set_batched_rope, False)
                 fused_rope_inplace(
                     expected[..., -ROPE_DIM:], None, freqs_cis, positions
                 )

@@ -498,10 +498,12 @@ def build_decode_schedule(
     context_lens = context_lens.to(torch.int32)
     rows = context_lens.shape[0]
     ctas = cta_info_out.shape[0]
-    assert 0 < rows <= ctas, (
+    assert rows <= ctas, (
         f"{rows} rows on {ctas} CTAs: the persistent grid must give every row a CTA"
     )
     scratch = torch.empty(rows + 2, dtype=torch.int32, device=context_lens.device)
+    if rows == 0:
+        return scratch
     scalars, incl = scratch[:2], scratch[2:]
     _decode_schedule_prep_kernel[(1,)](
         context_lens,

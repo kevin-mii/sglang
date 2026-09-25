@@ -329,7 +329,6 @@ def _gate_row(
         my_idx = _slot(cursor, i0, i1, i2, i3, i4, i5, 0)
         max_val = tl.max(my_val, axis=0)
         win_lane = tl.min(tl.where(my_val == max_val, lane, 64), axis=0)
-        win_lane = tl.where(win_lane == 64, 0, win_lane)
         win_idx = tl.sum(tl.where(lane == win_lane, my_idx, 0), axis=0)
         i_won = (cursor < 6) & (my_idx == win_idx)
         my_orig = tl.where(i_won, _slot(cursor, o0, o1, o2, o3, o4, o5, 0.0), 0.0)
@@ -432,7 +431,7 @@ def rocm_router_gate(
         gating_output.stride(0),
         stride_ps,
         stride_pm,
-        topk,
+        weights.stride(0),
         float(1.0 if routed_scaling_factor is None else routed_scaling_factor),
         SPLIT_K=split_k,
         WRITE_LOGITS=split_k > 0,

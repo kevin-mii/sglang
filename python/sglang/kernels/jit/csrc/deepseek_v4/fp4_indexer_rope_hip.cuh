@@ -28,8 +28,8 @@ template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, 
 __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_k_split_kernel(
     const IndexKSplitParams params) {
   using namespace device;
-  namespace fp4 = deepseek_v4::fp4;
 
+  static_assert(kPageSize == 64, "the 16 x 4 slot transpose of the scale spans a 64-slot page");
   static_assert(
       kHeadDim == 128 && kRopeDim == 64,
       "the one-warp tiling is specific to a 128-wide row whose second half is the RoPE tail");

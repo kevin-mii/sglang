@@ -595,6 +595,7 @@ def store_fp4_index_k_cache_split(
     loc[i] of the split FlyDSL K layout (payload [pages, 1, 4, page_size, 16],
     scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
     assert input.shape[-1] == _HEAD_DIM
+    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
     assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
     assert scale.shape[1:] == (1, 4, page_size), scale.shape
     k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
@@ -618,6 +619,7 @@ def read_fp4_index_k_split(
     """Inverse of store_fp4_index_k_cache_split: (payload int8 [n, 64], scales
     int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
     quantize_fp4_indexer_tensor."""
+    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
     slots = slots.to(torch.int64)
     page, off = slots // page_size, slots % page_size
     rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
