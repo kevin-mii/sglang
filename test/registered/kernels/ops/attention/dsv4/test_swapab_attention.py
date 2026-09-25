@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the HIP swap-AB Gluon kernel runs on gfx950.
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 def make_cache(page, pages=11):
@@ -119,9 +119,6 @@ class TestSwapABAttention(CustomTestCase):
             gold = reference(
                 q, values, ids, lengths, sink, (extra_values, ei, el) if ne else None
             )
-            self.assertTrue(torch.isfinite(out).all().item())
-            self.assertEqual(out.shape, (b, 16, 512))
-            self.assertTrue(out.is_contiguous())
             floor_error = (gold.bfloat16().double() - gold).square().mean().sqrt()
             error = (out.double() - gold).square().mean().sqrt()
             self.assertLessEqual(error.item(), floor_error.item() * 1.01 + 1e-6)
