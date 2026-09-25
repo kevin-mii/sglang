@@ -3,7 +3,7 @@ on HIP; every kernel reproduces the torch expression quoted in its docstring bit
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import triton
@@ -183,7 +183,7 @@ def low_ratio_compression_metadata(
     seq_lens_casual: torch.Tensor,
     raw_out_loc: torch.Tensor,
     low_ratios: Tuple[int, ...],
-) -> dict:
+) -> Dict[str, torch.Tensor]:
     """_low_ratio_compression_metadata for ratios 1 and 2 in one launch: cR_out_loc =
     where(seq_lens[:nw] % R == 0, raw_out_loc // R, -1) (int64) and cR_topk_lengths_clamp1 =
     (seq_lens // R).clamp_min(1) (int32), keyed c{R}_... for the ratios present."""
@@ -286,7 +286,7 @@ def sparse_buffers(
     c2_topk_lengths_clamp1: Optional[torch.Tensor],
     index_topk: int,
     page_index_align: int,
-) -> dict:
+) -> Dict[str, torch.Tensor]:
     """init_flashmla_related's tensors in one launch, keyed by attribute name: the top-k
     lengths clamped to index_topk and the -1-filled int32 page-index buffers padded to
     page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given."""
