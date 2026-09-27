@@ -17,6 +17,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
@@ -204,6 +206,25 @@ def _create_flashmla_metadata():
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
+
+
+@triton.jit
+def _dspark_expand_same_length_kernel(
+    seq_lens_ptr,
+    req_pool_indices_ptr,
+    seq_lens_out_ptr,
+    req_pool_indices_out_ptr,
+    QO_LEN: tl.constexpr,
+):
+    request = tl.program_id(0).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + request)
+    req_pool_index = tl.load(req_pool_indices_ptr + request)
+    for token in tl.static_range(QO_LEN):
+        offset = request * QO_LEN + token
+        tl.store(seq_lens_out_ptr + offset, seq_len - QO_LEN + 1 + token)
+        tl.store(req_pool_indices_out_ptr + offset, req_pool_index)
+
+
 
 
 @dataclass
@@ -2986,6 +3007,39 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ):
+        if (
+            qo_len > 0
+            and seq_lens.dim() == 1
+            and req_pool_indices.dim() == 1
+            and seq_lens.numel() == bs
+            and req_pool_indices.numel() == bs
+            and seq_lens.is_contiguous()
+            and req_pool_indices.is_contiguous()
+            and seq_lens.device.type == "cuda"
+            and seq_lens.device == req_pool_indices.device
+        ):
+            seq_lens_casual = torch.empty(
+                (bs * qo_len,),
+                dtype=torch.result_type(
+                    seq_lens, torch.empty(0, dtype=torch.int32, device=seq_lens.device)
+                ),
+                device=seq_lens.device,
+            )
+            req_pool_indices_repeated = torch.empty(
+                (bs * qo_len,),
+                dtype=req_pool_indices.dtype,
+                device=req_pool_indices.device,
+            )
+            _dspark_expand_same_length_kernel[(bs,)](
+                seq_lens,
+                req_pool_indices,
+                seq_lens_casual,
+                req_pool_indices_repeated,
+                QO_LEN=qo_len,
+                num_warps=1,
+            )
+            return seq_lens_casual, req_pool_indices_repeated
+
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
         )

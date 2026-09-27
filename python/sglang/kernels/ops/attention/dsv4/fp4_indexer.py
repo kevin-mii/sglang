@@ -117,13 +117,21 @@ def quantize_fp4_indexer_row(
     offs1 = offs0 + 1
     group0 = offs0 // GROUP_N
     group1 = offs1 // GROUP_N
-    scale_exp0 = _select_group_value(group0, exp0, exp1, exp2, exp3)
-    scale_exp1 = _select_group_value(group1, exp0, exp1, exp2, exp3)
-    scale0 = (scale_exp0 << 23).to(tl.float32, bitcast=True)
-    scale1 = (scale_exp1 << 23).to(tl.float32, bitcast=True)
+    recip_bits0 = tl.where(exp0 == 254, 0x00400000, (254 - exp0) << 23)
+    recip_bits1 = tl.where(exp1 == 254, 0x00400000, (254 - exp1) << 23)
+    recip_bits2 = tl.where(exp2 == 254, 0x00400000, (254 - exp2) << 23)
+    recip_bits3 = tl.where(exp3 == 254, 0x00400000, (254 - exp3) << 23)
+    recip0 = _select_group_value(
+        group0, recip_bits0, recip_bits1, recip_bits2, recip_bits3
+    )
+    recip1 = _select_group_value(
+        group1, recip_bits0, recip_bits1, recip_bits2, recip_bits3
+    )
+    recip0 = recip0.to(tl.float32, bitcast=True)
+    recip1 = recip1.to(tl.float32, bitcast=True)
 
-    v0 = v0 / scale0
-    v1 = v1 / scale1
+    v0 = v0 * recip0
+    v1 = v1 * recip1
     if RNE:
         code0 = _fp4_e2m1_code_rne(v0)
         code1 = _fp4_e2m1_code_rne(v1)
@@ -208,6 +216,58 @@ def _quantize_fp4_indexer_rows(
 
 
 @triton.jit
+def _quantize_fp4_indexer_rowblock_kernel(
+    x,
+    x_fp4,
+    x_sf,
+    M,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_N == 128 and GROUP_N == 32)
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < M
+    offs = tl.arange(0, BLOCK_N)
+    values = tl.load(
+        x + rows[:, None].to(tl.int64) * BLOCK_N + offs[None, :],
+        mask=row_mask[:, None],
+        other=0,
+    ).to(tl.float32)
+
+    grouped = tl.reshape(values, (BLOCK_ROWS, BLOCK_N // GROUP_N, GROUP_N))
+    amax = tl.max(tl.abs(grouped), axis=2)
+    sf = tl.maximum(amax / 6.0, 1.0e-4)
+    exp = _ceil_ue8m0_exp(sf)
+    recip_bits = tl.where(exp == 254, 0x00400000, (254 - exp) << 23)
+    recip = recip_bits.to(tl.float32, bitcast=True)
+    normalized = grouped * recip[:, :, None]
+
+    v0, v1 = tl.split(
+        tl.reshape(normalized, (BLOCK_ROWS, BLOCK_N // GROUP_N, GROUP_N // 2, 2))
+    )
+    if RNE:
+        code0 = _fp4_e2m1_code_rne(v0)
+        code1 = _fp4_e2m1_code_rne(v1)
+    else:
+        code0 = _fp4_e2m1_code(v0)
+        code1 = _fp4_e2m1_code(v1)
+    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    packed = tl.reshape(packed, (BLOCK_ROWS, BLOCK_N // 2))
+    tl.store(
+        x_fp4 + rows[:, None].to(tl.int64) * (BLOCK_N // 2)
+        + tl.arange(0, BLOCK_N // 2)[None, :],
+        packed,
+        mask=row_mask[:, None],
+    )
+
+    shifts = tl.arange(0, 4) * 8
+    packed_sf = tl.sum(exp.to(tl.uint32) << shifts[None, :], axis=1)
+    tl.store(x_sf + rows, packed_sf.to(tl.int32), mask=row_mask)
+
+
+@triton.jit
 def _store_fp4_index_k_cache_kernel(
     k_fp4,
     k_sf,
@@ -256,6 +316,20 @@ def quantize_fp4_indexer_tensor(
             GROUP_N=32,
             RNE=rne,
             num_warps=4,
+        )
+    elif x.shape[0] >= 4096 and get_platform().is_hip:
+        block_rows = 32
+        num_warps = 8
+        _quantize_fp4_indexer_rowblock_kernel[(triton.cdiv(x.shape[0], block_rows),)](
+            x,
+            x_fp4,
+            x_sf,
+            x.shape[0],
+            BLOCK_ROWS=block_rows,
+            BLOCK_N=128,
+            GROUP_N=32,
+            RNE=rne,
+            num_warps=num_warps,
         )
     elif x.shape[0] > 0:
         _quantize_fp4_indexer_kernel[(x.shape[0],)](
