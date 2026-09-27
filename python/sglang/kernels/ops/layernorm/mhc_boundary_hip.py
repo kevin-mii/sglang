@@ -28,6 +28,8 @@ _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
+_HC_SINKHORN_PREFILL_MIN_M = 2048
+_HC_SINKHORN_PREFILL_NUM_STAGES = 2
 
 
 @triton.jit
@@ -460,6 +462,11 @@ def rmsnorm_with_sinkhorn(
         ITERS=coefficients.sinkhorn_iters,
         EPS=coefficients.hc_eps,
         num_warps=_HC_SINKHORN_NUM_WARPS,
+        num_stages=(
+            _HC_SINKHORN_PREFILL_NUM_STAGES
+            if M >= _HC_SINKHORN_PREFILL_MIN_M
+            else None
+        ),
     )
     return quant, out_norm
 

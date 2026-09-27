@@ -974,6 +974,9 @@ class SchedulerMetricsReporter:
                     estimate_suffix = draft_worker.block_accept_estimate_log_suffix()
                     if estimate_suffix:
                         msg += f"{estimate_suffix}, "
+                    width3_suffix = draft_worker.dspark_width3_log_suffix()
+                    if width3_suffix:
+                        msg += f"{width3_suffix}, "
 
             if self.current_scheduler_metrics_enabled:
                 spec_snapshot = self._active_spec_config_snapshot()

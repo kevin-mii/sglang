@@ -1512,11 +1512,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.next_token_logits is not None
                     else None
                 )
+                precomputed_token_ids = (
+                    output.precomputed_token_ids[: self.raw_num_token]
+                    if output.precomputed_token_ids is not None
+                    else None
+                )
 
             # Preserve extension fields produced by the eager output processor.
             return dataclasses.replace(
                 output,
                 next_token_logits=next_token_logits,
+                precomputed_token_ids=precomputed_token_ids,
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
@@ -1602,8 +1608,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
-                ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
-            )
+                    ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+                    precompute_greedy_ids=(
+                        True
+                        if (
+                            self.model_runner.spec_algorithm.is_dspark()
+                            and not self.model_runner.is_draft_worker
+                            and not self.ragged_verify_mode
+                        )
+                        else None
+                    ),
+                )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

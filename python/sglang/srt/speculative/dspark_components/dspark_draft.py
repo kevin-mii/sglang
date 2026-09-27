@@ -6,6 +6,8 @@ from typing import Optional
 
 import msgspec
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
@@ -33,6 +35,78 @@ from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _draft_input_copy_kernel(
+    bonus_ptr,
+    positions_ptr,
+    cache_loc_ptr,
+    draft_ids_ptr,
+    positions_out_ptr,
+    cache_loc_out_ptr,
+    bonus_stride,
+    positions_stride_row,
+    positions_stride_col,
+    cache_loc_stride_row,
+    cache_loc_stride_col,
+    draft_ids_stride_row,
+    QO_LEN: tl.constexpr,
+):
+    request = tl.program_id(0).to(tl.int64)
+    bonus = tl.load(bonus_ptr + request * bonus_stride)
+    tl.store(draft_ids_ptr + request * draft_ids_stride_row, bonus)
+    for token in tl.static_range(QO_LEN):
+        position = tl.load(
+            positions_ptr
+            + request * positions_stride_row
+            + token * positions_stride_col
+        )
+        cache_loc = tl.load(
+            cache_loc_ptr
+            + request * cache_loc_stride_row
+            + token * cache_loc_stride_col
+        )
+        offset = request * QO_LEN + token
+        tl.store(positions_out_ptr + offset, position)
+        tl.store(cache_loc_out_ptr + offset, cache_loc)
+
+
+def _copy_draft_inputs(
+    bonus_tokens: torch.Tensor,
+    positions_2d: torch.Tensor,
+    verify_cache_loc_2d: torch.Tensor,
+    draft_block_ids: torch.Tensor,
+    query_token_num: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = draft_block_ids.shape[0]
+    draft_positions = torch.empty(
+        (batch_size * query_token_num,),
+        dtype=positions_2d.dtype,
+        device=positions_2d.device,
+    )
+    draft_cache_loc = torch.empty(
+        (batch_size * query_token_num,),
+        dtype=verify_cache_loc_2d.dtype,
+        device=verify_cache_loc_2d.device,
+    )
+    _draft_input_copy_kernel[(batch_size,)](
+        bonus_tokens,
+        positions_2d,
+        verify_cache_loc_2d,
+        draft_block_ids,
+        draft_positions,
+        draft_cache_loc,
+        bonus_tokens.stride(0),
+        positions_2d.stride(0),
+        positions_2d.stride(1),
+        verify_cache_loc_2d.stride(0),
+        verify_cache_loc_2d.stride(1),
+        draft_block_ids.stride(0),
+        QO_LEN=query_token_num,
+        num_warps=1,
+    )
+    return draft_positions, draft_cache_loc
 
 
 def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
@@ -395,9 +469,13 @@ class DraftBlockProposer:
             self._draft_block_ids_buf = buf
         draft_block_ids = buf[:bs]
 
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :query_token_num].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
+        draft_positions, draft_cache_loc = _copy_draft_inputs(
+            draft_input.bonus_tokens,
+            positions_2d,
+            verify_cache_loc_2d,
+            draft_block_ids,
+            query_token_num,
+        )
 
         draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
             self.draft_model, "forward_embed"

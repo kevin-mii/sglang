@@ -16,11 +16,11 @@ from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
+
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
     """Fix mlp's activation route from down_proj's loaded weight (once per layer)."""
     quant_method = mlp.down_proj.quant_method
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
-    mlp.use_fused_clamp_act_mul = half_width % 128 == 0
     mlp._fused_clamp_use_fp8 = (
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_quant
@@ -34,6 +34,7 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
         and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and silu_and_mul_clamp_fp8_grid_supported(half_width)
     )
+    mlp.use_fused_clamp_act_mul = half_width % 128 == 0 and not mlp._hip_act_fp8_grid
     # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue at decode token counts
     mlp._hip_act_native_consumer = bool(
         mlp._hip_act_fp8_grid
@@ -56,9 +57,12 @@ def silu_and_mul_clamp(mlp, gate_up: torch.Tensor):
     """silu(clamp(g)) * clamp(u) for any half width (unlike the aiter kernel's
     multiple of 128), emitted on down_proj's fp8 grid or as native fp8 + ue8m0
     when the resolved route takes it."""
-    return silu_and_mul_clamp_triton(
+    half_width = gate_up.shape[-1] // 2
+    result = silu_and_mul_clamp_triton(
         gate_up,
         float(mlp.swiglu_limit),
         fp8_grid=mlp._hip_act_fp8_grid,
         emit_fp8=_emit_fp8(mlp, gate_up.shape[0]),
+        exp2=mlp._hip_act_fp8_grid and half_width % 128 == 0,
     )
+    return result

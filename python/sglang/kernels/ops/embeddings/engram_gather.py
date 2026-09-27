@@ -20,14 +20,21 @@ def _engram_gather_kernel(
     s_ptr,
     ids_ptr,
     out_ptr,
+    ids_stride0,
+    ids_stride1,
     row_lo,
     row_hi,
+    IDS_COLS: tl.constexpr,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
+    linear = tl.program_id(0).to(tl.int64)
+    ids_row = linear // IDS_COLS
+    ids_col = linear % IDS_COLS
+    idx = tl.load(
+        ids_ptr + ids_row * ids_stride0 + ids_col * ids_stride1
+    ).to(tl.int64)
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
@@ -43,7 +50,7 @@ def _engram_gather_kernel(
     scale = (exps << 23).to(tl.float32, bitcast=True)
     scale = tl.where(exps == 0, E8M0_ZERO, scale)
     out = tl.where(owned, vals * scale, 0.0)
-    tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
+    tl.store(out_ptr + linear * DIM + offs, out.to(tl.bfloat16))
 
 
 def engram_gather(
@@ -64,20 +71,30 @@ def engram_gather(
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
-    assert (
-        ids.is_cuda and ids.is_contiguous() and ids.dtype in (torch.int32, torch.int64)
-    )
+    assert ids.is_cuda and ids.dtype in (torch.int32, torch.int64)
+    assert ids.ndim <= 2, ids.shape
     assert out.is_contiguous() and out.dtype == torch.bfloat16
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
     if n:
+        if ids.ndim == 1:
+            ids_stride0 = ids.stride(0)
+            ids_stride1 = 0
+            ids_cols = 1
+        else:
+            ids_stride0 = ids.stride(0)
+            ids_stride1 = ids.stride(1)
+            ids_cols = ids.shape[1]
         _engram_gather_kernel[(n,)](
             weight_ptr,
             scale_ptr,
             ids,
             out,
+            ids_stride0,
+            ids_stride1,
             row_lo,
             row_hi,
+            IDS_COLS=ids_cols,
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,

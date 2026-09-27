@@ -79,6 +79,7 @@ def _fused_qk_norm_rope_store_kernel(
     q_in_ptr,
     q_out_ptr,
     kv_ptr,
+    kv_out_ptr,
     q_norm_weight_ptr,
     kv_norm_weight_ptr,
     positions_ptr,
@@ -95,6 +96,8 @@ def _fused_qk_norm_rope_store_kernel(
     stride_qd,
     stride_kv_m,
     stride_kv_d,
+    stride_kv_out_m,
+    stride_kv_out_d,
     cos_stride_t,
     cos_stride_d,
     swa_cache_stride_page,
@@ -115,6 +118,7 @@ def _fused_qk_norm_rope_store_kernel(
     SWA_PAGE_SIZE: tl.constexpr,
     BF16_STORE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
+    HAS_KV_OUT: tl.constexpr,
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -197,11 +201,19 @@ def _fused_qk_norm_rope_store_kernel(
         w_kv = None
     kv_normed = _batched_rmsnorm(kv_full, w_kv, HEAD_DIM, kv_eps)
 
-    tl.store(
-        kv_full_ptrs,
-        kv_normed.to(kv_ptr.dtype.element_ty),
-        mask=src_mask[:, None] & nope_d_mask[None, :],
-    )
+    if HAS_KV_OUT:
+        kv_out_base = kv_out_ptr + src_id[:, None].to(tl.int64) * stride_kv_out_m
+        tl.store(
+            kv_out_base + offs_d_full[None, :] * stride_kv_out_d,
+            kv_normed.to(kv_out_ptr.dtype.element_ty),
+            mask=src_mask[:, None] & nope_d_mask[None, :],
+        )
+    else:
+        tl.store(
+            kv_full_ptrs,
+            kv_normed.to(kv_ptr.dtype.element_ty),
+            mask=src_mask[:, None] & nope_d_mask[None, :],
+        )
 
     kv_pe = tl.where((offs_d_full >= NOPE_DIM)[None, :], kv_normed, 0.0)
     kv_pe = tl.reshape(kv_pe, (BLOCK_SIZE_M, NUM_PE_CHUNKS, ROPE_DIM))
@@ -210,11 +222,20 @@ def _fused_qk_norm_rope_store_kernel(
     kv_pe = _batched_rope(
         kv_pe, cos, sin, d_pe_offs, BLOCK_SIZE_M, ROPE_DIM, ROPE_DIM // 2
     )
-    tl.store(
-        kv_base + (NOPE_DIM + d_pe_offs[None, :]) * stride_kv_d,
-        kv_pe.to(kv_ptr.dtype.element_ty),
-        mask=src_mask[:, None],
-    )
+    if HAS_KV_OUT:
+        tl.store(
+            kv_out_ptr
+            + src_id[:, None].to(tl.int64) * stride_kv_out_m
+            + (NOPE_DIM + d_pe_offs[None, :]) * stride_kv_out_d,
+            kv_pe.to(kv_out_ptr.dtype.element_ty),
+            mask=src_mask[:, None],
+        )
+    else:
+        tl.store(
+            kv_base + (NOPE_DIM + d_pe_offs[None, :]) * stride_kv_d,
+            kv_pe.to(kv_ptr.dtype.element_ty),
+            mask=src_mask[:, None],
+        )
 
     # ===== Paged SWA store: FP8 quant nope + BF16 rope + scales =====
     # Layout within a page (matches fused_store_flashmla_cache CUDA kernel):
@@ -469,6 +490,7 @@ def fused_qk_norm_rope_swa_store(
     k_nope_out: Optional[torch.Tensor] = None,
     k_rope_out: Optional[torch.Tensor] = None,
     q_rope_out: Optional[torch.Tensor] = None,
+    kv_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
@@ -557,6 +579,7 @@ def fused_qk_norm_rope_swa_store(
         q,
         q_out,
         kv,
+        kv_out,
         q_norm_weight,
         kv_norm_weight,
         positions,
@@ -573,6 +596,8 @@ def fused_qk_norm_rope_swa_store(
         q_out.stride(2),
         kv.stride(0),
         kv.stride(1),
+        kv_out.stride(0) if kv_out is not None else 0,
+        kv_out.stride(1) if kv_out is not None else 0,
         cos_cache.stride(0),
         cos_cache.stride(-1),
         swa_cache.stride(0) if HAS_SWA_STORE else 0,
@@ -593,6 +618,7 @@ def fused_qk_norm_rope_swa_store(
         SWA_PAGE_SIZE=swa_page_size,
         BF16_STORE=bf16_store,
         IS_FNUZ=_fp8_fnuz,
+        HAS_KV_OUT=kv_out is not None,
         num_warps=num_warps,
     )
     return q_out

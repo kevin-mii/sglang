@@ -34,8 +34,10 @@ _ROPE_DIM = 64
 _GROUP_SIZE = 32
 _KV_BLOCK_SIZE = 64
 _Q_SCALE_SHAPE = (1, 4, 16, 4)
-# gfx950 has 256 CUs; target four persistent CTAs per CU.
-_DECODE_BASE_CTA_TARGET = 1024
+# gfx950 has 256 CUs. Short contexts fill best with two persistent CTAs per
+# CU; longer contexts benefit from four while each CTA processes fewer chunks.
+_DECODE_SHORT_CONTEXT_CTA_TARGET = 512
+_DECODE_LONG_CONTEXT_CTA_TARGET = 1024
 # Preserve per-query parallelism when the batch itself exceeds one CTA per CU.
 _DECODE_CTAS_PER_QUERY = 4
 _PREFILL_BASE_CTA_TARGET = 1024
@@ -136,7 +138,12 @@ def _decode_cta_count(num_queries: int, max_seq_len: int) -> int:
     """Choose a bounded persistent grid without exceeding available KV chunks."""
     chunks_per_seq = max(1, (max_seq_len + 255) // 256)
     available_ctas = num_queries * chunks_per_seq
-    target_ctas = max(_DECODE_BASE_CTA_TARGET, num_queries * _DECODE_CTAS_PER_QUERY)
+    base_ctas = (
+        _DECODE_SHORT_CONTEXT_CTA_TARGET
+        if num_queries >= 128 and chunks_per_seq <= 16
+        else _DECODE_LONG_CONTEXT_CTA_TARGET
+    )
+    target_ctas = max(base_ctas, num_queries * _DECODE_CTAS_PER_QUERY)
     return min(available_ctas, target_ctas)
 
 
@@ -661,6 +668,107 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             BLOCK_N=_HEAD_DIM,
             GROUP_N=_GROUP_SIZE,
         )
+    return q_fp4, q_scale
+
+
+@triton.jit
+def _rope_fake_quant_pack_fp4_query_kernel(
+    q_ptr,
+    f_ptr,
+    pos_ptr,
+    q_fp4_ptr,
+    q_scale_ptr,
+    stride_qt,
+    stride_qh,
+    num_pos,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    scale_base = q_scale_ptr + token * (4 * 16 * 4) + (head % 16) * 4 + head // 16
+    chunks = tl.arange(0, 4)
+    if head >= H:
+        tl.store(scale_base + chunks * (16 * 4), tl.zeros([4], dtype=tl.uint8))
+        return
+
+    pos = tl.load(pos_ptr + token)
+    pos = tl.where((pos >= 0) & (pos < num_pos), pos, 0)
+    fake_quant = rope_tail_fake_quant_fp4_row(
+        q_ptr + token * stride_qt + head * stride_qh,
+        f_ptr + pos * RD,
+        D=D,
+        RD=RD,
+        BLK=32,
+        AMAX_FLOOR=AMAX_FLOOR,
+        INVERSE=False,
+        COMPRESSED_KV=False,
+    )
+    values = fake_quant.to(tl.bfloat16).to(tl.float32)
+    v0, v1 = tl.split(tl.reshape(values, (D // 2, 2)))
+    packed, packed_scale = quantize_fp4_indexer_row(
+        values, v0, v1, BLOCK_N=D, GROUP_N=32, RNE=True
+    )
+    scale_bytes = ((packed_scale >> (8 * chunks)) & 0xFF).to(tl.uint8)
+    tl.store(scale_base + chunks * (16 * 4), scale_bytes)
+    tl.store(
+        q_fp4_ptr + token * (H * (D // 2)) + head * (D // 2) + tl.arange(0, D // 2),
+        packed,
+    )
+
+
+def rope_fake_quant_pack_fp4_query_flydsl(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE-tail fake-quant and FlyDSL FP4 query packing in one launch."""
+    if (
+        q.dim() != 3
+        or q.dtype != torch.bfloat16
+        or q.shape[-1] != _HEAD_DIM
+        or q.stride(2) != 1
+        or q.shape[1] % 16 != 0
+        or q.shape[1] > 64
+        or freqs_cis.dtype != torch.complex64
+        or freqs_cis.shape[1] != rope_dim // 2
+        or positions.shape != (q.shape[0],)
+        or positions.dtype.is_floating_point
+        or positions.device != q.device
+    ):
+        raise NotImplementedError
+
+    num_tokens, num_heads = q.shape[:2]
+    q_fp4 = torch.empty(
+        (num_tokens, num_heads, _HEAD_DIM // 2), dtype=torch.int8, device=q.device
+    )
+    q_scale = torch.empty(
+        (num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device
+    )
+    if num_tokens == 0:
+        return q_fp4, q_scale
+
+    freqs_real = torch.view_as_real(freqs_cis)
+    if not freqs_real.is_contiguous():
+        raise NotImplementedError
+    _rope_fake_quant_pack_fp4_query_kernel[(num_tokens, 64)](
+        q,
+        freqs_real,
+        positions,
+        q_fp4,
+        q_scale,
+        q.stride(0),
+        q.stride(1),
+        freqs_real.shape[0],
+        H=num_heads,
+        D=_HEAD_DIM,
+        RD=rope_dim,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        num_warps=1,
+    )
     return q_fp4, q_scale
 
 

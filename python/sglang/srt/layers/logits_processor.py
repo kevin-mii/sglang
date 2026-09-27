@@ -25,6 +25,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.kernels.ops.speculative.shard_argmax import shard_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -204,6 +205,8 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Full-vocabulary greedy IDs computed without materializing gathered logits.
+    precomputed_token_ids: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -503,8 +506,13 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsProcessorOutput:
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
+        precompute_greedy_ids = False
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
+            spec_info = getattr(logits_metadata, "spec_info", None)
+            precompute_greedy_ids = bool(
+                getattr(spec_info, "precompute_greedy_ids", False)
+            )
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output. `is False` not `not`: None
@@ -565,7 +573,29 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            use_shard_argmax = (
+                precompute_greedy_ids and self._can_shard_argmax(lm_head)
+            )
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                skip_tp_gather=use_shard_argmax,
+                copy_logits=not use_shard_argmax,
+            )
+            if use_shard_argmax:
+                parallel = get_parallel()
+                token_ids = shard_argmax(
+                    logits,
+                    tp_rank=parallel.tp_rank,
+                    tp_group=parallel.tp_group,
+                )
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    precomputed_token_ids=token_ids,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -842,6 +872,8 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        skip_tp_gather: bool = False,
+        copy_logits: bool = True,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -881,7 +913,7 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if self.do_tensor_parallel_all_gather and not skip_tp_gather:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
@@ -909,9 +941,10 @@ class LogitsProcessor(nn.Module):
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
 
-        logits = self._copy_logits_to_buffer(
-            logits, logits_metadata, use_buffer=use_logits_buffer
-        )
+        if copy_logits:
+            logits = self._copy_logits_to_buffer(
+                logits, logits_metadata, use_buffer=use_logits_buffer
+            )
 
         if self.final_logit_softcapping:
             if not (_is_npu or _is_cpu):
@@ -922,6 +955,25 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _can_shard_argmax(self, lm_head: VocabParallelEmbedding) -> bool:
+        parallel = get_parallel()
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        return (
+            self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_attn_tp_group
+            and parallel.tp_size > 1
+            and self.final_logit_softcapping is None
+            and getattr(base_lm_head, "enable_tp", False)
+            and getattr(base_lm_head, "tp_size", None) == parallel.tp_size
+            and getattr(base_lm_head, "num_embeddings", None) == self.vocab_size
+            and getattr(base_lm_head, "num_embeddings_padded", None)
+            == self.vocab_size
+            and self.vocab_size % parallel.tp_size == 0
+            and getattr(base_lm_head, "num_embeddings_per_partition", None)
+            == self.vocab_size // parallel.tp_size
+        )
 
     def _compute_lm_head(
         self,

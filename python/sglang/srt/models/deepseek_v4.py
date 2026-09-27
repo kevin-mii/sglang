@@ -464,10 +464,26 @@ def _apply_wo_a_bf16_matmul(
     is_prefill: bool = False,
     fast_path: bool = False,
     fp8_grid: bool = False,
+    site: str = "target",
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
+    if (
+        fp8_grid
+        and _is_hip
+        and _is_gfx95_supported
+        and (is_decode or is_target_verify)
+        and o.shape[1:] == (2, 4096)
+        and wo_a.shape == (2, 1024, 4096)
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.stride(2) == 1
+        and wo_a.is_contiguous()
+        and site == "draft"
+    ):
+        y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid=True)
+        if y is not None:
+            return y
     hip_decode_verify = (
         _is_hip
         and _is_gfx95_supported
@@ -1902,6 +1918,7 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_rope_cache = None
+            kv_out = None
             if unified and fuse_verify:
                 # Target-verify runs through the unified_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
@@ -1916,16 +1933,19 @@ class MQALayer(MqaAttentionBase):
                 # computed -- it only addresses the kernel store this path drops.
                 #
                 # kv is a strided slice of qkv_a and the ring store requires a
-                # contiguous buffer, so materialise it before the kernel norms
-                # it in place. The unfused path pays the same copy inside
-                # _compute_kv_bf16.
+                # contiguous buffer. The fused kernel writes the normed and
+                # RoPE'd rows directly there, avoiding the separate copy.
                 #
                 # Under fp8 the kernel writes the packed pair to the caller's
                 # buffers rather than norming kv in place, and the same backend
                 # store takes that pair -- only the row format changes.
-                kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, not fuse_verify_fp8
+                kv_out = (
+                    None
+                    if fuse_verify_fp8
+                    else torch.empty_like(kv, memory_format=torch.contiguous_format)
+                )
             elif unified and fuse_prefill:
                 # No pools, so the kernel norms + RoPEs + packs and writes no
                 # ring row. It must not: those rows are this fwd's extend region
@@ -1981,6 +2001,7 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
                 q_rope_out=q_rope_out,
+                kv_out=kv_out,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the
@@ -1996,6 +2017,8 @@ class MQALayer(MqaAttentionBase):
                 kv = k_nope_out
             elif not (unified and fuse_verify):
                 kv = None
+            elif kv_out is not None:
+                kv = kv_out
 
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
@@ -3896,6 +3919,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         *,
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
+        shared_expert_input_quant: Optional["Fp8GridActivation"] = None,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -4006,6 +4030,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
+                shared_expert_input_quant=shared_expert_input_quant,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)

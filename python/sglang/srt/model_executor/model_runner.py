@@ -1860,6 +1860,7 @@ class ModelRunner:
                 mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and not forward_batch.force_eager
             )
 
             if (

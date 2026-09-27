@@ -1448,6 +1448,23 @@ def biased_topk_jit_kernel_impl(
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
+        if (
+            sqrtsoftplus_log1p
+            and num_token_non_padded is not None
+            and gating_output.shape[0] <= 256
+            and gating_output.shape[1] == 384
+        ):
+            from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
+
+            return rocm_router_gate(
+                gating_output,
+                correction_bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                partials=router_logits_partials,
+                num_token_non_padded=num_token_non_padded,
+            )
         if router_logits_partials is not None:
             # ROCm decode router: split-K reduce + gate in one launch
             from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
@@ -1638,6 +1655,7 @@ def biased_grouped_topk_impl(
 from sglang.kernels.ops.moe.fill_padded_rows import (
     _can_fuse_padded_region,
     _fill_padded_rows,
+    _fill_padded_rows_pair,
 )
 
 
@@ -2277,7 +2295,6 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
-    _fold_pad_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2329,17 +2346,10 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         #
-        # Fold: when the fused append+remap kernel runs below (aiter per-rank
-        # shared-slot path, EPLB off) it folds this padded fill itself
-        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
-        # _fill_padded_rows launch here.
-        _fold_pad_into_append = (
-            num_fused_shared_experts > 0
-            and _use_aiter
-            and use_per_rank_shared_slots
-            and not _eplb_remap_enabled()
-        )
-        if not _fold_pad_into_append:
+        # EPLB remaps IDs through a table before the final pair fill, so padded
+        # rows must already contain a valid index. Other rewrites only do
+        # arithmetic on IDs and are cleaned by the final pair fill.
+        if _eplb_remap_enabled():
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
@@ -2353,7 +2363,7 @@ def _post_process_topk_ids(
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
 
-    if recorder_topk_ids is None:
+    if recorder_topk_ids is None and not _is_hip:
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
@@ -2400,7 +2410,7 @@ def _post_process_topk_ids(
             shared_id_base,
             num_local_routed,
             num_token_non_padded=(
-                num_token_non_padded if _fold_pad_into_append else None
+                None
             ),
         )
     elif _aiter_append:
@@ -2448,11 +2458,22 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not padded_rows_masked:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
-        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        if not _fill_padded_rows_pair(
+            topk_ids,
+            topk_weights,
+            num_token_non_padded,
+            ids_fill_value=0,
+        ):
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        if recorder_topk_ids is None:
+            recorder_topk_ids = topk_ids
+    elif _is_hip and recorder_topk_ids is None:
+        recorder_topk_ids = topk_ids
 
     return topk_ids, topk_weights, recorder_topk_ids
 
@@ -2647,6 +2668,15 @@ def select_experts(
                 if router_logits_partials is not None
                 else {}
             )
+            _router_padfill_fused = (
+                _use_aiter
+                and scoring_func == "sqrtsoftplus"
+                and num_fused_shared_experts_for_gate == 0
+                and topk_config.sqrtsoftplus_log1p
+                and num_token_non_padded is not None
+                and router_logits.shape[0] <= 256
+                and router_logits.shape[1] == 384
+            )
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -2662,7 +2692,9 @@ def select_experts(
                 **_packed_kwargs,
                 **_partials_kwargs,
             )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            padded_rows_masked = _fused_gate_masks_padded_rows(
+                scoring_func
+            ) or _router_padfill_fused
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"

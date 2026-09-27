@@ -482,7 +482,7 @@ def hc_boundary(
     if new_residual is None:
         new_residual = residual
     if y is None:
-        y = new_residual[:, 0, :].contiguous()
+        y = new_residual[:, 0, :]
     return new_residual, y, coefficients
 
 
@@ -594,11 +594,17 @@ def forward_hc_pre_from_prev_fused_boundary(
         layer.hc_ffn_scale,
         layer.hc_ffn_base,
     )
-    x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
+    x, shared_expert_input_quant = _gfx95_dense_post_attention_norm(
+        layer, x, ffn_coefficients
+    )
     mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
     with use_mhc_post_fusion(mhc):
         x = layer._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+            x,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            shared_expert_input_quant=shared_expert_input_quant,
         )
     ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
     if mhc is not None and mhc.output is not None:
@@ -617,4 +623,4 @@ def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
     if _is_gfx95_supported:
         return post_attention_norm(layer, x, coefficients)
     coefficients.materialize()
-    return layer.post_attention_layernorm(x)
+    return layer.post_attention_layernorm(x), None

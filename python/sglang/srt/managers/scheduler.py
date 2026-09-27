@@ -4333,12 +4333,12 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
-                if self._confidence_budget_prepare is not None:
-                    self._confidence_budget_prepare(batch, self.future_map)
-
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    self.future_map.resolve_seq_lens_cpu(batch, on_forward_stream=True)
+                    if self._confidence_budget_prepare is not None:
+                        self._confidence_budget_prepare(batch, self.future_map)
+
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring

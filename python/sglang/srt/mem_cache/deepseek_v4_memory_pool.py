@@ -26,6 +26,10 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    DSPARK_BS1_GAMMA,
+    is_dspark_algorithm,
+)
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
@@ -52,7 +56,9 @@ def get_compress_state_ring_size(
         # speculative ring must be wider than the draft window: pow2 >= 2 + drafts.
         if not is_speculative:
             return 2
-        return 1 << (num_draft_tokens + 1).bit_length()
+        if is_dspark_algorithm(get_spec().speculative_algorithm):
+            num_draft_tokens = max(num_draft_tokens, DSPARK_BS1_GAMMA + 1)
+        return max(8, 1 << (num_draft_tokens + 1).bit_length())
     # Online c128 keeps one (max, sum, kv) state per index instead of a 128-slot
     # ring of raw tokens, so ring_size collapses to 1.
     if compress_ratio == 128 and ONLINE_C128:
@@ -74,7 +80,13 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     # A verify batch writes its draft tokens ahead of the committed position.
-    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    spec_extra = 0
+    if is_speculative:
+        spec = get_spec()
+        num_draft_tokens = int(spec.speculative_num_draft_tokens or 0)
+        if is_dspark_algorithm(spec.speculative_algorithm):
+            num_draft_tokens = max(num_draft_tokens, DSPARK_BS1_GAMMA + 1)
+        spec_extra = num_draft_tokens - 1
     return sliding_window + spec_extra
 
 

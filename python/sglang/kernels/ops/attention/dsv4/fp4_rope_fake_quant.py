@@ -12,6 +12,7 @@ from triton.language.extra import libdevice
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
 
 
+
 @triton.jit
 def rope_tail_fake_quant_fp4_row(
     x_row_ptr,
@@ -63,14 +64,105 @@ def rope_tail_fake_quant_fp4_row(
         expo = ((bits >> 23) & 0xFF) - 127
         expo = expo + ((bits & 0x7FFFFF) != 0).to(tl.int32)
         scale = ((expo + 127) << 23).to(tl.float32, bitcast=True)
-        s = vb / scale[:, None]
+        recip_bits = tl.where(expo <= 126, (127 - expo) << 23, 0)
+        recip = recip_bits.to(tl.float32, bitcast=True)
+        s = vb * recip[:, None]
     s = tl.minimum(tl.maximum(s, -6.0), 6.0)
     mag = tl.abs(s)
     step = tl.where(mag < 2.0, 0.5, tl.where(mag < 4.0, 1.0, 2.0))
+    inv_step = tl.where(mag < 2.0, 2.0, tl.where(mag < 4.0, 1.0, 0.5))
     # torch.round is round-half-to-even; torch.sign(0) is 0
     sgn = tl.where(s > 0, 1.0, tl.where(s < 0, -1.0, 0.0))
-    q = libdevice.rint(mag / step) * step * sgn
+    q = libdevice.rint(mag * inv_step) * step * sgn
     return tl.reshape(q * scale[:, None], (D,))
+
+
+@triton.jit
+def _rope_tail_fake_quant_fp4_rowblock_kernel(
+    x_ptr,
+    f_ptr,
+    pos_ptr,
+    out_ptr,
+    x_stride_r,
+    out_stride_r,
+    f_stride_t,
+    rows_per_token,
+    num_pos,
+    M,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    BLK: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+    INVERSE: tl.constexpr,
+    COMPRESSED_KV: tl.constexpr,
+    HAS_POS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = rows < M
+    token = rows // rows_per_token
+    if HAS_POS:
+        t = tl.load(pos_ptr + token, mask=row_mask, other=0).to(tl.int64)
+        t = tl.where((t >= 0) & (t < num_pos), t, 0)
+    else:
+        t = token.to(tl.int64)
+
+    offs = tl.arange(0, D)
+    x_base = x_ptr + rows[:, None].to(tl.int64) * x_stride_r
+    v = tl.load(x_base + offs[None, :], mask=row_mask[:, None], other=0).to(
+        tl.float32
+    )
+
+    head_len = D - RD
+    in_tail = offs >= head_len
+    tail_mask = row_mask[:, None] & in_tail[None, :]
+    pos = offs - head_len
+    j = pos // 2
+    is_im = (pos % 2) == 1
+    re = tl.load(
+        x_base + (head_len + 2 * j)[None, :], mask=tail_mask, other=0.0
+    ).to(tl.float32)
+    im = tl.load(
+        x_base + (head_len + 2 * j + 1)[None, :], mask=tail_mask, other=0.0
+    ).to(tl.float32)
+    f_base = f_ptr + t[:, None] * f_stride_t
+    fr = tl.load(f_base + (2 * j)[None, :], mask=tail_mask, other=1.0)
+    fi = tl.load(f_base + (2 * j + 1)[None, :], mask=tail_mask, other=0.0)
+    if INVERSE:
+        fi = -fi
+    rot = tl.where(
+        is_im[None, :], re * fi + im * fr, re * fr - im * fi
+    )
+    rot = rot.to(tl.bfloat16).to(tl.float32)
+    v = tl.where(in_tail[None, :], rot, v)
+
+    grouped = tl.reshape(v, (BLOCK_ROWS, D // BLK, BLK))
+    amax = tl.max(tl.abs(grouped), axis=2)
+    if COMPRESSED_KV:
+        scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
+        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        s = tl.div_rn(grouped, scale[:, :, None])
+    else:
+        amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
+        bits = amax.to(tl.int32, bitcast=True)
+        expo = ((bits >> 23) & 0xFF) - 127
+        expo = expo + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scale = ((expo + 127) << 23).to(tl.float32, bitcast=True)
+        recip_bits = tl.where(expo <= 126, (127 - expo) << 23, 0)
+        recip = recip_bits.to(tl.float32, bitcast=True)
+        s = grouped * recip[:, :, None]
+    s = tl.minimum(tl.maximum(s, -6.0), 6.0)
+    mag = tl.abs(s)
+    step = tl.where(mag < 2.0, 0.5, tl.where(mag < 4.0, 1.0, 2.0))
+    inv_step = tl.where(mag < 2.0, 2.0, tl.where(mag < 4.0, 1.0, 0.5))
+    sgn = tl.where(s > 0, 1.0, tl.where(s < 0, -1.0, 0.0))
+    q = libdevice.rint(mag * inv_step) * step * sgn
+    out = tl.reshape(q * scale[:, :, None], (BLOCK_ROWS, D))
+    tl.store(
+        out_ptr + rows[:, None].to(tl.int64) * out_stride_r + offs[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=row_mask[:, None],
+    )
 
 
 @triton.jit
@@ -148,6 +240,34 @@ def rope_tail_fake_quant_fp4(
             x.shape,
         )
         positions = positions.contiguous()
+    if torch.version.hip is not None and rows >= 4096:
+        block_rows = 8
+        num_warps = 4
+        _rope_tail_fake_quant_fp4_rowblock_kernel[
+            (triton.cdiv(rows, block_rows),)
+        ](
+            x2,
+            f_real,
+            positions if positions is not None else f_real,
+            out.reshape(-1, d),
+            x2.stride(0),
+            d,
+            f_real.stride(0),
+            rows_per_token,
+            f_real.shape[0],
+            rows,
+            D=d,
+            RD=rope_dim,
+            BLK=block_size,
+            AMAX_FLOOR=FP4_AMAX_FLOOR,
+            INVERSE=inverse,
+            COMPRESSED_KV=compressed_kv,
+            HAS_POS=positions is not None,
+            BLOCK_ROWS=block_rows,
+            num_warps=num_warps,
+            enable_fp_fusion=False,
+        )
+        return out
     _rope_tail_fake_quant_fp4_kernel[(rows,)](
         x2,
         f_real,

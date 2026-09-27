@@ -37,6 +37,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Fp8GridActivation
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -100,6 +101,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.moe_runner.aiter import moe_epilogue
 from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -320,6 +322,7 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        gateup_fp8_grid: Optional[Fp8GridActivation] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -355,6 +358,8 @@ class DeepseekV2MLP(nn.Module):
             # inside the fp8 linear method. q rows may be padded to a multiple
             # of 4; the caller slices the MLP output back.
             gate_up, _ = self.gate_up_proj(gateup_pre_quant)
+        elif gateup_fp8_grid is not None:
+            gate_up, _ = self.gate_up_proj(gateup_fp8_grid)
         else:
             if (
                 gemm_output_zero_allocator is not None
@@ -936,6 +941,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        shared_expert_input_quant: Optional[Fp8GridActivation] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -993,6 +999,7 @@ class DeepseekV2MoE(nn.Module):
                     skip_shared_experts=skip_shared_experts,
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
+                    shared_expert_input_quant=shared_expert_input_quant,
                 )
         else:
             return self.forward_deepep(
@@ -1275,6 +1282,7 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
+        shared_expert_input_quant: Optional[Fp8GridActivation] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1286,6 +1294,13 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
+        fuse_shared_epilogue = (
+            _use_aiter
+            and hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+            and not self._shared_expert_tp1
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
@@ -1299,7 +1314,7 @@ class DeepseekV2MoE(nn.Module):
                 else self._maybe_quant_moe_input_once(hidden_states)
             )
             if (
-                not defer_shared
+                (not defer_shared or fuse_shared_epilogue)
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
@@ -1307,6 +1322,13 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states,
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
+                    shared_expert_input_quant=shared_expert_input_quant,
+                )
+            if fuse_shared_epilogue:
+                fuse_shared_epilogue = (
+                    shared_output is not None
+                    and shared_output.dtype == torch.bfloat16
+                    and shared_output.shape == hidden_states.shape
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits, router_logits_partials = self._forward_gate(
@@ -1371,17 +1393,32 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
-            )
+        epilogue_state = None
+        if fuse_shared_epilogue:
+            with moe_epilogue(shared_output, 1.0) as epilogue_state:
+                if pre_quant_input is not None:
+                    final_hidden_states = self.experts(
+                        hidden_states,
+                        topk_output,
+                        pre_quant_input=pre_quant_input,
+                    )
+                else:
+                    final_hidden_states = self.experts(
+                        hidden_states,
+                        topk_output,
+                    )
         else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                )
         if (
             not _is_cuda
             and not _is_musa
@@ -1397,6 +1434,7 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
+            and epilogue_state is None
         ):
             shared_output = self._forward_shared_experts(
                 hidden_states,
@@ -1404,12 +1442,13 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if epilogue_state is None or not epilogue_state.fused:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if (
             self.is_deepseek_v4
@@ -1717,6 +1756,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states,
         gemm_output_zero_allocator: BumpAllocator = None,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        shared_expert_input_quant: Optional[Fp8GridActivation] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is not None:
@@ -1728,7 +1768,9 @@ class DeepseekV2MoE(nn.Module):
                 )
                 return out[: hidden_states.shape[0]]
             return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                gateup_fp8_grid=shared_expert_input_quant,
             )
         else:
             return None

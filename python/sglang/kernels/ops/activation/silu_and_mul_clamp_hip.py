@@ -28,6 +28,7 @@ def _silu_and_mul_clamp_kernel(
     BLOCK_I: tl.constexpr,
     FP8_GRID: tl.constexpr,
     EMIT_FP8: tl.constexpr,
+    EXP2: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_i = tl.program_id(1)
@@ -39,7 +40,10 @@ def _silu_and_mul_clamp_kernel(
     )
     g = tl.minimum(g, limit)
     u = tl.minimum(tl.maximum(u, -limit), limit)
-    y = g / (1.0 + tl.exp(-g)) * u
+    if EXP2:
+        y = g / (1.0 + tl.exp2(-(g * 1.44269504089))) * u
+    else:
+        y = g / (1.0 + tl.exp(-g)) * u
     if EMIT_FP8:
         # per-32 fp8 codes plus ue8m0 exponent: the native MXFP8 route's operand
         y = y.to(tl.bfloat16).to(tl.float32)
@@ -69,7 +73,7 @@ def _silu_and_mul_clamp_kernel(
 
 def silu_and_mul_clamp_fp8_grid_supported(intermediate: int) -> bool:
     """The fp8-grid epilogue needs whole 32-wide groups inside one program."""
-    return intermediate % 32 == 0 and intermediate <= 1024
+    return intermediate % 32 == 0
 
 
 def silu_and_mul_clamp_triton(
@@ -78,6 +82,7 @@ def silu_and_mul_clamp_triton(
     fp8_grid: bool = False,
     eps: float = 1e-10,
     emit_fp8: bool = False,
+    exp2: bool = False,
 ):
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
     Fp8GridActivation with fp8_grid or Mxfp8Activation with emit_fp8."""
@@ -87,7 +92,7 @@ def silu_and_mul_clamp_triton(
     fp8_grid = fp8_grid or emit_fp8
     if fp8_grid:
         assert silu_and_mul_clamp_fp8_grid_supported(inter_size), (
-            f"inter_size {inter_size}: the fp8-grid epilogue needs a multiple of 32 up to 1024"
+            f"inter_size {inter_size}: the fp8-grid epilogue needs a multiple of 32"
         )
     out = torch.empty(
         (M, inter_size),
@@ -118,6 +123,7 @@ def silu_and_mul_clamp_triton(
         BLOCK_I=block_i,
         FP8_GRID=fp8_grid,
         EMIT_FP8=emit_fp8,
+        EXP2=exp2,
         num_warps=4,
     )
     return result

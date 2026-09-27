@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_prefill_workspace,
+    rope_fake_quant_pack_fp4_query_flydsl,
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
@@ -193,6 +194,7 @@ def _candidate_lengths_kernel(
     seq_lens_ptr,
     block_lens_ptr,
     compact_lens_ptr,
+    compact_page_table_ptr,
     rows,
     topk_blocks,
     BLOCK_SIZE: tl.constexpr,
@@ -212,6 +214,7 @@ def _candidate_lengths_kernel(
         tl.minimum(block_lens, topk_blocks) * BLOCK_SIZE,
         mask=mask,
     )
+    tl.store(compact_page_table_ptr + r, 0, mask=mask)
 
 
 @triton.jit
@@ -340,10 +343,12 @@ def select_candidate_blocks_hip(
     )
     block_lens = torch.empty(rows, dtype=torch.int32, device=device)
     compact_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    compact_page_table = torch.empty((rows, 1), dtype=torch.int32, device=device)
     _candidate_lengths_kernel[(triton.cdiv(rows, 1024),)](
         seq_lens,
         block_lens,
         compact_lens,
+        compact_page_table,
         rows,
         topk_blocks,
         BLOCK_SIZE=block_size,
@@ -364,7 +369,7 @@ def select_candidate_blocks_hip(
     return CandidateBlocks(
         ids=ids,
         compact_lens=compact_lens,
-        compact_page_table=torch.zeros((rows, 1), dtype=torch.int32, device=device),
+        compact_page_table=compact_page_table,
         compact_page_size=triton.next_power_of_2(compact_width),
         block_size=block_size,
     )
@@ -506,9 +511,16 @@ def _indexer_inputs(layer, x, q_lora, pos):
             indexer.head_weight_scale,
             num_heads=indexer.n_heads,
         )
-    # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
-    q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
-    q_fp4, q_scale = pack_fp4_query_flydsl(q)
+    try:
+        q, _ = indexer.wq_b(q_lora)
+        q = q.view(q.shape[0], indexer.n_heads, indexer.index_head_dim)
+        q_fp4, q_scale = rope_fake_quant_pack_fp4_query_flydsl(
+            q, layer.freqs_cis, pos, indexer.rope_head_dim
+        )
+    except NotImplementedError:
+        # [T, H, 128] fp4 grid; the RoPE launch gathers freqs_cis[pos] itself
+        q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
+        q_fp4, q_scale = pack_fp4_query_flydsl(q)
     weights = _indexer_head_weights(indexer, x)  # [T, H] bf16, already scaled
     return q_fp4, q_scale, weights
 

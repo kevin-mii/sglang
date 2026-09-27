@@ -698,12 +698,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:
-        if int(cfg.speculative_dspark_block_size) <= 0:
+        if int(cfg.speculative_dspark_block_size) <= 2:
             raise ValueError(
-                "DSpark requires --speculative-dspark-block-size to be positive, "
+                "DSpark requires --speculative-dspark-block-size to be greater than 2, "
                 f"got {cfg.speculative_dspark_block_size}."
             )
-        gamma = int(cfg.speculative_dspark_block_size)
+        gamma = int(cfg.speculative_dspark_block_size) - 2
     else:
         if draft_config is not None:
             gamma = draft_config.resolve_gamma(default=None)

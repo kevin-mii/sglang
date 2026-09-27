@@ -29,6 +29,32 @@ def _fill_padded_rows_kernel(
         tl.store(ptrs, fill, mask=mask)
 
 
+@triton.jit
+def _fill_padded_rows_pair_kernel(
+    ids_ptr,
+    weights_ptr,
+    num_token_non_padded_ptr,
+    n_cols,
+    ids_fill_value,
+    ids_stride_row,
+    weights_stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_valid = tl.load(num_token_non_padded_ptr)
+    if row >= n_valid:
+        cols = tl.arange(0, BLOCK_COLS)
+        mask = cols < n_cols
+        ids = ids_ptr + row * ids_stride_row + cols
+        weights = weights_ptr + row * weights_stride_row + cols
+        ids_fill = tl.full(
+            (BLOCK_COLS,), ids_fill_value, dtype=ids_ptr.dtype.element_ty
+        )
+        weights_fill = tl.zeros((BLOCK_COLS,), dtype=weights_ptr.dtype.element_ty)
+        tl.store(ids, ids_fill, mask=mask)
+        tl.store(weights, weights_fill, mask=mask)
+
+
 def _can_fuse_padded_region(x: torch.Tensor) -> bool:
     # The fused kernel uses one program per row and assumes a row-major 2D
     # tensor (columns contiguous); fall back to eager for anything else.
@@ -76,3 +102,36 @@ def _fill_padded_rows(
         x.stride(0),
         BLOCK_COLS=triton.next_power_of_2(n_cols),
     )
+
+
+def _fill_padded_rows_pair(
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    *,
+    ids_fill_value: int,
+) -> bool:
+    """Fill padded top-k IDs and zero their weights in one launch."""
+    if (
+        not _can_fuse_padded_region(ids)
+        or not _can_fuse_padded_region(weights)
+        or ids.shape != weights.shape
+        or ids.device != weights.device
+        or not isinstance(num_token_non_padded, torch.Tensor)
+        or num_token_non_padded.numel() != 1
+        or num_token_non_padded.dtype.is_floating_point
+        or num_token_non_padded.device != ids.device
+    ):
+        return False
+    n_rows, n_cols = ids.shape
+    _fill_padded_rows_pair_kernel[(n_rows,)](
+        ids,
+        weights,
+        num_token_non_padded,
+        n_cols,
+        ids_fill_value,
+        ids.stride(0),
+        weights.stride(0),
+        BLOCK_COLS=triton.next_power_of_2(n_cols),
+    )
+    return True

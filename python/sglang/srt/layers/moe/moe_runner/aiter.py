@@ -3,11 +3,15 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -39,6 +43,346 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _MoeEpilogueState:
+    shared_out: torch.Tensor
+    routed_scale: float
+    fused: bool = False
+
+
+_MOE_EPILOGUE_STATE: Optional[_MoeEpilogueState] = None
+
+
+@contextmanager
+def moe_epilogue(shared_out: torch.Tensor, routed_scale: float):
+    global _MOE_EPILOGUE_STATE
+    previous = _MOE_EPILOGUE_STATE
+    state = _MoeEpilogueState(shared_out, routed_scale)
+    _MOE_EPILOGUE_STATE = state
+    try:
+        yield state
+    finally:
+        _MOE_EPILOGUE_STATE = previous
+
+
+@triton.jit
+def _fused_local_route_reduce_kernel(
+    input_ptr,
+    output_ptr,
+    expert_mask_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_ptr,
+    input_stride_token,
+    input_stride_route,
+    input_stride_hidden,
+    output_stride_token,
+    output_stride_hidden,
+    hidden_dim,
+    topk: tl.constexpr,
+    block_hidden: tl.constexpr,
+    use_weights: tl.constexpr,
+    has_shared: tl.constexpr,
+    routed_scale: tl.constexpr,
+):
+    token = tl.program_id(0)
+    hidden_block = tl.program_id(1)
+    hidden_offsets = hidden_block * block_hidden + tl.arange(0, block_hidden)
+    hidden_mask = hidden_offsets < hidden_dim
+    accumulator = tl.zeros((block_hidden,), dtype=tl.float32)
+
+    for route in tl.static_range(topk):
+        expert_id = tl.load(topk_ids_ptr + token * topk + route)
+        valid = tl.load(expert_mask_ptr + expert_id) != 0
+        if valid:
+            values = tl.load(
+                input_ptr
+                + token * input_stride_token
+                + route * input_stride_route
+                + hidden_offsets * input_stride_hidden,
+                mask=hidden_mask,
+                other=0.0,
+            ).to(tl.float32)
+            if use_weights:
+                values *= tl.load(topk_weights_ptr + token * topk + route).to(
+                    tl.float32
+                )
+            accumulator += values
+
+    routed = accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
+    if routed_scale != 1.0:
+        routed = (routed * routed_scale).to(output_ptr.dtype.element_ty).to(
+            tl.float32
+        )
+    if has_shared:
+        routed += tl.load(
+            shared_ptr
+            + token * output_stride_token
+            + hidden_offsets * output_stride_hidden,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    tl.store(
+        output_ptr + token * output_stride_token + hidden_offsets * output_stride_hidden,
+        routed.to(output_ptr.dtype.element_ty),
+        mask=hidden_mask,
+    )
+
+
+@triton.jit
+def _fused_local_route_reduce_prefill_kernel(
+    input_ptr,
+    output_ptr,
+    expert_mask_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_ptr,
+    input_stride_token,
+    input_stride_route,
+    input_stride_hidden,
+    output_stride_token,
+    output_stride_hidden,
+    hidden_dim,
+    topk: tl.constexpr,
+    block_hidden: tl.constexpr,
+    use_weights: tl.constexpr,
+    has_shared: tl.constexpr,
+    routed_scale: tl.constexpr,
+):
+    token = tl.program_id(0)
+    hidden_block = tl.program_id(1)
+    hidden_offsets = hidden_block * block_hidden + tl.arange(0, block_hidden)
+    hidden_mask = hidden_offsets < hidden_dim
+    accumulator = tl.zeros((block_hidden,), dtype=tl.float32)
+
+    for route in tl.static_range(topk):
+        expert_id = tl.load(topk_ids_ptr + token * topk + route)
+        valid = tl.load(expert_mask_ptr + expert_id) != 0
+        if valid:
+            values = tl.load(
+                input_ptr
+                + token * input_stride_token
+                + route * input_stride_route
+                + hidden_offsets * input_stride_hidden,
+                mask=hidden_mask,
+                other=0.0,
+            ).to(tl.float32)
+            if use_weights:
+                values *= tl.load(topk_weights_ptr + token * topk + route).to(
+                    tl.float32
+                )
+            accumulator += values
+
+    routed = accumulator.to(output_ptr.dtype.element_ty).to(tl.float32)
+    if routed_scale != 1.0:
+        routed = (routed * routed_scale).to(output_ptr.dtype.element_ty).to(
+            tl.float32
+        )
+    if has_shared:
+        routed += tl.load(
+            shared_ptr
+            + token * output_stride_token
+            + hidden_offsets * output_stride_hidden,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+    tl.store(
+        output_ptr + token * output_stride_token + hidden_offsets * output_stride_hidden,
+        routed.to(output_ptr.dtype.element_ty),
+        mask=hidden_mask,
+    )
+
+
+def _fused_local_route_reduce(
+    target,
+    out,
+    token_num,
+    topk,
+    model_dim,
+    expert_mask=None,
+    topk_ids=None,
+    topk_weights=None,
+    shared_out=None,
+    routed_scale=1.0,
+):
+    if (
+        expert_mask is None
+        or topk_ids is None
+        or target.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or not target.is_contiguous()
+        or not out.is_contiguous()
+    ):
+        raise NotImplementedError
+    if shared_out is not None and (
+        shared_out.dtype != out.dtype
+        or shared_out.shape != out.shape
+        or not shared_out.is_contiguous()
+    ):
+        raise NotImplementedError
+
+    if token_num >= 2048:
+        block_hidden = 2048
+        kernel = _fused_local_route_reduce_prefill_kernel
+        num_warps = 4
+    else:
+        block_hidden = 1024
+        kernel = _fused_local_route_reduce_kernel
+        num_warps = 8
+    grid = (token_num, triton.cdiv(model_dim, block_hidden))
+    kernel[grid](
+        target,
+        out,
+        expert_mask.to(torch.int32).contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        topk_weights if topk_weights is not None else topk_ids,
+        shared_out if shared_out is not None else out,
+        *target.stride(),
+        *out.stride(),
+        model_dim,
+        topk=topk,
+        block_hidden=block_hidden,
+        use_weights=topk_weights is not None,
+        has_shared=shared_out is not None,
+        routed_scale=routed_scale,
+        num_warps=num_warps,
+    )
+
+
+
+_local_route_reduce_installed = False
+
+
+def _install_local_route_reduce() -> None:
+    """Use a masked reducer for AITER's dense EP stage-2 output.
+
+    AITER zero-fills the route buffer so its generic reduction can safely read
+    remote routes. The local reducer knows which routes are local, so the
+    buffer can stay uninitialized and remote rows are never read.
+    """
+    global _local_route_reduce_installed
+    if _local_route_reduce_installed:
+        return
+
+    import aiter.fused_moe as aiter_fused_moe
+    from aiter.ops.flydsl import moe_kernels as aiter_moe_kernels
+
+    original_stage2 = aiter_fused_moe._flydsl_v2_stage2_wrapper
+    original_reduction = aiter_moe_kernels._run_moe_reduction
+    signature = inspect.signature(original_stage2)
+
+    def patched_reduction(
+        target,
+        out,
+        token_num,
+        topk,
+        model_dim,
+        expert_mask=None,
+        topk_ids=None,
+        stream=None,
+        is_fp8=False,
+        topk_weights=None,
+        fp8_scale_blk=None,
+        fp8_pitch_align=None,
+    ):
+        if is_fp8:
+            return original_reduction(
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+                stream=stream,
+                is_fp8=is_fp8,
+                topk_weights=topk_weights,
+                fp8_scale_blk=fp8_scale_blk,
+                fp8_pitch_align=fp8_pitch_align,
+            )
+        state = _MOE_EPILOGUE_STATE
+        try:
+            result = _fused_local_route_reduce(
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                shared_out=None if state is None else state.shared_out,
+                routed_scale=1.0 if state is None else state.routed_scale,
+            )
+            if state is not None:
+                state.fused = True
+            return result
+        except NotImplementedError:
+            return original_reduction(
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+                stream=stream,
+                is_fp8=is_fp8,
+                topk_weights=topk_weights,
+                fp8_scale_blk=fp8_scale_blk,
+                fp8_pitch_align=fp8_pitch_align,
+            )
+
+    def patched_stage2(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        out = bound.arguments["out"]
+        kernel_name = bound.arguments["kernelName"]
+        sorted_weights = bound.arguments["sorted_weights"]
+        topk_weights = bound.arguments["topk_weights"]
+
+        from aiter.fused_moe import parse_flydsl_v2_gemm2_kernel
+
+        config = parse_flydsl_v2_gemm2_kernel(kernel_name)
+        if config is None:
+            return original_stage2(*args, **kwargs)
+        fp8_intermediate = (
+            config["epilog"] == "reduce"
+            and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+            and os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+            and sorted_weights is not None
+            and topk_weights is not None
+        )
+        if fp8_intermediate or out.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ) or topk_weights is not None:
+            return original_stage2(*args, **kwargs)
+
+        token_num, model_dim = out.shape
+        topk = bound.arguments["topk"]
+        target_shape = (token_num, topk, model_dim)
+        original_zero = torch.Tensor.zero_
+
+        def local_zero(self, *zero_args, **zero_kwargs):
+            if self.shape == target_shape and self.dtype == out.dtype:
+                return self
+            return original_zero(self, *zero_args, **zero_kwargs)
+
+        aiter_moe_kernels._run_moe_reduction = patched_reduction
+        torch.Tensor.zero_ = local_zero
+        try:
+            return original_stage2(*args, **kwargs)
+        finally:
+            torch.Tensor.zero_ = original_zero
+            aiter_moe_kernels._run_moe_reduction = original_reduction
+
+    aiter_fused_moe._flydsl_v2_stage2_wrapper = patched_stage2
+    _local_route_reduce_installed = True
 
 
 class AiterQuantType(str, Enum):
@@ -245,6 +589,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
+        _install_local_route_reduce()
         from aiter.fused_moe import fused_moe
 
         from sglang.srt.environ import envs
