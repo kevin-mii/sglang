@@ -78,6 +78,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify_width import (
+    LaggedAcceptanceReader,
     VerifyWidthController,
     parse_verify_widths,
     use_verify_width_runtime,
@@ -462,6 +463,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_sampler_capture_hook = None
         self._decode_steps = 0
         self._width3_steps = 0
+        self._acceptance_reader = LaggedAcceptanceReader(device=self.device)
+        self._acceptance_samples: list[float] = []
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -920,15 +923,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._width3_steps = 0
         return f"width-3 fraction: {fraction:.2f}"
 
-    def _batch_rolling_acceptance(self, batch: ScheduleBatch) -> Optional[float]:
-        accepted_tokens = 0
-        samples = 0
-        for req in batch.reqs:
-            history = getattr(req, "dspark_acceptance_history", None)
-            if history:
-                accepted_tokens += sum(history)
-                samples += len(history)
-        return accepted_tokens / samples if samples else None
+    def _update_rolling_acceptance(self) -> Optional[float]:
+        values = self._acceptance_reader.try_take()
+        if values is None:
+            return None
+        self._acceptance_samples.append(sum(values) / len(values))
+        if len(self._acceptance_samples) > 8:
+            self._acceptance_samples.pop(0)
+        return sum(self._acceptance_samples) / len(self._acceptance_samples)
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         if not self._hosts_draft:
@@ -1143,7 +1145,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
 
         runtime = self._primary_runtime
-        rolling_acceptance = self._batch_rolling_acceptance(batch)
+        rolling_acceptance = self._update_rolling_acceptance()
         use_width3 = (
             self._dual_width_enabled
             and self._width3_runtime is not None
@@ -1326,6 +1328,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
+            if logits_output.next_token_logits is None:
+                raise RuntimeError(
+                    "DSpark grammar verify unexpectedly produced precomputed IDs."
+                )
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
                 tree=grammar_tree,
@@ -1347,6 +1353,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             verify_ids_2d=verify_ids_2d,
             target_logits=logits_output.next_token_logits,
+            target_predict=logits_output.precomputed_token_ids,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
@@ -1360,6 +1367,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_width.observe(
                 width=verify_width, correct_len=accept.correct_len
             )
+        self._acceptance_reader.record(accept.commit_lens)
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,

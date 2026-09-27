@@ -13,6 +13,13 @@ from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inpl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.kernels.ops.layernorm.mhc_post_combine_hip import (
+    mhc_post_combine_hip,
+)
+from sglang.kernels.ops.quantization.mxfp8_dot_scaled_splitk import (
+    mainproj_dot_scaled_splitk,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Fp8GridActivation
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
     CommitKvProj,
@@ -46,6 +53,7 @@ from sglang.srt.models.deepseek_v4 import (
     hc_head_torch,
     make_hc_head_params,
 )
+from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
@@ -138,6 +146,11 @@ class DSparkAttention(MqaAttentionBase):
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        self.fused_rmsnorm_fake_quant = (
+            not _is_npu and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
+        )
+        self._wq_b_native_consumer_checked = False
+        self._wq_b_native_consumer = None
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -189,8 +202,12 @@ class DSparkAttention(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q, _ = self.wq_b(q)
+        if self.fused_rmsnorm_fake_quant:
+            q, q_for_wq_b = _hip.q_norm_for_wq_b(self, q)
+            q, _ = self.wq_b(q_for_wq_b)
+        else:
+            q = self.q_norm(q)
+            q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if self._use_fast_kernel and not _is_npu:
@@ -360,10 +377,15 @@ class DSparkAttention(MqaAttentionBase):
                 is_decode=forward_batch.forward_mode.is_decode(),
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 fast_path=self.is_dsv41,
+                fp8_grid=_hip.wo_b_takes_fp8_grid(self),
+                site="draft",
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
+        if isinstance(o, Fp8GridActivation):
+            out, _ = self.wo_b(o)
+        else:
+            out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
         return out
 
 
@@ -645,6 +667,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
                 quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
+            self.main_proj._dspark_main_proj = True
             self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         if stage_id == num_stages - 1:
@@ -750,12 +773,15 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
-
-        residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        if stats_stream is not None and x.shape[0] > 8:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        hidden_states, combined = mhc_post_combine_hip(
+            x, residual, attn_post, attn_comb, attn_pre
         )
+        residual = hidden_states
+        x = self.post_attention_layernorm(combined)
+        if stats_stream is not None and x.shape[0] <= 8:
+            stats_stream.wait_stream(torch.cuda.current_stream())
         x = self._run_ffn(x, forward_batch)
         ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
@@ -931,7 +957,24 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
+        projected = None
+        try:
+            if main_hidden.dtype == torch.bfloat16 and main_hidden.is_contiguous():
+                input_2d = main_hidden.reshape(-1, 15360)
+                weight = getattr(
+                    stage0.main_proj, "_mainproj_dot_scaled_weight", None
+                )
+                weight_scale = getattr(
+                    stage0.main_proj, "_mainproj_dot_scaled_scale", None
+                )
+                if weight is not None and weight_scale is not None:
+                    projected = mainproj_dot_scaled_splitk(
+                        input_2d, weight, weight_scale
+                    ).reshape(*main_hidden.shape[:-1], 5120)
+        except NotImplementedError:
+            projected = None
+        if projected is None:
+            projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
     def write_target_hidden_kv(
@@ -1004,7 +1047,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
-            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            x_flat = x.flatten(1)
+            x = hc_combine(x_flat, pre, self.hc_mult, x.dtype)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 

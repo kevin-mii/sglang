@@ -120,15 +120,69 @@ class AcceptHistogram:
         self._event = torch.cuda.Event()
         self._event.record()
 
-    def take_delta(self) -> Optional[torch.Tensor]:
-        """Counts since the previous take, from the snapshot one interval ago."""
-        if self._event is None:
+    def try_take_delta(self) -> Optional[torch.Tensor]:
+        """Counts since the previous take, if the snapshot has landed."""
+        if self._event is None or not self._event.query():
             return None
-        self._event.synchronize()
         current = self._host.clone()
         delta = current - self._last
         self._last = current
         return delta
+
+
+class LaggedAcceptanceReader:
+    """Depth-2 nonblocking ring of per-step acceptance lengths."""
+
+    def __init__(self, *, device) -> None:
+        self._device = device
+        self._capacity = 512
+        self._host = [
+            torch.zeros(self._capacity, dtype=torch.int32).pin_memory()
+            for _ in range(2)
+        ]
+        self._events: list[Optional[torch.cuda.Event]] = [None, None]
+        self._sizes = [0, 0]
+        self._write = 0
+        self._pending: list[int] = []
+
+    def _grow(self, size: int) -> None:
+        self._capacity = max(512, size)
+        self._host = [
+            torch.zeros(self._capacity, dtype=torch.int32).pin_memory()
+            for _ in range(2)
+        ]
+        self._events = [None, None]
+        self._sizes = [0, 0]
+        self._write = 0
+        self._pending = []
+
+    def record(self, accept_lens: torch.Tensor) -> None:
+        size = int(accept_lens.numel())
+        if size > self._capacity:
+            self._grow(size)
+        if len(self._pending) == 2:
+            self._pending.pop(0)
+        slot = self._write
+        self._host[slot][:size].copy_(accept_lens, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._events[slot] = event
+        self._sizes[slot] = size
+        self._pending.append(slot)
+        self._write = (slot + 1) % 2
+
+    def try_take(self) -> Optional[list[int]]:
+        if not self._pending:
+            return None
+        slot = self._pending[0]
+        event = self._events[slot]
+        if event is None or not event.query():
+            return None
+        values = self._host[slot][: self._sizes[slot]].tolist()
+        self._events[slot] = None
+        self._sizes[slot] = 0
+        self._pending.pop(0)
+        return values
 
 
 class VerifyWidthPolicy:
@@ -308,7 +362,7 @@ class VerifyWidthController:
         self.histogram.record(width=width, correct_len=correct_len)
         self._steps += 1
         if self._steps % self._update_interval == 0:
-            delta = self.histogram.take_delta()
+            delta = self.histogram.try_take_delta()
             if delta is not None:
                 self.policy.update(delta)
             self.histogram.snapshot()

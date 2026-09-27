@@ -51,6 +51,9 @@ class DFlashVerifyInput(SpecInput):
     live_seq_lens_cpu: Optional[torch.Tensor] = None
     # Conservative request-lifetime bound for candidate graph dispatch.
     candidate_max_seq_len_upper_bound: Optional[int] = None
+    # DSpark target-verify only: True captures shard-argmax IDs, False forces
+    # the full-logits eager path. None leaves other DFlash users unchanged.
+    precompute_greedy_ids: Optional[bool] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -102,12 +105,15 @@ class DFlashVerifyInput(SpecInput):
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
         )
+        if self.precompute_greedy_ids is False:
+            verify_forward_batch.force_eager = True
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
+            and self.precompute_greedy_ids is not False
         )
         if _is_npu:
             # Do not pre-plan target verify on NPU. DP/EP padding can change
