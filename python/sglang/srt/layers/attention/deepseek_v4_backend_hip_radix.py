@@ -43,13 +43,11 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     SOFTMAX_SCALE as SWAPAB_SOFTMAX_SCALE,
 )
-from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
-    swapab_attention,
-)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
+from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     late_layer_tail_layout,

@@ -95,8 +95,8 @@ def aiter_sparse_decode_fwd(
 
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
-    from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
-        aiter_sparse_split_reduce,
+    from sglang.kernels.ops.attention.sparse_decode_reduce_hip import (
+        gfx_sparse_split_reduce,
     )
 
     b, s, h, d = q.shape
@@ -137,7 +137,7 @@ def aiter_sparse_decode_fwd(
     if isinstance(out, tuple):
         # Split-KV partials (acc, m, l): combine them here.
         part_acc, part_m, part_l = out
-        out = aiter_sparse_split_reduce(
+        out = gfx_sparse_split_reduce(
             part_acc, part_m, part_l, attn_sink, q.dtype, inv_rope=inv_rope
         )
     elif inv_rope is not None:
