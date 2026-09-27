@@ -18,7 +18,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     SoftmaxTemp,
     _row_argmax,
     accept_greedy_triton,
-    finalize_accept_lens_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -71,13 +70,18 @@ def _finalize_accept_and_out_tokens_kernel(
     cap_trim_out_ptr,
     out_tokens_ptr,
     gamma,
+    draft_tokens_stride_row,
     width: tl.constexpr,
+    HAS_CAP_TRIM: tl.constexpr,
 ):
     request = tl.program_id(0).to(tl.int64)
     correct_len = tl.load(correct_len_ptr + request).to(tl.int32)
     commit_len = correct_len + 1
     prefix_len = tl.load(prefix_lens_ptr + request)
-    cap_trim = tl.load(cap_trim_ptr + request).to(tl.int32)
+    if HAS_CAP_TRIM:
+        cap_trim = tl.load(cap_trim_ptr + request).to(tl.int32)
+    else:
+        cap_trim = 0
     bonus = tl.load(bonus_ptr + request).to(tl.int64)
 
     tl.store(commit_lens_ptr + request, commit_len)
@@ -86,7 +90,7 @@ def _finalize_accept_and_out_tokens_kernel(
 
     for token in tl.static_range(width):
         draft = tl.load(
-            draft_tokens_ptr + request * gamma + token,
+            draft_tokens_ptr + request * draft_tokens_stride_row + token,
             mask=token < gamma,
             other=0,
         ).to(tl.int64)
@@ -101,38 +105,100 @@ def _finalize_accept_and_out_tokens_kernel(
 def _finalize_accept_and_out_tokens(
     *,
     correct_len: torch.Tensor,
-    cap_trim_lens: torch.Tensor,
+    cap_trim_lens: Optional[torch.Tensor],
     prefix_lens: torch.Tensor,
     draft_tokens: torch.Tensor,
     bonus: torch.Tensor,
     gamma: int,
     width: int,
+    commit_lens_out: Optional[torch.Tensor] = None,
+    new_seq_lens_out: Optional[torch.Tensor] = None,
+    cap_trim_out: Optional[torch.Tensor] = None,
+    out_tokens_out: Optional[torch.Tensor] = None,
 ):
+    bs = correct_len.shape[0]
+    device = correct_len.device
     if (
         correct_len.device.type != "cuda"
         or correct_len.dtype not in (torch.int32, torch.int64)
-        or cap_trim_lens.dtype not in (torch.int32, torch.int64)
+        or (
+            cap_trim_lens is not None
+            and cap_trim_lens.dtype not in (torch.int32, torch.int64)
+        )
         or prefix_lens.dtype not in (torch.int32, torch.int64)
         or draft_tokens.dtype != torch.int64
         or bonus.dtype != torch.int64
         or not correct_len.is_contiguous()
-        or not cap_trim_lens.is_contiguous()
+        or (cap_trim_lens is not None and not cap_trim_lens.is_contiguous())
         or not prefix_lens.is_contiguous()
-        or not draft_tokens.is_contiguous()
+        or draft_tokens.dim() != 2
+        or draft_tokens.shape != (bs, gamma)
+        or draft_tokens.stride(1) != 1
         or not bonus.is_contiguous()
+        or (
+            commit_lens_out is not None
+            and (
+                commit_lens_out.dtype != torch.int32
+                or commit_lens_out.shape != (bs,)
+                or not commit_lens_out.is_contiguous()
+                or commit_lens_out.device != device
+            )
+        )
+        or (
+            new_seq_lens_out is not None
+            and (
+                new_seq_lens_out.dtype != prefix_lens.dtype
+                or new_seq_lens_out.shape != (bs,)
+                or not new_seq_lens_out.is_contiguous()
+                or new_seq_lens_out.device != device
+            )
+        )
+        or (
+            cap_trim_out is not None
+            and (
+                cap_trim_out.dtype != torch.int32
+                or cap_trim_out.shape != (bs,)
+                or not cap_trim_out.is_contiguous()
+                or cap_trim_out.device != device
+            )
+        )
+        or (
+            out_tokens_out is not None
+            and (
+                out_tokens_out.dtype != torch.int64
+                or out_tokens_out.shape != (bs, width)
+                or not out_tokens_out.is_contiguous()
+                or out_tokens_out.device != device
+            )
+        )
     ):
         raise NotImplementedError
 
-    bs = correct_len.shape[0]
-    device = correct_len.device
-    commit_lens = torch.empty(bs, dtype=torch.int32, device=device)
-    new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
-    cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
-    out_tokens = torch.empty((bs, width), dtype=torch.int64, device=device)
+    commit_lens = (
+        torch.empty(bs, dtype=torch.int32, device=device)
+        if commit_lens_out is None
+        else commit_lens_out
+    )
+    new_seq_lens = (
+        torch.empty(bs, dtype=prefix_lens.dtype, device=device)
+        if new_seq_lens_out is None
+        else new_seq_lens_out
+    )
+    cap_trim_out = (
+        torch.empty(bs, dtype=torch.int32, device=device)
+        if cap_trim_out is None
+        else cap_trim_out
+    )
+    out_tokens = (
+        torch.empty((bs, width), dtype=torch.int64, device=device)
+        if out_tokens_out is None
+        else out_tokens_out
+    )
+    cap_trim_ptr = cap_trim_lens if cap_trim_lens is not None else cap_trim_out
 
     _finalize_accept_and_out_tokens_kernel[(bs,)](
         correct_len,
-        cap_trim_lens,
+        cap_trim_ptr,
         prefix_lens,
         draft_tokens,
         bonus,
@@ -141,7 +207,9 @@ def _finalize_accept_and_out_tokens(
         cap_trim_out,
         out_tokens,
         gamma,
+        draft_tokens.stride(0),
         width,
+        HAS_CAP_TRIM=cap_trim_lens is not None,
         num_warps=1,
     )
     return commit_lens, new_seq_lens, cap_trim_out, out_tokens
@@ -787,7 +855,7 @@ class DsparkVerifyEpilogue:
         self._tp_sync = tp_sync
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
-            (self.max_bs,), dtype=torch.int64, device=device
+            (self.max_bs,), dtype=torch.int32, device=device
         )
         self.draft_tokens_buf = torch.zeros(
             (self.max_bs * self.gamma,), dtype=torch.int64, device=device
@@ -867,14 +935,14 @@ class DsparkVerifyEpilogue:
             candidates=candidates,
             logits=out.next_token_logits,
             target_predict=target_predict,
-            draft_tokens=candidates[:, 1:].contiguous(),
+            draft_tokens=candidates[:, 1:],
             seq_lens=forward_batch.seq_lens,
         )
         if not self.folds_commit:
             return
         # Same staged locations as target verify; padded and fallback rows skip KV.
         gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            torch.minimum(commit_lens, verify_lens)
             * self.inject_gate_buf
         )
         cache_loc = forward_batch.out_cache_loc
@@ -1002,28 +1070,30 @@ class DsparkVerifyEpilogue:
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
+        if cutoff_verify_lens is None:
+            cap_trim_lens = None
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
-        finalized = finalize_accept_lens_triton(
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            prefix_lens=seq_lens[:bs],
-        )
-        out_tokens = BuildOutTokens.execute(
-            draft_tokens=draft_tokens,
-            correct_len=correct_len,
-            bonus=bonus,
-            verify_num_draft_tokens=self.stride,
-            gamma=self.gamma,
+        if cap_trim_lens is not None:
+            self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
+        commit_lens, new_seq_lens, cap_trim_out, out_tokens = (
+            _finalize_accept_and_out_tokens(
+                correct_len=correct_len,
+                cap_trim_lens=cap_trim_lens,
+                prefix_lens=seq_lens[:bs],
+                draft_tokens=draft_tokens,
+                bonus=bonus,
+                gamma=self.gamma,
+                width=self.stride,
+                commit_lens_out=self.commit_lens_buf[:bs],
+                new_seq_lens_out=self.new_seq_lens_buf[:bs],
+                cap_trim_out=self.cap_trim_lens_buf[:bs],
+                out_tokens_out=self.out_tokens_buf[:bs],
+            )
         )
         self.correct_len_buf[:bs].copy_(correct_len)
         self.bonus_buf[:bs].copy_(bonus)
-        self.cap_trim_lens_buf[:bs].copy_(cap_trim_lens.to(torch.int32))
-        self.commit_lens_buf[:bs].copy_(finalized.commit_lens)
-        self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
-        self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
-        return finalized.commit_lens
+        return commit_lens
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int
@@ -1031,7 +1101,7 @@ class DsparkVerifyEpilogue:
         ctx = self.commit_ctx
         pool = ctx.resolve_pool()
         gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            torch.minimum(commit_lens, verify_lens)
             * self.inject_gate_buf
         )
         if is_unified_kv_triton():

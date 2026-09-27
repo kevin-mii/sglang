@@ -745,12 +745,8 @@ def rope_fake_quant_pack_fp4_query_flydsl(
     q_fp4 = torch.empty(
         (num_tokens, num_heads, _HEAD_DIM // 2), dtype=torch.int8, device=q.device
     )
-    q_scale = (
-        torch.empty((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
-        if num_heads == 64
-        else torch.zeros(
-            (num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device
-        )
+    q_scale = torch.empty(
+        (num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device
     )
     if num_tokens == 0:
         return q_fp4, q_scale
@@ -758,7 +754,7 @@ def rope_fake_quant_pack_fp4_query_flydsl(
     freqs_real = torch.view_as_real(freqs_cis)
     if not freqs_real.is_contiguous():
         raise NotImplementedError
-    _rope_fake_quant_pack_fp4_query_kernel[(num_tokens, num_heads)](
+    _rope_fake_quant_pack_fp4_query_kernel[(num_tokens, 64)](
         q,
         freqs_real,
         positions,

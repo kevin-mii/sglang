@@ -194,6 +194,7 @@ def _candidate_lengths_kernel(
     seq_lens_ptr,
     block_lens_ptr,
     compact_lens_ptr,
+    compact_page_table_ptr,
     rows,
     topk_blocks,
     BLOCK_SIZE: tl.constexpr,
@@ -213,6 +214,7 @@ def _candidate_lengths_kernel(
         tl.minimum(block_lens, topk_blocks) * BLOCK_SIZE,
         mask=mask,
     )
+    tl.store(compact_page_table_ptr + r, 0, mask=mask)
 
 
 @triton.jit
@@ -341,10 +343,12 @@ def select_candidate_blocks_hip(
     )
     block_lens = torch.empty(rows, dtype=torch.int32, device=device)
     compact_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    compact_page_table = torch.empty((rows, 1), dtype=torch.int32, device=device)
     _candidate_lengths_kernel[(triton.cdiv(rows, 1024),)](
         seq_lens,
         block_lens,
         compact_lens,
+        compact_page_table,
         rows,
         topk_blocks,
         BLOCK_SIZE=block_size,
@@ -365,7 +369,7 @@ def select_candidate_blocks_hip(
     return CandidateBlocks(
         ids=ids,
         compact_lens=compact_lens,
-        compact_page_table=torch.zeros((rows, 1), dtype=torch.int32, device=device),
+        compact_page_table=compact_page_table,
         compact_page_size=triton.next_power_of_2(compact_width),
         block_size=block_size,
     )

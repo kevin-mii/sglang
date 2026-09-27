@@ -10,11 +10,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.attention.deepseek_v4_rope import apply_rotary_emb_flat_copy
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.kernels.ops.layernorm.mhc_post_combine_hip import (
     mhc_post_combine_hip,
+    mhc_post_combine_norm_hip,
 )
 from sglang.kernels.ops.quantization.mxfp8_dot_scaled_splitk import (
     mainproj_dot_scaled_splitk,
@@ -210,6 +212,25 @@ class DSparkAttention(MqaAttentionBase):
             q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
+            if (
+                q_out is not None
+                and q.dtype == torch.bfloat16
+                and q_out.dtype == torch.bfloat16
+                and q.is_contiguous()
+                and q_out.shape == q.shape
+                and q_out.stride(2) == 1
+                and self.rope_head_dim > 0
+                and self.rope_head_dim & (self.rope_head_dim - 1) == 0
+                and self.head_dim >= self.rope_head_dim
+                and positions is not None
+                and positions.shape == (q.shape[0],)
+                and self.freqs_cis.dtype == torch.complex64
+                and self.freqs_cis.device == q.device
+            ):
+                apply_rotary_emb_flat_copy(
+                    q, q_out, self.freqs_cis, positions=positions
+                )
+                return q_out
             if self._use_fast_kernel and not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
@@ -775,11 +796,44 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             torch.cuda.current_stream().wait_stream(stats_stream)
         if stats_stream is not None and x.shape[0] > 8:
             stats_stream.wait_stream(torch.cuda.current_stream())
-        hidden_states, combined = mhc_post_combine_hip(
-            x, residual, attn_post, attn_comb, attn_pre
-        )
+        norm = self.post_attention_layernorm
+        if (
+            x.shape[1] == 5120
+            and residual.shape == (x.shape[0], 4, 5120)
+            and attn_post.shape == (x.shape[0], 4)
+            and attn_comb.shape == (x.shape[0], 4, 4)
+            and attn_pre.shape == (x.shape[0], 4)
+            and x.dtype == residual.dtype == torch.bfloat16
+            and attn_post.dtype
+            == attn_comb.dtype
+            == attn_pre.dtype
+            == torch.float32
+            and all(
+                t.is_contiguous()
+                for t in (x, residual, attn_post, attn_comb, attn_pre)
+            )
+            and norm.hidden_size == 5120
+            and norm.variance_size_override is None
+            and not norm.cast_x_before_out_mul
+            and norm.weight.dtype == torch.bfloat16
+            and norm.weight.shape == (5120,)
+            and norm.weight.data.is_contiguous()
+        ):
+            hidden_states, combined, x = mhc_post_combine_norm_hip(
+                x,
+                residual,
+                attn_post,
+                attn_comb,
+                attn_pre,
+                norm.weight.data,
+                norm.variance_epsilon,
+            )
+        else:
+            hidden_states, combined = mhc_post_combine_hip(
+                x, residual, attn_post, attn_comb, attn_pre
+            )
+            x = self.post_attention_layernorm(combined)
         residual = hidden_states
-        x = self.post_attention_layernorm(combined)
         if stats_stream is not None and x.shape[0] <= 8:
             stats_stream.wait_stream(torch.cuda.current_stream())
         x = self._run_ffn(x, forward_batch)

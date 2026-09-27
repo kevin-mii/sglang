@@ -254,6 +254,142 @@ def apply_rotary_emb_flat_kernel(
     tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
+@triton.jit
+def apply_rotary_emb_flat_copy_kernel(
+    q_ptr,
+    out_ptr,
+    fr_ptr,
+    pos_ptr,
+    n_rows,
+    n_heads,
+    sq_tok,
+    sq_head,
+    sq_d,
+    so_tok,
+    so_head,
+    so_d,
+    sfr_pos,
+    sfr_d,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    HD: tl.constexpr,
+    ROPE_START: tl.constexpr,
+    RD: tl.constexpr,
+    RDH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # FLAT-row GPT-J rope + copy: same tail arithmetic as
+    # apply_rotary_emb_flat_kernel, but the full head row is read once and
+    # written straight into the (possibly padded) q_out view.
+    pid = tl.program_id(0)
+    row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = row < n_rows
+    tok = row // n_heads
+    head = row % n_heads
+
+    if USE_POS:
+        pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
+    else:
+        pos = tok
+
+    qbase = tok[:, None] * sq_tok + head[:, None] * sq_head
+    obase = tok[:, None] * so_tok + head[:, None] * so_head
+
+    dh = tl.arange(0, HD)
+    hmask = dh < ROPE_START
+    xh = tl.load(
+        q_ptr + qbase + dh[None, :] * sq_d,
+        mask=rmask[:, None] & hmask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        out_ptr + obase + dh[None, :] * so_d,
+        xh,
+        mask=rmask[:, None] & hmask[None, :],
+    )
+
+    d = tl.arange(0, RD)
+    xo = qbase + (ROPE_START + d[None, :]) * sq_d
+    x = tl.load(q_ptr + xo, mask=rmask[:, None], other=0.0).to(tl.float32)
+    cos_idx = (d // 2) * 2
+    cos = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+    sin = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
+    )
+    x_sin = x * sin
+    even = (d % 2 == 0)[None, :]
+    if IS_INVERSE:
+        x_neg = tl.where(even, -x_sin, x_sin)
+    else:
+        x_neg = tl.where(even, x_sin, -x_sin)
+    x_neg = tl.reshape(x_neg, (BLOCK_ROWS, RDH, 2))
+    x_neg = tl.flip(x_neg, 2)
+    x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
+    out = x * cos + x_rot
+    tl.store(
+        out_ptr + obase + (ROPE_START + d[None, :]) * so_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=rmask[:, None],
+    )
+
+
+def apply_rotary_emb_flat_copy(
+    q: torch.Tensor,
+    q_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> None:
+    """RoPE q's tail in-place-equivalent and write the full row into q_out."""
+    assert q.dim() == 3 and q_out.shape == q.shape
+    batch_size, n_heads, head_dim = q.shape
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    rope_dim = freqs_real.shape[-1]
+    assert head_dim >= rope_dim and rope_dim % 2 == 0
+    if positions is not None:
+        assert positions.shape == (batch_size,)
+    else:
+        assert freqs_real.shape[0] == batch_size
+    if batch_size * n_heads == 0:
+        return
+
+    RD = triton.next_power_of_2(rope_dim)
+    HD = triton.next_power_of_2(head_dim)
+    BLOCK_ROWS = 16
+    n_rows = batch_size * n_heads
+    grid = (triton.cdiv(n_rows, BLOCK_ROWS),)
+    apply_rotary_emb_flat_copy_kernel[grid](
+        q,
+        q_out,
+        freqs_real,
+        positions,
+        n_rows,
+        n_heads,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q_out.stride(0),
+        q_out.stride(1),
+        q_out.stride(2),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        USE_POS=(positions is not None),
+        IS_INVERSE=inverse,
+        HD=HD,
+        ROPE_START=head_dim - rope_dim,
+        RD=RD,
+        RDH=RD // 2,
+        BLOCK_ROWS=BLOCK_ROWS,
+        num_warps=4,
+    )
+
+
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
 # per-token kernel. Default OFF; DeepseekV4 enables it via set_batched_rope(True).
 # The env var SGLANG_ROPE_BATCHED=1 still works as an override.

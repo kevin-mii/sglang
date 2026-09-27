@@ -745,7 +745,7 @@ class EngramEmbedding(nn.Module):
             engram_gather(
                 self.weight.data_ptr(),
                 self.scale.data_ptr(),
-                indices.reshape(-1),
+                indices,
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
@@ -805,7 +805,7 @@ class EngramEmbedding(nn.Module):
         engram_gather(
             self.weight.data_ptr(),
             self.scale.data_ptr(),
-            indices.reshape(-1),
+            indices,
             out.view(-1, self.dim),
             self.dim,
             FP8_BLOCK_SIZE,

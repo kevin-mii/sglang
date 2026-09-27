@@ -23,7 +23,6 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
-    mask_indices_by_length,
     page_table_from_req_to_token,
     sparse_buffers,
     widen_pair_i64,
@@ -132,66 +131,6 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 
-
-def _fold_lengths_into_index_lists(
-    indices: torch.Tensor,
-    lengths: Optional[torch.Tensor],
-    extra_indices: Optional[torch.Tensor] = None,
-    extra_lengths: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Entries of indices ([b, s, w]) at position >= lengths ([b]) set to -1 (the aiter
-    sparse kernel skips -1), likewise the optional second list; one launch for both."""
-    if lengths is None:
-        indices, lengths = None, None
-    if extra_indices is not None and extra_lengths is None:
-        extra_indices = None
-    if indices is None and extra_indices is None:
-        return indices, extra_indices
-    first, first_len = (
-        (indices, lengths) if indices is not None else (extra_indices, extra_lengths)
-    )
-    second, second_len = (
-        (extra_indices, extra_lengths) if indices is not None else (None, None)
-    )
-    masked, masked_second = mask_indices_by_length(
-        first.contiguous(), first_len.contiguous(), second, second_len
-    )
-    if indices is None:
-        return None, masked
-    return masked, masked_second if second is not None else extra_indices
-
-
-def _fold_lengths_for_aiter_sparse(
-    core_attn_metadata,
-    compress_ratio: int,
-    swa_page_indices: torch.Tensor,
-    swa_topk_lengths: Optional[torch.Tensor],
-    extra_indices: Optional[torch.Tensor],
-    extra_topk_lengths: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """indices with positions >= lengths set to -1, since the aiter kernel takes
-    no per-row length; cached on the per-step metadata, once per step and ratio."""
-    cache = core_attn_metadata._aiter_sparse_masked_indices
-    if cache is None:
-        cache = core_attn_metadata._aiter_sparse_masked_indices = {}
-    key = (
-        compress_ratio,
-        swa_page_indices.data_ptr(),
-        tuple(swa_page_indices.shape),
-        None if extra_indices is None else extra_indices.data_ptr(),
-        None if extra_indices is None else tuple(extra_indices.shape),
-    )
-    folded = cache.get(key)
-    if folded is None:
-        masked, masked_extra = _fold_lengths_into_index_lists(
-            swa_page_indices, swa_topk_lengths, extra_indices, extra_topk_lengths
-        )
-        folded = (
-            swa_page_indices if masked is None else masked,
-            masked_extra,
-        )
-        cache[key] = folded
-    return folded
 
 
 def _create_flashmla_metadata():
@@ -544,9 +483,9 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            page_index_align=PAGE_INDEX_ALIGNED_SIZE,
         )
 
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if unified_swa_pages:
@@ -2923,15 +2862,6 @@ class DeepseekV4HipRadixBackend(
                     extra_topk_lengths,
                     inv_rope=inv_rope,
                 )
-            if backend == "aiter_sparse":
-                swa_page_indices, extra_indices = _fold_lengths_for_aiter_sparse(
-                    core_attn_metadata,
-                    compress_ratio,
-                    swa_page_indices,
-                    swa_topk_lengths,
-                    extra_indices,
-                    extra_topk_lengths,
-                )
             input_dict = dict(
                 q=q,
                 k_cache=swa_k_cache,
@@ -3103,9 +3033,6 @@ class DeepseekV4HipRadixBackend(
                 seq_lens_casual=seq_lens_casual,
                 req_pool_indices_repeated=req_pool_indices_repeated,
             )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
@@ -3168,19 +3095,14 @@ class DeepseekV4HipRadixBackend(
         seq_lens_casual: torch.Tensor,
         req_pool_indices_repeated: torch.Tensor,
     ) -> torch.Tensor:
-        pos_causal = seq_lens_casual - 1
-        num_qo_tokens = seq_lens_casual.size(0)
-        offsets = pos_causal.unsqueeze(1) - torch.arange(
-            SWA_WINDOW, **self.cuda_int32_kwargs
-        ).unsqueeze(0)
-        invalid_offset_mask = offsets < 0
-        offsets.masked_fill_(invalid_offset_mask, 0)
-        raw_indices = self.req_to_token[req_pool_indices_repeated[:, None], offsets]
-        assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
-        raw_indices.masked_fill_(invalid_offset_mask, -1)
-        swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
-        # flash_mla attention requires int32 page indices.
-        return swa_indices.to(torch.int32)
+        return BuildCausalSwaPageIndices.execute(
+            req_to_token=self.req_to_token,
+            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=seq_lens_casual,
+            swa_window=SWA_WINDOW,
+            page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+        )
 
     get_dspark_swa_page_indices = DeepseekV4AttnBackend.get_dspark_swa_page_indices
 
