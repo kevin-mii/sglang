@@ -554,8 +554,10 @@ class Envs:
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Extra uniform verify widths (tokens per request, below gamma + 1) captured for
     # the static verify; each step verifies at the width with the best predicted
-    # throughput. Needs --speculative-dspark-sps-table-path.
-    SGLANG_DSPARK_VERIFY_WIDTHS = EnvTuple(tuple())
+    # throughput. Needs --speculative-dspark-sps-table-path, except for the
+    # default, which applies only to a DeepSeek-V4.1 target where supported and
+    # falls back to the packaged MI355X TP4 table.
+    SGLANG_DSPARK_VERIFY_WIDTHS = EnvTuple(("2", "3"))
     # Verify every step at this captured width instead of the policy's choice.
     SGLANG_DSPARK_FORCE_VERIFY_WIDTH = EnvInt(0)
 

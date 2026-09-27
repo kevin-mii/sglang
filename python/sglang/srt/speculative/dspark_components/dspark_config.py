@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
+DSPARK_BS1_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 
 # The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
@@ -56,6 +57,12 @@ def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
             f"got {num_draft_tokens}."
         )
     return gamma
+
+
+def is_dspark_algorithm(algorithm) -> bool:
+    return algorithm == "DSPARK" or (
+        not isinstance(algorithm, str) and algorithm.is_dspark()
+    )
 
 
 class DSparkDraftConfig(msgspec.Struct, frozen=True):

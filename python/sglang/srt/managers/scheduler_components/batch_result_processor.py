@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from collections import deque
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -1014,6 +1015,12 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
+                if is_spec:
+                    history = getattr(req, "dspark_acceptance_history", None)
+                    if history is None:
+                        history = deque(maxlen=8)
+                        req.dspark_acceptance_history = history
+                    history.append(new_accept_len)
                 self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 

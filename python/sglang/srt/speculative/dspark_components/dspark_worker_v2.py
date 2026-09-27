@@ -1,5 +1,7 @@
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -40,6 +42,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    DSPARK_BS1_GAMMA,
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
     resolve_runtime_config,
@@ -97,6 +100,29 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_DSPARK_WIDTH3_MIN_BS = 8
+_DSPARK_WIDTH3_ACCEPTANCE_THRESHOLD = 2.3
+_DSPARK_ACCEPTANCE_HISTORY_WINDOW = 8
+_DEFAULT_VERIFY_WIDTH_SPS_TABLE = (
+    Path(__file__).parent / "sps_tables" / "dsv41_flash_mi355x_tp4.json"
+)
+
+
+@dataclass(slots=True)
+class _DSparkRuntime:
+    gamma: int
+    verify_num_draft_tokens: int
+    block_pos_offsets: torch.Tensor
+    draft_block_spec_info: object
+    planner: DSparkVerifyPlanner
+    kv_injector: TargetHiddenKvInjector
+    proposer: DraftBlockProposer
+    verify_epilogue: Optional[DsparkVerifyEpilogue]
+    executor: TargetVerifyExecutor
+    observers: DsparkStepObservers
+    draft_sampler: Optional[object] = None
+    target_graph_runner: Optional[object] = None
+    draft_graph_runner: Optional[object] = None
 
 
 @runtime_checkable
@@ -389,6 +415,54 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
+        self._primary_runtime = _DSparkRuntime(
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            draft_block_spec_info=self._draft_block_spec_info,
+            planner=self._verify_planner,
+            kv_injector=self._kv_injector,
+            proposer=self._proposer,
+            verify_epilogue=self._verify_epilogue,
+            executor=self._verify_executor,
+            observers=self._observers,
+            draft_sampler=self._draft_sampler,
+        )
+        self._dual_width_enabled = (
+            target_is_dsv41
+            and self._draft_is_moe
+            and self._decode_graph_allowed
+            and not get_parallel().enable_dp_attention
+            and self.model_runner.pp_size == 1
+        )
+        self._logged_widths: set[int] = set()
+        self._bs1_runtime = (
+            self._build_alt_runtime(
+                gamma=DSPARK_BS1_GAMMA,
+                max_bs=1,
+                fused_argmax=target_is_dsv41,
+            )
+            if self._dual_width_enabled
+            else None
+        )
+        self._width3_batch_sizes = [
+            int(batch_size)
+            for batch_size in get_exec().graph.cuda_graph_config.decode.bs
+            if int(batch_size) >= _DSPARK_WIDTH3_MIN_BS
+        ]
+        self._width3_runtime = (
+            self._build_alt_runtime(
+                gamma=2,
+                max_bs=max(self._width3_batch_sizes),
+                fused_argmax=target_is_dsv41,
+            )
+            if self._dual_width_enabled and self._width3_batch_sizes
+            else None
+        )
+        self._draft_sampler_capture_hook = None
+        self._decode_steps = 0
+        self._width3_steps = 0
+
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
@@ -415,9 +489,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_build_verify_width_controller(self) -> Optional[VerifyWidthController]:
+        explicit = envs.SGLANG_DSPARK_VERIFY_WIDTHS.is_set()
+        if not explicit and not self._target_is_dsv41:
+            return None
+        raw_widths = envs.SGLANG_DSPARK_VERIFY_WIDTHS.get()
+        if not explicit:
+            raw_widths = [
+                w for w in raw_widths if 2 <= int(w) < self.verify_num_draft_tokens
+            ]
         widths = parse_verify_widths(
-            envs.SGLANG_DSPARK_VERIFY_WIDTHS.get(),
-            full_width=self.verify_num_draft_tokens,
+            raw_widths, full_width=self.verify_num_draft_tokens
         )
         if not widths:
             return None
@@ -427,9 +508,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
         if unsupported:
+            if not explicit:
+                return None
             raise ValueError(f"SGLANG_DSPARK_VERIFY_WIDTHS: {unsupported}.")
         sps_table = load_sps_table_from_path(
             get_spec().speculative_dspark_sps_table_path
+            or str(_DEFAULT_VERIFY_WIDTH_SPS_TABLE)
         )
         if not isinstance(sps_table, SpsCostTable):
             raise ValueError(
@@ -456,6 +540,92 @@ class DSparkWorkerV2(BaseSpecWorker):
             full_epilogue=self._verify_epilogue,
             make_epilogue=self._make_verify_epilogue,
             override_draft_tokens=override_draft_tokens,
+        )
+
+    def _build_alt_runtime(
+        self, *, gamma: int, max_bs: int, fused_argmax: bool
+    ) -> _DSparkRuntime:
+        verify_num_draft_tokens = gamma + 1
+        block_pos_offsets = build_block_pos_offsets(
+            length=verify_num_draft_tokens, device=self.device
+        )
+        draft_block_spec_info = make_draft_block_spec_info(
+            draft_token_num=(
+                gamma if self.sample_from_anchor else verify_num_draft_tokens
+            ),
+            device=self.device,
+        )
+        planner = DSparkVerifyPlanner(
+            draft_model=self.draft_model,
+            gamma=gamma,
+            model_runner=self.model_runner,
+            device=self.device,
+            tp_rank=self.model_runner.tp_rank,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
+        )
+        kv_injector = TargetHiddenKvInjector(
+            draft_model=self.draft_model,
+            draft_model_runner=self.draft_model_runner,
+            model_runner=self.model_runner,
+            device=self.device,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            block_pos_offsets=block_pos_offsets,
+        )
+        proposer = DraftBlockProposer(
+            draft_model=self.draft_model,
+            draft_model_runner=self.draft_model_runner,
+            gamma=gamma,
+            mask_token_id=self._mask_token_id,
+            draft_block_spec_info=draft_block_spec_info,
+            tp_sync=self._tp_sync,
+            dp_moe_sync=False,
+        )
+        verify_epilogue = DsparkVerifyEpilogue(
+            max_bs=max_bs,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            device=self.device,
+            tp_sync=self._tp_sync,
+            fused_argmax=fused_argmax,
+            commit_ctx=CommitInjectCtx(
+                draft_model=self.draft_model,
+                block_pos_offsets=block_pos_offsets,
+                resolve_pool=lambda: self.draft_model_runner.token_to_kv_pool,
+                resolve_req_to_token=lambda: (
+                    self.model_runner.req_to_token_pool.req_to_token
+                ),
+                kv_injector=kv_injector,
+            ),
+        )
+        executor = TargetVerifyExecutor(
+            target_worker=self.target_worker,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            kv_injector=kv_injector,
+            tp_sync=self._tp_sync,
+            verify_epilogue=verify_epilogue,
+            simulate_acc_len=self._simulate_acc_len,
+        )
+        observers = DsparkStepObservers(
+            planner=planner,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            tp_rank=self.model_runner.tp_rank,
+            device=self.device,
+            simulate_acc_len=self._simulate_acc_len,
+        )
+        return _DSparkRuntime(
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            block_pos_offsets=block_pos_offsets,
+            draft_block_spec_info=draft_block_spec_info,
+            planner=planner,
+            kv_injector=kv_injector,
+            proposer=proposer,
+            verify_epilogue=verify_epilogue,
+            executor=executor,
+            observers=observers,
         )
 
     def _resolve_target_embed_tokens(self, target_model):
@@ -553,35 +723,165 @@ class DSparkWorkerV2(BaseSpecWorker):
                         available_memory_gb=available_mem
                     )
                     if self._draft_sampler is not None:
-                        self.draft_model_runner.capture_tail_hooks.append(
+                        self._draft_sampler_capture_hook = (
                             make_draft_sampler_capture_hook(self._draft_sampler)
+                        )
+                        self.draft_model_runner.capture_tail_hooks.append(
+                            self._draft_sampler_capture_hook
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if capture_decode_cuda_graph and self._dual_width_enabled:
+                logger.info(
+                    "Captured DSpark primary graphs on TP rank %d: "
+                    "gamma=%d, verify_num_draft_tokens=%d.",
+                    self.model_runner.tp_rank,
+                    self.gamma,
+                    self.verify_num_draft_tokens,
+                )
+                self._capture_alt_cuda_graphs(
+                    runtime=self._bs1_runtime,
+                    batch_sizes=[1],
+                    label="bs1",
+                )
+                self._capture_alt_cuda_graphs(
+                    runtime=self._width3_runtime,
+                    batch_sizes=self._width3_batch_sizes,
+                    label="width-3",
+                )
         if self._verify_width is not None:
             self._build_verify_width_runtimes()
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(
+        self,
+        *,
+        available_memory_gb: float,
+        gamma: Optional[int] = None,
+        max_bs: Optional[int] = None,
+        planner=None,
+        out=None,
+    ):
+        gamma = self.gamma if gamma is None else gamma
+        max_bs = (
+            max(get_exec().graph.cuda_graph_config.decode.bs)
+            if max_bs is None
+            else max_bs
+        )
+        planner = self._verify_planner if planner is None else planner
+        if out is None and self._verify_epilogue is not None:
+            out = self._verify_epilogue.draft_tokens_buf
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
-            gamma=self.gamma,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            gamma=gamma,
+            max_bs=max_bs,
             device=self.device,
             tp_rank=self.model_runner.tp_rank,
             tp_sync=self._tp_sync,
             available_memory_gb=available_memory_gb,
             confidence_fn=(
-                self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
+                planner.compute_confidence_tensor
+                if planner.carries_confidence
                 else None
             ),
-            out=(
-                self._verify_epilogue.draft_tokens_buf
-                if self._verify_epilogue is not None
-                else None
-            ),
+            out=out,
+        )
+
+    def _capture_alt_cuda_graphs(
+        self, *, runtime: Optional[_DSparkRuntime], batch_sizes: list[int], label: str
+    ) -> None:
+        if runtime is None:
+            return
+        from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+            build_attention_backends,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        available_memory_gb = self._tp_sync.available_memory_gb(
+            SpecTpSyncSite.DSPARK_MEM,
+            self.device,
+            self.gpu_id,
+            group=self._draft_graph_group,
+        )
+        runtime.draft_sampler = self._maybe_build_draft_sampler(
+            available_memory_gb=available_memory_gb,
+            gamma=runtime.gamma,
+            max_bs=max(batch_sizes),
+            planner=runtime.planner,
+            out=runtime.verify_epilogue.draft_tokens_buf,
+        )
+        runtime.proposer.attach_draft_sampler(runtime.draft_sampler)
+
+        primary_target_hook = (
+            self._verify_epilogue.capture_hook
+            if self._verify_epilogue is not None
+            else None
+        )
+        if primary_target_hook is not None:
+            self.model_runner.capture_tail_hooks.remove(primary_target_hook)
+        target_hook = runtime.verify_epilogue.capture_hook
+        self.model_runner.capture_tail_hooks.append(target_hook)
+
+        if self._draft_sampler_capture_hook is not None:
+            self.draft_model_runner.capture_tail_hooks.remove(
+                self._draft_sampler_capture_hook
+            )
+        alt_draft_sampler_hook = (
+            make_draft_sampler_capture_hook(runtime.draft_sampler)
+            if runtime.draft_sampler is not None
+            else None
+        )
+        if alt_draft_sampler_hook is not None:
+            self.draft_model_runner.capture_tail_hooks.append(alt_draft_sampler_hook)
+
+        decode_config = get_exec().graph.cuda_graph_config.decode
+        saved_decode_bs = decode_config.bs
+        decode_config.bs = batch_sizes
+        try:
+            width = runtime.verify_num_draft_tokens
+            with get_spec().override(speculative_num_draft_tokens=width):
+                target_backends = build_attention_backends(
+                    model_runner=self.model_runner
+                )
+                runtime.target_graph_runner = DecodeCudaGraphRunner(
+                    self.model_runner,
+                    attn_backend=target_backends.attn_backend,
+                    speculative_num_draft_tokens=width,
+                )
+
+                draft_backends = build_attention_backends(
+                    model_runner=self.draft_model_runner
+                )
+                runtime.draft_graph_runner = DecodeCudaGraphRunner(
+                    self.draft_model_runner,
+                    attn_backend=draft_backends.attn_backend,
+                    speculative_num_draft_tokens=width,
+                )
+        finally:
+            decode_config.bs = saved_decode_bs
+            self.model_runner.capture_tail_hooks.remove(target_hook)
+            if primary_target_hook is not None:
+                self.model_runner.capture_tail_hooks.append(primary_target_hook)
+            if alt_draft_sampler_hook is not None:
+                self.draft_model_runner.capture_tail_hooks.remove(
+                    alt_draft_sampler_hook
+                )
+            if self._draft_sampler_capture_hook is not None:
+                self.draft_model_runner.capture_tail_hooks.append(
+                    self._draft_sampler_capture_hook
+                )
+
+        logger.info(
+            "Captured DSpark %s alternate graphs on TP rank %d: "
+            "gamma=%d, verify_num_draft_tokens=%d, batch_sizes=%s.",
+            label,
+            self.model_runner.tp_rank,
+            runtime.gamma,
+            runtime.verify_num_draft_tokens,
+            batch_sizes,
         )
 
     def clear_cache_pool(self):
@@ -607,6 +907,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return None
         return self._observers.block_accept_estimate_log_suffix()
+
+    def dspark_width3_log_suffix(self) -> Optional[str]:
+        if not self._hosts_draft:
+            return None
+        fraction = (
+            self._width3_steps / self._decode_steps
+            if self._decode_steps > 0
+            else 0.0
+        )
+        self._decode_steps = 0
+        self._width3_steps = 0
+        return f"width-3 fraction: {fraction:.2f}"
+
+    def _batch_rolling_acceptance(self, batch: ScheduleBatch) -> Optional[float]:
+        accepted_tokens = 0
+        samples = 0
+        for req in batch.reqs:
+            history = getattr(req, "dspark_acceptance_history", None)
+            if history:
+                accepted_tokens += sum(history)
+                samples += len(history)
+        return accepted_tokens / samples if samples else None
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         if not self._hosts_draft:
@@ -820,28 +1142,80 @@ class DSparkWorkerV2(BaseSpecWorker):
         device = self.device
         prefix_lens = batch.seq_lens
 
-        self._observers.begin_step()
+        runtime = self._primary_runtime
+        rolling_acceptance = self._batch_rolling_acceptance(batch)
+        use_width3 = (
+            self._dual_width_enabled
+            and self._width3_runtime is not None
+            and bs >= _DSPARK_WIDTH3_MIN_BS
+            and bs in self._width3_batch_sizes
+            and rolling_acceptance is not None
+            and rolling_acceptance < _DSPARK_WIDTH3_ACCEPTANCE_THRESHOLD
+        )
+        if use_width3:
+            runtime = self._width3_runtime
+        elif (
+            self._dual_width_enabled
+            and bs == 1
+            and self._bs1_runtime is not None
+            and self._bs1_runtime.target_graph_runner is not None
+            and self._bs1_runtime.draft_graph_runner is not None
+        ):
+            runtime = self._bs1_runtime
+        self._decode_steps += 1
+        if runtime is self._width3_runtime:
+            self._width3_steps += 1
+        proposer = runtime.proposer
+        planner = runtime.planner
+        executor = runtime.executor
+        observers = runtime.observers
+        verify_num_draft_tokens = runtime.verify_num_draft_tokens
+        block_pos_offsets = runtime.block_pos_offsets
+        gamma = runtime.gamma
+        if verify_num_draft_tokens not in self._logged_widths:
+            self._logged_widths.add(verify_num_draft_tokens)
+            if self.model_runner.tp_rank == 0:
+                logger.info(
+                    "DSpark multi-width first use: gamma=%d, "
+                    "verify_num_draft_tokens=%d, bs=%d, rolling_acceptance=%s.",
+                    gamma,
+                    verify_num_draft_tokens,
+                    bs,
+                    "none" if rolling_acceptance is None else f"{rolling_acceptance:.3f}",
+                )
+
+        observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
             device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            block_pos_offsets=block_pos_offsets,
             model_runner=self.model_runner,
         )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
+        draft_graph_runner_backup = self.draft_model_runner.decode_cuda_graph_runner
+        if runtime.draft_graph_runner is not None:
+            self.draft_model_runner.decode_cuda_graph_runner = (
+                runtime.draft_graph_runner
+            )
+        try:
+            with self._draft_context(), observers.segment(InfoSegment.DRAFT):
+                proposal = proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
+        finally:
+            self.draft_model_runner.decode_cuda_graph_runner = (
+                draft_graph_runner_backup
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
@@ -849,14 +1223,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         confidence = proposal.confidence
         if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
+            confidence = planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
 
-        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+        verify_token_budget = planner.resolve_verify_token_budget(
             draft_input=draft_input,
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -870,7 +1244,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
-        layout = self._verify_planner.schedule_layout(
+        layout = planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
@@ -879,7 +1253,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+        run_compact = planner.should_run_compact(layout=layout)
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
@@ -892,8 +1266,9 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # A live grammar forces the eager path: the folded epilogue accepts inside
         # the cuda graph off its own buffers, where the mask below never lands.
+        verify_epilogue = executor.verify_epilogue
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            verify_epilogue is not None
             and proposal.folded
             # The epilogue's in-graph accept is greedy (accept_greedy_triton);
             # sampling batches must take the eager accept path even when the
@@ -904,42 +1279,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
-        verify_width = self.verify_num_draft_tokens
-        step_epilogue = self._verify_epilogue
-        with self._observers.segment(InfoSegment.TARGET_VERIFY):
-            if run_compact:
-                target_verify, hidden_strided = self._verify_executor.run_compact(
-                    batch=batch,
-                    layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
-                    bs=bs,
-                    device=device,
-                    sampling_info=sampling_info,
-                    inject_gate=fold_eligible,
-                )
-            else:
-                verify_width, width_runtime = self._select_verify_width(batch, bs)
-                step_epilogue = (
-                    width_runtime.epilogue
-                    if width_runtime is not None
-                    else self._verify_epilogue
-                )
-                if (
-                    step_epilogue is not None
-                    and self._verify_planner.mode_value == "static"
-                ):
-                    step_epilogue.begin_static_step(bs, fold_eligible)
-                with use_verify_width_runtime(self.model_runner, width_runtime):
-                    target_verify = self._verify_executor.run_non_compact(
+        verify_width = verify_num_draft_tokens
+        step_epilogue = verify_epilogue
+        target_graph_runner_backup = self.model_runner.decode_cuda_graph_runner
+        if runtime.target_graph_runner is not None:
+            self.model_runner.decode_cuda_graph_runner = (
+                runtime.target_graph_runner
+            )
+        try:
+            with observers.segment(InfoSegment.TARGET_VERIFY):
+                if run_compact:
+                    target_verify, hidden_strided = executor.run_compact(
                         batch=batch,
-                        draft_input=draft_input,
-                        verify_ids_2d=verify_ids_2d,
-                        verify_window=verify_window,
+                        layout=layout,
+                        draft_block_ids=draft_block_ids,
+                        draft_tokens=draft_tokens,
+                        bs=bs,
+                        device=device,
                         sampling_info=sampling_info,
-                        verify_width=verify_width,
+                        inject_gate=fold_eligible,
                     )
-                hidden_strided = None
+                else:
+                    width_runtime = None
+                    if runtime is self._primary_runtime:
+                        verify_width, width_runtime = self._select_verify_width(
+                            batch, bs
+                        )
+                        if width_runtime is not None:
+                            step_epilogue = width_runtime.epilogue
+                    if step_epilogue is not None and planner.mode_value == "static":
+                        step_epilogue.begin_static_step(bs, fold_eligible)
+                    with use_verify_width_runtime(self.model_runner, width_runtime):
+                        target_verify = executor.run_non_compact(
+                            batch=batch,
+                            draft_input=draft_input,
+                            verify_ids_2d=verify_ids_2d,
+                            verify_window=verify_window,
+                            sampling_info=sampling_info,
+                            verify_width=verify_width,
+                        )
+                    hidden_strided = None
+        finally:
+            self.model_runner.decode_cuda_graph_runner = target_graph_runner_backup
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
         if batch.has_grammar:
@@ -955,13 +1336,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        epilogue = self._verify_executor.verify_epilogue
+        epilogue = verify_epilogue
         folded_accept = (
             fold_eligible
             and can_run_cuda_graph
-            and (run_compact or self._verify_planner.mode_value == "static")
+            and (run_compact or planner.mode_value == "static")
         )
-        accept = self._verify_executor.accept_and_finalize(
+        accept = executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
             verify_ids_2d=verify_ids_2d,
@@ -975,7 +1356,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_width=verify_width,
             epilogue=step_epilogue,
         )
-        if self._verify_width is not None:
+        if self._verify_width is not None and runtime is self._primary_runtime:
             self._verify_width.observe(
                 width=verify_width, correct_len=accept.correct_len
             )
@@ -989,7 +1370,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch,
                 logits_output,
                 accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
+                chain_stride=verify_num_draft_tokens,
             )
 
         if on_publish is not None:
@@ -1007,7 +1388,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
-            self._verify_executor.commit_hidden(
+            executor.commit_hidden(
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
@@ -1020,7 +1401,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
-        self._observers.observe_verify_step(
+        observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
             bs=bs,
