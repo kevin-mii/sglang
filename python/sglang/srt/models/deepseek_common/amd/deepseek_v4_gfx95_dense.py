@@ -162,7 +162,9 @@ def input_norm_fake_quant(
     return hidden_states, x_quant
 
 
-def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tensor:
+def post_attention_norm(
+    layer, x: torch.Tensor, coefficients=None
+) -> Tuple[torch.Tensor, Optional[Fp8GridActivation]]:
     """layer.post_attention_layernorm(x); with coefficients (HcCoefficients of the
     boundary that produced x) still pending, the reduce + sinkhorn rides in the norm
     launch, which then is the Triton row norm rather than the aiter one."""
@@ -175,11 +177,21 @@ def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tens
     ):
         if coefficients is not None:
             coefficients.materialize()
-        return norm(x)
-    _, out = rmsnorm_with_sinkhorn(
-        x, norm.weight.data, norm.variance_epsilon, coefficients, fake_quant=False
+        return norm(x), None
+    shared_gate_up = getattr(
+        getattr(getattr(layer, "mlp", None), "shared_experts", None),
+        "gate_up_proj",
+        None,
     )
-    return out
+    quant, out = rmsnorm_with_sinkhorn(
+        x,
+        norm.weight.data,
+        norm.variance_epsilon,
+        coefficients,
+        fake_quant=shared_gate_up is not None
+        and _native_mxfp8_consumer(shared_gate_up) is not None,
+    )
+    return out, quant
 
 
 def live_rows(activation, num_tokens: int):

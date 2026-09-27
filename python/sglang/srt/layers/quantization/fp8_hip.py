@@ -16,6 +16,9 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
 )
+from sglang.kernels.ops.quantization.mxfp8_dot_scaled_splitk import (
+    prepare_mainproj_dot_scaled_cache,
+)
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     native_route_supports,
     prepare_mxfp8_native_weight,
@@ -41,6 +44,16 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             layer.weight_scale_inv.data,
             method.weight_block_size,
         )
+        if (
+            getattr(layer, "_dspark_main_proj", False)
+            and tuple(layer.weight.shape) == (5120, 15360)
+        ):
+            (
+                layer._mainproj_dot_scaled_weight,
+                layer._mainproj_dot_scaled_scale,
+            ) = prepare_mainproj_dot_scaled_cache(
+                shuffled.view(torch.float8_e4m3fn), scale_ue8m0
+            )
         copy_or_rebind_param(layer, "weight", shuffled.view(torch.float8_e4m3fn))
         copy_or_rebind_param(layer, "weight_scale_mx_e8m0", scale_ue8m0)
         if weight_bf16 is not None:
