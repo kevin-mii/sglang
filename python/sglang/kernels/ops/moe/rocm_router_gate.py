@@ -354,6 +354,7 @@ def _router_gate_kernel(
     bias_ptr,  # [384] fp32 or bf16 (HAS_BIAS)
     weights_ptr,  # [M, TOPK] fp32
     ids_ptr,  # [M, TOPK] int32
+    num_token_non_padded_ptr,
     stride_lm,
     stride_ps,
     stride_pm,
@@ -364,23 +365,28 @@ def _router_gate_kernel(
     HAS_BIAS: tl.constexpr,
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     row = tl.program_id(0)
-    weights, ids = _gate_row(
-        logits_ptr,
-        part_ptr,
-        bias_ptr,
-        row,
-        stride_lm,
-        stride_ps,
-        stride_pm,
-        routed_scaling_factor,
-        SPLIT_K,
-        WRITE_LOGITS,
-        HAS_BIAS,
-        RENORM,
-        TOPK,
-    )
+    if HAS_PADDING and row >= tl.load(num_token_non_padded_ptr):
+        weights = tl.zeros([64], dtype=tl.float32)
+        ids = tl.zeros([64], dtype=tl.int32)
+    else:
+        weights, ids = _gate_row(
+            logits_ptr,
+            part_ptr,
+            bias_ptr,
+            row,
+            stride_lm,
+            stride_ps,
+            stride_pm,
+            routed_scaling_factor,
+            SPLIT_K,
+            WRITE_LOGITS,
+            HAS_BIAS,
+            RENORM,
+            TOPK,
+        )
     lane = tl.arange(0, 64)
     out_mask = lane < TOPK
     tl.store(weights_ptr + row * stride_om + lane, weights, mask=out_mask)
@@ -395,6 +401,7 @@ def rocm_router_gate(
     routed_scaling_factor: Optional[float],
     *,
     partials: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """aiter topk_gating(..., score_func="sqrtsoftplus") for 384 experts: fp32 weights and int32
     ids [M, topk]; with partials their fixed-order sum is gated and written into
@@ -417,6 +424,12 @@ def rocm_router_gate(
         assert (
             correction_bias.shape == (num_experts,) and correction_bias.is_contiguous()
         )
+    if num_token_non_padded is not None:
+        assert (
+            num_token_non_padded.numel() == 1
+            and not num_token_non_padded.dtype.is_floating_point
+            and num_token_non_padded.device == gating_output.device
+        )
     weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
     ids = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
     if M == 0:
@@ -427,6 +440,7 @@ def rocm_router_gate(
         correction_bias if correction_bias is not None else gating_output,
         weights,
         ids,
+        num_token_non_padded if num_token_non_padded is not None else gating_output,
         gating_output.stride(0),
         stride_ps,
         stride_pm,
@@ -437,6 +451,7 @@ def rocm_router_gate(
         HAS_BIAS=correction_bias is not None,
         RENORM=bool(renormalize),
         TOPK=topk,
+        HAS_PADDING=num_token_non_padded is not None,
         num_warps=1,
     )
     return weights, ids

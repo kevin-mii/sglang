@@ -1448,6 +1448,23 @@ def biased_topk_jit_kernel_impl(
 
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
+        if (
+            sqrtsoftplus_log1p
+            and num_token_non_padded is not None
+            and gating_output.shape[0] <= 256
+            and gating_output.shape[1] == 384
+        ):
+            from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
+
+            return rocm_router_gate(
+                gating_output,
+                correction_bias,
+                topk,
+                renormalize,
+                routed_scaling_factor,
+                partials=router_logits_partials,
+                num_token_non_padded=num_token_non_padded,
+            )
         if router_logits_partials is not None:
             # ROCm decode router: split-K reduce + gate in one launch
             from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
@@ -2441,7 +2458,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask:
+    if _is_hip and not _skip_hip_pad_mask and not padded_rows_masked:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2651,6 +2668,15 @@ def select_experts(
                 if router_logits_partials is not None
                 else {}
             )
+            _router_padfill_fused = (
+                _use_aiter
+                and scoring_func == "sqrtsoftplus"
+                and num_fused_shared_experts_for_gate == 0
+                and topk_config.sqrtsoftplus_log1p
+                and num_token_non_padded is not None
+                and router_logits.shape[0] <= 256
+                and router_logits.shape[1] == 384
+            )
             topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -2666,7 +2692,9 @@ def select_experts(
                 **_packed_kwargs,
                 **_partials_kwargs,
             )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            padded_rows_masked = _fused_gate_masks_padded_rows(
+                scoring_func
+            ) or _router_padfill_fused
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
