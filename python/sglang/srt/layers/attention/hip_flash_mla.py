@@ -178,6 +178,11 @@ def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:
         backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
     if backend == "auto":
         return "aiter_sparse" if is_gfx95_supported() else "tilelang"
+    if backend == "aiter_sparse" and not is_gfx95_supported():
+        raise ValueError(
+            "SGLANG_HACK_FLASHMLA_BACKEND=aiter_sparse needs gfx950 (aiter's gluon sparse "
+            "decode kernel); use auto or tilelang"
+        )
     return backend
 
 

@@ -38,7 +38,8 @@ class TestVerifyCandidateGraph(CustomTestCase):
         self.assertFalse(low_ratio_decode_rows_fit_candidate_span(backend, batch))
 
     def test_factory_keeps_causal_indexer_for_verify(self):
-        """ROCm must be admitted without a Blackwell capability; pre-Blackwell CUDA stays rejected."""
+        """gfx950 must be admitted without a Blackwell capability; other ROCm GPUs and
+        pre-Blackwell CUDA stay rejected."""
         config = SimpleNamespace(
             model_type="deepseek_v41",
             candidate_source_layer_id=1,
@@ -55,8 +56,9 @@ class TestVerifyCandidateGraph(CustomTestCase):
             is_draft_worker=False,
         )
         with (
-            patch("torch.cuda.get_device_capability", return_value=(9, 4)),
+            patch("torch.cuda.get_device_capability", return_value=(9, 5)),
             patch("sglang.srt.utils.is_hip", return_value=True),
+            patch("sglang.srt.utils.is_gfx95_supported", return_value=True),
         ):
             self.assertIsNotNone(
                 create_dsv41_candidate_graph_variants(
@@ -64,8 +66,19 @@ class TestVerifyCandidateGraph(CustomTestCase):
                 )
             )
         with (
+            patch("torch.cuda.get_device_capability", return_value=(9, 4)),
+            patch("sglang.srt.utils.is_hip", return_value=True),
+            patch("sglang.srt.utils.is_gfx95_supported", return_value=False),
+        ):
+            self.assertIsNone(
+                create_dsv41_candidate_graph_variants(
+                    runner, ForwardMode.TARGET_VERIFY, 6
+                )
+            )
+        with (
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
             patch("sglang.srt.utils.is_hip", return_value=False),
+            patch("sglang.srt.utils.is_gfx95_supported", return_value=False),
         ):
             self.assertIsNone(
                 create_dsv41_candidate_graph_variants(

@@ -1141,7 +1141,10 @@ class MQALayer(MqaAttentionBase):
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
         if alt_streams is not None and (
-            ((_is_cuda or _is_hip) and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            (
+                (_is_cuda or _is_gfx95_supported)
+                and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         ):
             self.alt_streams = alt_streams[:3]
@@ -2042,7 +2045,7 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            fuse_q_rope = _is_hip and _hip.fuses_q_rope_into_k_store(
+            fuse_q_rope = _is_gfx95_supported and _hip.fuses_q_rope_into_k_store(
                 self, q_out, unified=unified, use_cp=use_cp
             )
             if fuse_q_rope:
@@ -2801,10 +2804,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self._wqkv_a_native_consumer_checked = False
         self._wqkv_a_native_consumer = False
-        # ROCm: hc_post, pre-collapse and mixing stats in one launch; the kernel only
+        # gfx950: hc_post, pre-collapse and mixing stats in one launch; the kernel only
         # supports hc_mult 4
         self.hc_boundary_fused = (
-            _is_hip and self.hc_pre_from_prev_sublayer and self.hc_mult == 4
+            _is_gfx95_supported and self.hc_pre_from_prev_sublayer and self.hc_mult == 4
         )
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
@@ -3437,8 +3440,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             x.is_cuda
             and (
-                # ROCm: the fused Triton port wins at every row count
-                _is_hip
+                # gfx950: the fused Triton port wins at every row count (MI350X)
+                _is_gfx95_supported
                 or (
                     torch.version.cuda is not None
                     and (

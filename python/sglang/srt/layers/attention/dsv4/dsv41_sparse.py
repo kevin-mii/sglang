@@ -23,10 +23,15 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
+def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
+    # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
+    return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
+
+
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
     """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
     positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
-    if x.is_cuda and x.dtype == torch.bfloat16:
+    if _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
@@ -51,7 +56,7 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
-            x.is_cuda
+            _fused_dsv41_kernels(x)
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
