@@ -1,4 +1,3 @@
-import functools
 from typing import Any, Optional, Tuple
 
 import torch
@@ -30,21 +29,30 @@ def hip_attn_kv_splits() -> int:
     return 4 if deterministic else 0
 
 
-@functools.lru_cache(maxsize=None)  # a captured graph replays the cached address
-def _captured_uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
-    return torch.arange(
-        0, (num_tokens + 1) * width, width, dtype=torch.int32, device=device
-    )
+# row pointers built eagerly, keyed by (num_tokens, width, device); decode-sized batches only
+_UNIFORM_INDPTR_CACHE: dict = {}
 
 
 def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
-    """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]);
-    cached only for graph capture, whose sizes are bounded, not for every eager prefill size."""
-    if torch.cuda.is_current_stream_capturing():
-        return _captured_uniform_indptr(num_tokens, width, device)
-    return torch.arange(
+    """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]).
+
+    Only eagerly built tensors are cached. An arange issued during graph capture is recorded
+    into that graph and runs only when that graph replays, so a cached copy would hold
+    uninitialized row pointers for every other graph of the same shape; a graph that finds no
+    eager copy records its own arange instead. Prefill-sized batches are not cached."""
+    key = (num_tokens, width, device)
+    indptr = _UNIFORM_INDPTR_CACHE.get(key)
+    if indptr is not None:
+        return indptr
+    indptr = torch.arange(
         0, (num_tokens + 1) * width, width, dtype=torch.int32, device=device
     )
+    if (
+        num_tokens < _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _UNIFORM_INDPTR_CACHE[key] = indptr
+    return indptr
 
 
 def aiter_sparse_decode_fwd(

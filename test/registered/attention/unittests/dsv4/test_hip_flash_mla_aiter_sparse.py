@@ -457,5 +457,61 @@ class TestDecodeSelectionOrder(CustomTestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "HIP only")
+class TestUniformIndptrGraphs(CustomTestCase):
+    """Every captured graph must see valid sparse-decode row pointers, including a graph
+    that replays before the first graph of the same shape ever has."""
+
+    def test_second_graph_of_same_shape_replays_first(self):
+        from sglang.srt.layers.attention import hip_flash_mla
+
+        hip_flash_mla._UNIFORM_INDPTR_CACHE.clear()
+        n, width, dev = 18, 512, "cuda"
+        expected = torch.arange(
+            0, (n + 1) * width, width, dtype=torch.int32, device=dev
+        )
+        outs, seen = [], []
+        graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for g in graphs:
+                out = torch.zeros_like(expected)
+                with torch.cuda.graph(g, stream=stream):
+                    indptr = hip_flash_mla._uniform_indptr(n, width, dev)
+                    out.copy_(indptr)
+                outs.append(out)
+                seen.append(indptr)
+        torch.cuda.synchronize()
+        # the first graph never replays: poison whatever row pointers it was handed
+        seen[0].fill_(-7)
+        graphs[1].replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(outs[1], expected, rtol=0, atol=0)
+        self.assertNotIn((n, width, dev), hip_flash_mla._UNIFORM_INDPTR_CACHE)
+
+    def test_eager_indptr_is_reused_by_capture(self):
+        from sglang.srt.layers.attention import hip_flash_mla
+
+        hip_flash_mla._UNIFORM_INDPTR_CACHE.clear()
+        n, width, dev = 12, 128, "cuda"
+        eager = hip_flash_mla._uniform_indptr(n, width, dev)
+        out = torch.zeros_like(eager)
+        g = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(g, stream=stream):
+                captured = hip_flash_mla._uniform_indptr(n, width, dev)
+                out.copy_(captured)
+        self.assertEqual(captured.data_ptr(), eager.data_ptr())
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out,
+            torch.arange(0, (n + 1) * width, width, dtype=torch.int32, device=dev),
+            rtol=0,
+            atol=0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
