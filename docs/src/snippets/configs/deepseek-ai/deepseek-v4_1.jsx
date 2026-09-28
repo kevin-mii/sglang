@@ -352,8 +352,8 @@ export const config = {
         // Run-to-run repeatable output: forces the FlyDSL MoE down-projection onto
         // a per-slot reduce instead of atomics; measured free at 8-32 requests.
         "AITER_FLYDSL_FORCE_REDUCE=1",
-        // Keeps small batches off aiter's bf16-activation MoE path, which has no
-        // kernel for the fp4 experts; newer SGLang sets it for you on ROCm.
+        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
+        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
       flags: [

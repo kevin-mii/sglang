@@ -29,17 +29,15 @@ def hip_attn_kv_splits() -> int:
     return 4 if deterministic else 0
 
 
-# row pointers built eagerly, keyed by (num_tokens, width, device); decode-sized batches only
-_UNIFORM_INDPTR_CACHE: dict = {}
+# the eager warmups before each capture fill this, so captured graphs reuse these tensors
+_UNIFORM_INDPTR_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
 def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
-    """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]).
+    """Row pointers of the aiter sparse decode kernel: token t reads kv_indices[t*w : (t+1)*w].
 
-    Only eagerly built tensors are cached. An arange issued during graph capture is recorded
-    into that graph and runs only when that graph replays, so a cached copy would hold
-    uninitialized row pointers for every other graph of the same shape; a graph that finds no
-    eager copy records its own arange instead. Prefill-sized batches are not cached."""
+    Only tensors built outside capture are cached: an arange recorded into a graph runs only
+    when that graph replays, and V4.1 captures two verify graphs per batch size."""
     key = (num_tokens, width, device)
     indptr = _UNIFORM_INDPTR_CACHE.get(key)
     if indptr is not None:

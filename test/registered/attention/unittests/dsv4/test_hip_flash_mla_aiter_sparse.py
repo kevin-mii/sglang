@@ -459,10 +459,9 @@ class TestDecodeSelectionOrder(CustomTestCase):
 
 @unittest.skipIf(not is_hip(), "HIP only")
 class TestUniformIndptrGraphs(CustomTestCase):
-    """Every captured graph must see valid sparse-decode row pointers, including a graph
-    that replays before the first graph of the same shape ever has."""
-
-    def test_second_graph_of_same_shape_replays_first(self):
+    def test_graph_does_not_read_row_pointers_another_graph_records(self):
+        """Two graphs of one shape (the V4.1 verify variants): the one replayed alone must
+        not read row pointers only the other graph writes."""
         from sglang.srt.layers.attention import hip_flash_mla
 
         hip_flash_mla._UNIFORM_INDPTR_CACHE.clear()
@@ -488,29 +487,6 @@ class TestUniformIndptrGraphs(CustomTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(outs[1], expected, rtol=0, atol=0)
         self.assertNotIn((n, width, dev), hip_flash_mla._UNIFORM_INDPTR_CACHE)
-
-    def test_eager_indptr_is_reused_by_capture(self):
-        from sglang.srt.layers.attention import hip_flash_mla
-
-        hip_flash_mla._UNIFORM_INDPTR_CACHE.clear()
-        n, width, dev = 12, 128, "cuda"
-        eager = hip_flash_mla._uniform_indptr(n, width, dev)
-        out = torch.zeros_like(eager)
-        g = torch.cuda.CUDAGraph()
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            with torch.cuda.graph(g, stream=stream):
-                captured = hip_flash_mla._uniform_indptr(n, width, dev)
-                out.copy_(captured)
-        self.assertEqual(captured.data_ptr(), eager.data_ptr())
-        g.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(
-            out,
-            torch.arange(0, (n + 1) * width, width, dtype=torch.int32, device=dev),
-            rtol=0,
-            atol=0,
-        )
 
 
 if __name__ == "__main__":

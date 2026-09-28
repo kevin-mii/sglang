@@ -1886,23 +1886,21 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is None:
-            # The overlap scheduler hands a DSpark verify batch only device seq lens; this eager
-            # path runs only for batches past the captured graphs, so one host copy is cheap.
-            seq_lens_cpu = forward_batch.seq_lens.cpu()
-            forward_batch.seq_lens_cpu = seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.page_size % 128 == 0
-        max_seq_len = (
-            max_seq_len_override
-            if max_seq_len_override is not None
-            else (
-                int(seq_lens_cpu.max().item())
-                if seq_lens_cpu is not None
-                else self.MAX_SEQ_LEN_FOR_CAPTURE
+        if max_seq_len_override is not None:
+            max_seq_len = max_seq_len_override
+        elif seq_lens_cpu is not None:
+            max_seq_len = int(seq_lens_cpu.max().item())
+        else:
+            # an eager DSpark verify under the overlap scheduler has device lengths only
+            max_seq_len = (
+                getattr(
+                    forward_batch.spec_info, "candidate_max_seq_len_upper_bound", None
+                )
+                or self.MAX_SEQ_LEN_FOR_CAPTURE
             )
-        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
