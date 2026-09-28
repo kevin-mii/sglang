@@ -463,6 +463,11 @@ def handle_model_specific_adjustments(server_args: Any):
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
+            # aiter's fused_moe sends batches under AITER_BF16_FP8_MOE_BOUND tokens (256 by
+            # default) down the bf16-activation CK path, which has no kernel for the V4 fp4
+            # expert shape; the prefill graph capture hits it first. Read by aiter at call
+            # time, so an exported value still wins.
+            os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
