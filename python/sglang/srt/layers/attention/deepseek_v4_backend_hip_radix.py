@@ -97,6 +97,7 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attn_kv_splits,
     resolve_hip_flashmla_backend,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
@@ -838,6 +839,7 @@ class DeepseekV4HipRadixBackend(
     ):
         super().__init__()
         self.device = torch.device(model_runner.device)
+        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -921,6 +923,7 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
+        self._verify_mask: Optional[VerifyMask] = None
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
         # Decode and speculative metadata can be rebuilt from device lengths.
         # The online c128 planner still consumes CPU lengths.
@@ -2304,7 +2307,21 @@ class DeepseekV4HipRadixBackend(
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(live)
         self.forward_metadata = capture_metadata
 
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        # verify metadata never reads the tree mask, so EAGLE builds it QLEN_ONLY
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_worker,
+            skip_prefill=False,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
