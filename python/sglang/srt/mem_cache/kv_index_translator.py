@@ -59,6 +59,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
+    kv_indices_num_token_blocks,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
@@ -231,7 +232,11 @@ class KVIndexTranslator:
         req_pool_indices = req_pool_indices[:bs]
 
         if not self.reads_are_translated:
-            create_flashinfer_kv_indices_triton[(bs,)](
+            # Runs every decode step: one program per request crawls a long context serially.
+            num_token_blocks = kv_indices_num_token_blocks(
+                self.req_to_token.size(1), bs
+            )
+            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
                 self.req_to_token,
                 req_pool_indices,
                 seq_lens,
@@ -240,6 +245,7 @@ class KVIndexTranslator:
                 out,
                 self.req_to_token.stride(0),
                 ENTRY_PAGE_SIZE=1,
+                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             )
             return False
 
