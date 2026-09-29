@@ -32,6 +32,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.graph_shape_stats import record_graph_replay
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -543,6 +544,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+        record_graph_replay(
+            runner="eagle_draft",
+            mode="DRAFT",
+            live_rows=raw_bs * self.captured_req_width,
+            captured_rows=bs * self.captured_req_width,
+        )
 
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)

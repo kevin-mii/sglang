@@ -83,6 +83,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.graph_shape_stats import record_graph_replay
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -1359,6 +1360,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
+        record_graph_replay(
+            runner="decode",
+            mode=forward_batch.forward_mode.name,
+            live_rows=raw_num_token,
+            captured_rows=padded_num_tokens,
+        )
 
         self.buffer_registry.fill_from(
             forward_batch,
