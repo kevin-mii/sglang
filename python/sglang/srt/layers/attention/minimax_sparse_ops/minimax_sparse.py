@@ -347,6 +347,8 @@ def minimax_sparse_decode(
         and block_size_k == 128
         and topk == 16
         and dense_main_attn_fn is None
+        # CP packs at most 4 rows x 4 heads per 16-row tile; larger packs stay native
+        and packed_queries <= 4
         and indexer_cp.supports(idx_q, idx_k_cache, max_seqlen, req_to_token)
     ):
         idx_o = real_seq_lens = None
@@ -362,6 +364,7 @@ def minimax_sparse_decode(
             idx_sm_scale,
             idx_q_scale,
             idx_k_scale,
+            packed_queries=packed_queries,
         )
         _skip_reduce = True
     else:

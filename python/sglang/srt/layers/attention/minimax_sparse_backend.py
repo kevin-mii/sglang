@@ -1577,6 +1577,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             cached_topk_idx=cached_topk,
             topk_out=topk_buf if publish_topk else None,
             packed_queries=int(row_meta.packed) if disable_value else 1,
+            indexer_cp=self.indexer_cp,
         )
         return idx_o, o
 
@@ -1677,6 +1678,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             topk_out=topk_buf if publish_topk else None,
             # packing is a score-only shortcut, so value layers stay per-row
             packed_queries=int(ndt) if disable_value else 1,
+            indexer_cp=self.indexer_cp,
         )
         return idx_o, o
 

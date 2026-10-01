@@ -1,4 +1,7 @@
-"""Opt-in, decode-only context partitioning of MiniMax's replicated index K.
+"""Opt-in context partitioning of MiniMax's replicated index K for decode and EAGLE chain verify.
+
+Verify rows reach the indexer as ordinary decode queries (each row carries its request slot and its own
+causal length), so the same path serves both.
 
 This first implementation gathers the existing post-RoPE index queries rather
 than changing checkpoint loading or fused projections. Both gathers go through
@@ -28,7 +31,7 @@ def unsupported_reason(
     score_type,
     max_context_len,
     radix_topk,
-    speculative,
+    draft_is_chain,
     tbo,
     hisparse,
     fp8_query,
@@ -45,11 +48,23 @@ def unsupported_reason(
         return "requires max scores and the ROCm radix top-k tie ordering"
     if not 0 < max_context_len <= 16384 * 128:
         return "context length exceeds the ROCm radix selector contract"
-    if speculative:
-        return "speculative verification is not implemented"
+    if not draft_is_chain:
+        return "verify rows must be chain drafts: no speculation, or EAGLE with top-k 1"
     if tbo or hisparse or fp8_query or dense_sparse_decode:
         return "TBO, HiSparse, FP8 queries, and dense sparse decode are unsupported"
     return None
+
+
+def draft_is_chain_layout(algorithm, eagle_topk):
+    """Whether verify rows reach the indexer as independent chain rows.
+
+    Allowlisted, not tree-denylisted: an unrecognized algorithm (DSPARK's ragged
+    verify, NGRAM's tree-in-mask) must disable CP rather than silently mis-score.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(algorithm)
+    return algo.is_none() or (algo.is_eagle() and (eagle_topk or 1) == 1)
 
 
 def make_indexer_cp(backend, runner, sparse_cfg):
@@ -62,6 +77,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
     from sglang.srt.utils import is_hip
 
     parallel = get_parallel()
+    spec = get_spec()
     arch = (
         torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
         if is_hip()
@@ -74,14 +90,16 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         attn_cp_size=parallel.attn_cp_size,
         attn_dp_size=parallel.attn_dp_size,
         index_heads=sparse_cfg["sparse_num_index_heads"],
-        kv_heads=runner.model_config.hf_config.num_key_value_heads,
+        kv_heads=runner.model_config.get_total_num_kv_heads(),
         head_dim=backend.idx_head_dim,
         block_size=backend.block_size_k,
         topk=backend.topk_blocks,
         score_type=backend.score_type,
         max_context_len=backend.max_context_len,
         radix_topk=envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get(),
-        speculative=get_spec().speculative_algorithm is not None,
+        draft_is_chain=draft_is_chain_layout(
+            spec.speculative_algorithm, spec.speculative_eagle_topk
+        ),
         tbo=is_tbo_enabled(),
         hisparse=backend.hisparse_coordinator is not None,
         fp8_query=backend.fp8_attn_gemm,
@@ -93,7 +111,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
     cp = MiniMaxIndexerCP(parallel.attn_tp_group)
     cp.warmup()
     logger.info(
-        "MiniMax indexer CP enabled: TP4, decode-only, replicated index cache, "
+        "MiniMax indexer CP enabled: TP4, decode and chain verify, replicated index cache, "
         "query gather + candidate gather, top-k 16; index-value layers use TP"
     )
     return cp
@@ -147,6 +165,7 @@ class MiniMaxIndexerCP:
         sm_scale=None,
         q_scale=None,
         k_scale=None,
+        packed_queries=1,
     ):
         from sglang.kernels.ops.attention.minimax_sparse.decode.indexer_cp import (
             merge_candidates,
@@ -174,6 +193,7 @@ class MiniMaxIndexerCP:
             local_blocks,
             sm_scale,
             1.0 if k_scale is None else k_scale,
+            packed_queries=packed_queries,
         )
         keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
         received = torch.empty((4, 4, batch, 16), dtype=torch.int64, device=q.device)

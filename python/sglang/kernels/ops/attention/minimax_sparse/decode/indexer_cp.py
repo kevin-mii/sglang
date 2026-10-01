@@ -9,6 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
+# Rows per scoring tile. Distinct from the literal 16 in the `num_blocks > 16` tests,
+# which is the selector's top-k; the two are equal only by coincidence.
+TILE_ROWS = 16
+
 
 @triton.jit
 def _score_shard(
@@ -89,6 +93,107 @@ def _score_shard(
             Scores + (heads * BATCH + row) * LOCAL_BLOCKS + local,
             score,
             mask=heads < WORLD,
+        )
+
+
+@triton.jit
+def _score_shard_packed(
+    Q,
+    K,
+    ReqToToken,
+    Slots,
+    Lengths,
+    Scores,
+    BATCH: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    PACK: tl.constexpr,
+    TILE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    LOCAL_BLOCKS: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr,
+    Q_ROW_STRIDE: tl.constexpr,
+    K_SLOT_STRIDE: tl.constexpr,
+    K_DIM_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    TABLE_ROWS: tl.constexpr,
+    CACHE_SLOTS: tl.constexpr,
+    BLOCKS_PER_CHUNK: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    LOCAL_KEEP: tl.constexpr,
+    sm_scale,
+    k_scale,
+):
+    # One program scores the PACK consecutive verify rows of one request: tile row i is
+    # (draft row i // WORLD, head i % WORLD), so each K block is read once per request.
+    # Deliberately not merged with _score_shard as its PACK=1 case: the vector row
+    # addressing that buys is 3.6% slower on every decode step (30/30 shapes, MI350X).
+    group, chunk = tl.program_id(0), tl.program_id(1)
+    tile = tl.arange(0, TILE)
+    head, sub = tile % WORLD, tile // WORLD
+    in_tile = tile < PACK * WORLD
+    rows = group * PACK + sub
+    dims = tl.arange(0, 128)
+    positions = tl.arange(0, 128)
+    lengths = tl.load(Lengths + rows, mask=in_tile, other=0)
+    group_len = tl.max(lengths, 0)
+    # Caller contract: rows group*PACK .. group*PACK+PACK-1 are one request's draft rows,
+    # so one slot and the group's longest length address K for the whole tile.
+    request = tl.load(Slots + group * PACK).to(tl.int64)
+    # Match the native scorer's request/slot addressing, including padding.
+    request = (request + CACHE_SLOTS) % CACHE_SLOTS
+    active = (lengths > 0) & (request >= 0) & (request < TABLE_ROWS) & in_tile
+    num_blocks = tl.cdiv(lengths, 128)
+    local_start = tl.maximum(0, num_blocks - LOCAL_KEEP)
+    q = tl.load(
+        Q
+        + head[:, None] * Q_HEAD_STRIDE
+        + rows[:, None] * Q_ROW_STRIDE
+        + dims[None, :],
+        mask=in_tile[:, None],
+        other=0,
+    )
+    start = chunk * BLOCKS_PER_CHUNK
+    end = tl.minimum(start + BLOCKS_PER_CHUNK, LOCAL_BLOCKS)
+    for local in range(start, end):
+        block = local * WORLD + RANK
+        valid = active & (block < MAX_BLOCKS) & (block < num_blocks)
+        # At <=top-k blocks the native selector emits every block without
+        # reading scores. In particular, graph padding need not read K.
+        score = tl.full((TILE,), 0.0, tl.float32)
+        # Rows in a tile have different lengths, so this branch (which must be scalar)
+        # takes the group max; the per-row rule comes back via num_blocks below.
+        group_blocks = tl.cdiv(group_len, 128)
+        if (block < group_blocks) & (group_blocks > 16):
+            pos = block * 128 + positions
+            token_valid = pos < group_len
+            slots = tl.load(
+                ReqToToken + request * TABLE_STRIDE + pos,
+                mask=token_valid,
+                other=0,
+            ).to(tl.int64)
+            slots = (slots + CACHE_SLOTS) % CACHE_SLOTS
+            k = tl.load(
+                K + dims[:, None] * K_DIM_STRIDE + slots[None, :] * K_SLOT_STRIDE,
+                mask=token_valid[None, :],
+                other=0.0,
+            ).to(q.dtype)
+            # Preserve the baseline's dot orientation and scale order.
+            dot = tl.dot(q, k) * (sm_scale * 1.4426950409 * k_scale)
+            dot = tl.where(pos[None, :] < lengths[:, None], dot, float("-inf"))
+            scored = tl.max(dot, 1)
+            scored = tl.where(
+                block >= local_start,
+                1e29,
+                tl.where(block < INIT_BLOCKS, 1e30, scored),
+            )
+            score = tl.where(num_blocks > 16, scored, 0.0)
+        score = tl.where(valid, score, float("-inf"))
+        # Every slot is written on every replay, including empty shards.
+        tl.store(
+            Scores + (head * BATCH + rows) * LOCAL_BLOCKS + local,
+            score,
+            mask=in_tile,
         )
 
 
@@ -190,14 +295,53 @@ def score_local_blocks(
     local_blocks,
     sm_scale,
     k_scale,
+    packed_queries=1,
 ):
-    """Score [world,batch,128] queries through SGLang's token-slot mapping."""
+    """Score [world,batch,128] queries through SGLang's token-slot mapping.
+
+    ``packed_queries > 1``: rows come in groups of that many consecutive verify rows of one
+    request (same slot), scored per K block together.
+    """
     world, batch, _ = gathered_q.shape
     blocks = triton.cdiv(max_seqlen, 128)
     local = triton.cdiv(blocks, world)
     scores = torch.empty(
         (world, batch, local), dtype=torch.float32, device=gathered_q.device
     )
+    pack = packed_queries
+    if pack > 1 and batch % pack == 0 and pack * world <= TILE_ROWS:
+        groups = batch // pack
+        chunks = min(local, max(1, min(256, 4096 // max(groups, 1))))
+        _score_shard_packed[(groups, chunks)](
+            gathered_q,
+            k_cache,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            scores,
+            BATCH=batch,
+            WORLD=world,
+            RANK=rank,
+            PACK=pack,
+            TILE=TILE_ROWS,
+            MAX_BLOCKS=blocks,
+            LOCAL_BLOCKS=local,
+            Q_HEAD_STRIDE=gathered_q.stride(0),
+            Q_ROW_STRIDE=gathered_q.stride(1),
+            K_SLOT_STRIDE=k_cache.stride(0),
+            K_DIM_STRIDE=k_cache.stride(2),
+            TABLE_STRIDE=req_to_token.stride(0),
+            TABLE_ROWS=req_to_token.shape[0],
+            CACHE_SLOTS=k_cache.shape[0],
+            BLOCKS_PER_CHUNK=triton.cdiv(local, chunks),
+            INIT_BLOCKS=init_blocks,
+            LOCAL_KEEP=local_blocks,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            num_warps=4,
+            num_stages=1,
+        )
+        return scores
     chunks = min(local, max(1, min(256, 4096 // max(batch, 1))))
     if batch:
         _score_shard[(batch, chunks)](

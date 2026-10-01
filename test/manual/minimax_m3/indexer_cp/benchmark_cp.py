@@ -35,7 +35,7 @@ def setup():
         rank,
         "nccl",
         use_pynccl=True,
-        use_mscclpp=False,
+        use_pymscclpp=False,
         use_custom_allreduce=True,
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
