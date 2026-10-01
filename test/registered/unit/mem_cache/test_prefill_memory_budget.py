@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -59,6 +59,26 @@ def _cache():
         swa_evictable_size=lambda: 0,
         is_chunk_cache=lambda: False,
     )
+
+
+class TestSinglePoolChunkContinuation(unittest.TestCase):
+    def _budget(self, available, decode_headroom):
+        allocator = SimpleNamespace(page_size=1, available_size=lambda: available)
+        cache = SimpleNamespace(supports_mamba=lambda: False, evictable_size=lambda: 0)
+        budget = PrefillBudget(allocator, cache)
+        budget.total_offset += decode_headroom
+        return budget
+
+    def test_continuation_never_claims_tokens_the_pool_lacks(self):
+        """Running requests' decode headroom exceeding the pool made a chunked
+        continuation claim a whole chunk the allocator could not provide (OOM crash)."""
+        budget = self._budget(available=104, decode_headroom=10_000)
+        self.assertLessEqual(budget.available_chunk_tokens(8192), 104)
+        self.assertIsNone(
+            self._budget(available=1, decode_headroom=10_000).available_chunk_tokens(
+                8192
+            )
+        )
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):
