@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -68,6 +68,31 @@ def _cache():
         swa_evictable_size=lambda: 0,
         supports_prefix_sharing=lambda: True,
     )
+
+
+class TestSinglePoolChunkContinuation(unittest.TestCase):
+    def _budget(self, available, page_size=1):
+        allocator = SimpleNamespace(
+            page_size=page_size, available_size=lambda: available
+        )
+        cache = SimpleNamespace(supports_mamba=lambda: False, evictable_size=lambda: 0)
+        budget = PrefillBudget(allocator, cache)
+        # Decode headroom far larger than the pool drives remaining_total negative.
+        budget.total_offset += 10_000
+        return budget
+
+    def test_continuation_never_claims_tokens_the_pool_lacks(self):
+        """A chunked continuation used to claim the whole chunk once decode headroom
+        exceeded the pool, so alloc_token_slots was asked for slots that did not exist."""
+        for page_size in (1, 16):
+            with self.subTest(page_size=page_size):
+                claimed = self._budget(104, page_size).available_chunk_tokens(8192)
+                self.assertLessEqual(claimed, 104)
+                self.assertEqual(claimed % page_size, 0)
+
+    def test_continuation_waits_when_no_whole_page_is_free(self):
+        self.assertIsNone(self._budget(1).available_chunk_tokens(8192))
+        self.assertIsNone(self._budget(16, page_size=16).available_chunk_tokens(8192))
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):
