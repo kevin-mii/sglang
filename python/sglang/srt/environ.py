@@ -463,6 +463,8 @@ class Envs:
     # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
+    # Path prefix: TP rank 0 writes a histogram of graph-replay (live, captured) rows.
+    SGLANG_GRAPH_SHAPE_STATS = EnvStr(None)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
