@@ -161,3 +161,34 @@ Final server: `opt/combined`, `rebase_0923/serve_m3.sh` flags + node hostcall kn
 17 18 20 22 24 26 28 30 32 33 35 37 40 44 48`; drop the checkpoint from the page cache during startup (`drop_weight_cache.py`), or the
 host budget check fails. With one HiCache server per box and all page cache dropped, `--hicache-size 300` adds another
 ~5% at c=48. Results: `/scratch/m3/results/opt0929/`.
+
+## Post-merge A/Bs and lever sweep (2026-10-03 .. 10-05)
+
+All side by side on the two TP4 halves, same day, 900 s per point, TOPK_FREQ=1, real acceptance.
+A/A noise is ~1% within a round; identical baselines drift ~3% between rounds, so each lever is read
+only against its own round's baseline.
+
+| Experiment | c | Baseline | Variant | Verdict |
+|---|---:|---:|---:|---|
+| Packed CP scorer (unpacked = merged main) | 24 | 26,576 unpacked | **28,380 packed (+6.8%)** | port it |
+| | 32 | 32,294 unpacked | **34,282 packed (+6.2%)** | ITL p50 17.1 -> 12.7 ms |
+| PR B: token-block-parallel kv-indices | 24 | 28,858 off | 28,185 on (-2.3%) | dropped, no gain |
+| `--max-running-requests 64` (hicache 150 GB) | 48 | 32,100 | 30,105 (-6.2%) | rejected: more live KV, more evictions |
+| `--mem-fraction-static 0.9` (hicache 150 GB) | 40 | 34,852 | 34,177 (-1.9%) | rejected: TTFT better, ITL worse |
+| `--chunked-prefill-size 16384` (hicache 150 GB) | 40 | 36,024 | 35,725 (-0.8%) | rejected: noise |
+| Prefill-budget fix removed (hicache 300 GB) | 48 | 40,943 with | 39,926 without, 0 errors | fix not needed with the CPU tier |
+
+Merged main (#41488, #42166) runs CP *unpacked*: our published +10.8% at c=24 was packed CP; merged
+main delivers ~+4.5% until the packed scorer lands (`feat/m3-indexer-cp-packed-verify`, 2 commits on main).
+
+Draft depth was not run: acceptance is 2.65 tokens/verify, and 5 draft rows x 4 heads overflows the
+16-row CP tile, which turns packing off. Every production lever in `M3_MI350X_STATUS.md` is on and
+verified not to fall back (custom AR, quick-reduce INT4, Gluon prefill, extend-long-prefix, fairness
+0.5, kv-splits 64, breakable prefill graphs); its lossy levers (TOPK_FREQ 4, forced acceptance, fp4
+MoE activations) stay off, and its structural ones (EP, TP2xDP2, Gluon no-copy, aiter glue fusion)
+were already ruled out with measurements.
+
+**Best config (unchanged by the sweep):** packed CP + `rebase_0923/serve_m3.sh` defaults (mem 0.85,
+chunk 8192, maxrun 48, EAGLE3 3/4) + TOPK_FREQ=1; c>=40 add `--enable-hierarchical-cache --hicache-size
+300 --radix-eviction-policy lru` (one per box, page cache dropped first); c<=32 tier off and the tuned
+`--cuda-graph-bs-decode` list. c=48 40,943 / c=40 36,771 / c=32 34,282-35,392 / c=24 28,380-28,844.
