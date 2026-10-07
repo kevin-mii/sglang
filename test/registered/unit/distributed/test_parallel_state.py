@@ -148,6 +148,7 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator._fi_workspace_hint = None
     coordinator.ca_comm = Mock(disabled=False)
     coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.small_ca_comm = None
     coordinator.pynccl_comm = Mock()
     coordinator.pynccl_comm.change_state.return_value = nullcontext()
     coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
@@ -170,6 +171,89 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
         outplace_all_reduce_method="ca",
     )
     coordinator.pynccl_comm.all_reduce.assert_not_called()
+
+
+def _small_message_coordinator(max_bytes, small_disabled=False):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.qr_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.pynccl_comm = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.small_ca_comm = Mock(disabled=small_disabled)
+    coordinator.small_ca_comm.should_custom_ar.return_value = True
+    coordinator._small_ca_max_bytes = max_bytes
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "rows, small_disabled, expected",
+    [
+        (8, False, "ca_small"),  # 96 KB
+        (16, False, "ca_small"),  # 192 KB, at the threshold
+        (17, False, "ca"),  # 204 KB, above it
+        (8, True, "ca"),  # a disabled small communicator falls through
+    ],
+)
+def test_small_message_all_reduce_routes_by_size(rows, small_disabled, expected):
+    coordinator = _small_message_coordinator(16 * 6144 * 2, small_disabled)
+    input_ = torch.empty((rows, 6144), dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == expected
+
+
+def test_small_message_all_reduce_dispatches_to_its_communicator():
+    coordinator = _small_message_coordinator(1 << 20)
+    input_ = torch.empty((4, 6144), dtype=torch.bfloat16)
+    out = coordinator._all_reduce_out_place(input_, "auto")
+    assert out is coordinator.small_ca_comm.custom_all_reduce.return_value
+    coordinator.small_ca_comm.custom_all_reduce.assert_called_once_with(input_)
+    coordinator.ca_comm.custom_all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "is_hip, max_size_kb, one_stage_everywhere, built",
+    [
+        (True, 256, False, True),
+        (False, 256, False, False),
+        (True, 0, False, False),
+        # ca_comm already runs the 1-stage kernel at every size
+        (True, 256, True, False),
+    ],
+)
+def test_small_message_communicator_built_only_when_useful(
+    is_hip, max_size_kb, one_stage_everywhere, built
+):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.ca_comm = Mock()
+    coordinator.cpu_group = Mock()
+    coordinator.device = Mock()
+    coordinator._small_ca_max_bytes = 0
+    car_module = "sglang.srt.distributed.device_communicators.custom_all_reduce"
+    with (
+        patch.object(parallel_state, "is_hip", return_value=is_hip),
+        patch(f"{car_module}.CustomAllreduce") as car_cls,
+        patch(
+            f"{car_module}._use_amd_deterministic_impl",
+            return_value=one_stage_everywhere,
+        ),
+        parallel_state.envs.SGLANG_CUSTOM_ALL_REDUCE_1STAGE_MAX_SIZE_KB.override(
+            max_size_kb
+        ),
+    ):
+        comm = coordinator._make_small_message_ca_comm()
+    if built:
+        assert comm is car_cls.return_value
+        assert comm.use_amd_deterministic_impl is True
+        assert coordinator._small_ca_max_bytes == max_size_kb * 1024
+    else:
+        assert comm is None
+        car_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
