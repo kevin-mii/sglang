@@ -1195,12 +1195,16 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
-        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        # The kernel casts K/V to an fp8 main cache itself; other quantized
+        # caches (e.g. FP4) keep the separate store.
+        main_kv_dtype_ok = kv_pool is not None and (
+            kv_pool.dtype == q.dtype or kv_pool.dtype in _FP8_KV_DTYPES
+        )
         can_use_cache_fusion = (
-            not main_kv_is_fp8
+            main_kv_dtype_ok
             and idx_v is None
+            # the index-K cache store does not apply a scale
+            and self.attn.idx_k_scale_float is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
             )
@@ -1209,7 +1213,7 @@ class MiniMaxM3Attention(nn.Module):
             and v.dtype == q.dtype
             and v.shape == k.shape
         )
-        if can_use_cache_fusion and kv_pool is not None:
+        if can_use_cache_fusion:
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
@@ -1233,6 +1237,8 @@ class MiniMaxM3Attention(nn.Module):
                 self.head_dim,
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
+                k_scale=self.attn.k_scale_float,
+                v_scale=self.attn.v_scale_float,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k

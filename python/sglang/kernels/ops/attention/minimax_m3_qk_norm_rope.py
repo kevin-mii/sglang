@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused MiniMax-M3 per-head Gemma Q/K RMSNorm + partial RoPE for ROCm."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -370,6 +371,24 @@ def sparse_qk_index_gemma_rmsnorm_rope(
 
 
 @triton.jit
+def _scale_cast_to_cache(x, inv_scale, cache_ptr, SCALED: tl.constexpr):
+    # Same bytes as MHATokenToKVPool.set_kv_buffer: torch divides the bf16/fp16
+    # tensor by a Python scalar as x * (1/scale) in fp32, rounds, then casts.
+    if SCALED:
+        x = (x.to(tl.float32) * inv_scale).to(x.dtype)
+    return x.to(cache_ptr.dtype.element_ty)
+
+
+def _cache_inv_scale(
+    scale: Optional[float], x: torch.Tensor, cache: torch.Tensor
+) -> Optional[float]:
+    # As in set_kv_buffer, a scale applies only where the store casts; None is unit.
+    if scale is None or x.dtype == cache.dtype:
+        return None
+    return float(np.float32(1.0) / np.float32(scale))
+
+
+@triton.jit
 def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     q_ptr,
     k_ptr,
@@ -384,6 +403,8 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     v_cache_ptr,
     idx_k_cache_ptr,
     loc_ptr,
+    k_inv_scale,
+    v_inv_scale,
     q_weight_ptr,
     k_weight_ptr,
     idx_q_weight_ptr,
@@ -416,6 +437,8 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     rotary_dim: tl.constexpr,
     eps: tl.constexpr,
     is_neox_style: tl.constexpr,
+    K_SCALED: tl.constexpr,
+    V_SCALED: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -534,23 +557,34 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     tl.store(base_out + cols, out_typed, mask=mask)
 
     loc = tl.load(loc_ptr + token_id)
+    # Like store_cache, the main K/V store skips the reserved cuda-graph padding
+    # slot 0 (padding rows may hold NaN); the K-only index scatter writes it.
+    store_kv = mask & is_k & (loc != 0)
     cache_k_base = (
         k_cache_ptr
         + loc * k_cache_stride_s
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
-    tl.store(cache_k_base, out_typed, mask=mask & is_k)
+    tl.store(
+        cache_k_base,
+        _scale_cast_to_cache(out_typed, k_inv_scale, k_cache_ptr, K_SCALED),
+        mask=store_kv,
+    )
 
     v_base = v_ptr + token_id * v_stride_m + head_id * head_dim * v_stride_d
-    v_val = tl.load(v_base + cols * v_stride_d, mask=mask & is_k, other=0.0)
+    v_val = tl.load(v_base + cols * v_stride_d, mask=store_kv, other=0.0)
     cache_v_base = (
         v_cache_ptr
         + loc * v_cache_stride_s
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
-    tl.store(cache_v_base, v_val, mask=mask & is_k)
+    tl.store(
+        cache_v_base,
+        _scale_cast_to_cache(v_val, v_inv_scale, v_cache_ptr, V_SCALED),
+        mask=store_kv,
+    )
 
     is_idx_k = head_program == idx_k_program
     idx_cache_base = (
@@ -584,8 +618,14 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
+    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores.
+
+    The caches may be fp8; K/V are then divided by their per-tensor scales
+    (``None`` is unit) before the cast, as the unfused pool store does.
+    """
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
     assert k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3
     assert out_cache_loc.dim() == positions.dim() == 1
@@ -609,6 +649,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     idx_q_out = torch.empty(idx_q.shape, dtype=idx_q.dtype, device=idx_q.device)
     idx_k_out = torch.empty(idx_k.shape, dtype=idx_k.dtype, device=idx_k.device)
     block_hd = triton.next_power_of_2(head_dim)
+    k_inv_scale = _cache_inv_scale(k_scale, k, k_cache)
+    v_inv_scale = _cache_inv_scale(v_scale, v, v_cache)
 
     _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel[
         (q.shape[0], q_heads + k_heads + idx_q_heads + 1)
@@ -626,6 +668,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         v_cache,
         idx_k_cache,
         out_cache_loc,
+        1.0 if k_inv_scale is None else k_inv_scale,
+        1.0 if v_inv_scale is None else v_inv_scale,
         q_weight,
         k_weight,
         idx_q_weight,
@@ -658,6 +702,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         rotary_dim,
         eps,
         is_neox_style,
+        K_SCALED=k_inv_scale is not None,
+        V_SCALED=v_inv_scale is not None,
         BLOCK_HD=block_hd,
         num_warps=4,
     )
