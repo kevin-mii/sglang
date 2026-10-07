@@ -95,8 +95,8 @@ def store_cache(
             when 0; it is the only knob here that exists purely for tuning.
         size_limit (int): Valid slot bound (cache row count = real slots + the
             reserved padding slot); an index outside [0, size_limit) fails fast
-            (device assert) instead of an illegal memory access. Defaults to the
-            cache row count when 0.
+            (device assert) instead of an illegal memory access, or on ROCm is
+            skipped. Defaults to the cache row count when 0.
         reserved_skip_index (int): If nonnegative, writes targeting this index
             are skipped. Defaults to the reserved CUDA-graph padding slot 0;
             pass -1 to disable skipping.
