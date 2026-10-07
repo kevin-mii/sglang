@@ -392,6 +392,13 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
+            packed_queries=packed_queries,
+            # without a head reduction the kernel's top-k is the published one
+            topk_idx_out=(
+                topk_out
+                if dense_main_attn_fn is None and idx_q.shape[1] == k_cache.shape[1]
+                else None
+            ),
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -417,7 +424,8 @@ def minimax_sparse_decode(
                     f"topk_out shape {tuple(topk_out.shape)} does not match "
                     f"reduced top-k shape {tuple(topk_idx.shape)}"
                 )
-            topk_out.copy_(topk_idx)
+            if topk_idx is not topk_out:
+                topk_out.copy_(topk_idx)
         hisparse_slots = (
             hisparse_swap_in_fn(topk_idx) if hisparse_swap_in_fn is not None else None
         )
