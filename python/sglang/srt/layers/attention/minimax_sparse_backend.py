@@ -1455,18 +1455,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     SMALL_EXTEND_MAX_TOKENS = 8
 
     def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
-        extend_lens = forward_batch.extend_seq_lens_cpu
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return False
+        # Graph replay views (e.g. target verify) may not carry the extend fields.
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         return (
             not self.is_npu
             # forward_decode's MSA / dense-main / hisparse paths need decode metadata
             and not self._use_msa_decode
             and not self.use_dense_sparse_decode
             and self.hisparse_coordinator is None
-            and forward_batch.forward_mode == ForwardMode.EXTEND
             and extend_lens is not None
             and len(extend_lens) > 0
             and max(extend_lens) <= self.SMALL_EXTEND_MAX_TOKENS
-            and forward_batch.extend_prefix_lens_cpu is not None
+            and getattr(forward_batch, "extend_prefix_lens_cpu", None) is not None
         )
 
     def _small_extend_row_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:

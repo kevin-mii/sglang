@@ -126,6 +126,23 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
 
 @unittest.skipUnless(torch.version.hip, "ROCm verify integration")
 class TestMiniMaxSmallExtendRows(unittest.TestCase):
+    def test_replay_views_without_extend_fields_are_not_small_extend(self):
+        """Graph replay views (target verify, decode) carry no extend fields and must not raise."""
+        from sglang.srt.layers.attention.minimax_sparse_backend import (
+            MiniMaxSparseAttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
+        backend.is_npu = False
+        backend._use_msa_decode = False
+        backend.use_dense_sparse_decode = False
+        backend.hisparse_coordinator = None
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DECODE, ForwardMode.EXTEND):
+            with self.subTest(mode=mode):
+                view = SimpleNamespace(forward_mode=mode)
+                self.assertFalse(backend._is_small_extend(view))
+
     def test_decode_rows_match_sparse_prefill(self):
         """Each flattened row must attend exactly its causal prefix, as the prefill path does."""
         from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
