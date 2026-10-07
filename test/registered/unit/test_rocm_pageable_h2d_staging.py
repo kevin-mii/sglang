@@ -7,6 +7,7 @@ operator who has tuned the threshold must keep their value.
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.platform_hook import handle_amd_specifics
@@ -40,7 +41,7 @@ class TestRocmPageableH2DStaging(CustomTestCase):
             ),
             patch("sglang.srt.arg_groups.platform_hook.declare_resolution"),
         ):
-            handle_amd_specifics(object())
+            handle_amd_specifics(SimpleNamespace(triton_attention_num_kv_splits=8))
 
     def test_set_on_hip(self):
         self._run(is_hip=True)
