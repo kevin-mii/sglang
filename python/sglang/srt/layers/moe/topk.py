@@ -1672,6 +1672,37 @@ def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
     return _is_cuda and not _use_aiter and scoring_func == "sqrtsoftplus"
 
 
+def _aiter_sigmoid_gate_writes_shared_slot(
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    routing_overridden: bool,
+) -> bool:
+    # moe_fused_gate writes each shared column as id num_experts + i with weight
+    # (sum / rsf) / sum * rsf, which is exactly 1.0 only for a power-of-two rsf.
+    # Every condition below is one under which fused_append_shared_experts would
+    # write that same row, so the gate's own column can replace the append launch.
+    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    rsf = topk_config.routed_scaling_factor or 1.0
+    return (
+        _use_aiter
+        and num_fused_shared_experts > 0
+        and not has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        and topk_config.scoring_func == "sigmoid"
+        and not topk_config.use_grouped_topk
+        and not topk_config.torch_native
+        and topk_config.custom_routing_function is None
+        and topk_config.renormalize
+        and topk_config.apply_routed_scaling_factor_on_output
+        and math.frexp(rsf)[0] == 0.5
+        and topk_config.fused_shared_experts_scaling_factor in (None, 1.0)
+        and num_token_non_padded is None
+        and expert_location_dispatch_info is None
+        and not routing_overridden
+        and not _eplb_remap_enabled()
+    )
+
+
 def _fused_gate_emits_packed_ids(
     scoring_func: str,
     num_fused_shared_experts: int,
@@ -2599,6 +2630,17 @@ def select_experts(
         if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
         else num_fused_shared_experts
     )
+    num_routed_topk_for_gate = num_routed_topk if _use_aiter else top_k
+    if dynamic_expert_bias is None and _aiter_sigmoid_gate_writes_shared_slot(
+        topk_config,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        routing_overridden=routing_overridden,
+    ):
+        # The JIT sigmoid gate below writes the shared column, so
+        # _post_process_topk_ids sees a full-width row and skips the append launch.
+        num_fused_shared_experts_for_gate = num_fused_shared_experts
+        num_routed_topk_for_gate = top_k
     if dynamic_expert_bias is not None:
         if scoring_func != "sigmoid":
             raise ValueError(
@@ -2699,7 +2741,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk_for_gate,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts_for_gate,
