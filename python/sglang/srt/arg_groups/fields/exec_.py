@@ -317,7 +317,7 @@ class ExecKernel(msgspec.Struct):
     ] = False
     triton_attention_num_kv_splits: A[
         int,
-        "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+        "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8 (16 on ROCm).",
     ] = 8
     triton_attention_split_tile_size: A[
         Optional[int],
