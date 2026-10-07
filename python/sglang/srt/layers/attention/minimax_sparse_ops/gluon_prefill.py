@@ -9,8 +9,8 @@ context is gathered into persistent SHUFFLE 5D scratch pages:
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize``. Each request occupies a contiguous,
-position-ordered page range rounded up to whole sparse blocks.
+with ``x = 16 // dtype.itemsize`` (8 for bf16, 16 for an fp8 pool). Each request
+occupies a contiguous, position-ordered page range rounded up to whole sparse blocks.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
@@ -36,9 +37,9 @@ HEAD_DIM = 128
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# 512 MiB per buffer at bf16 (~2.1M context tokens per forward); past it the caller
-# falls back to the Triton kernel, which reads the pool in place.
-_MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
+# 512 MiB per buffer (~2.1M context tokens per forward at bf16, ~4.2M at fp8); past
+# it the caller falls back to the Triton kernel, which reads the pool in place.
+_MAX_SCRATCH_BYTES = 512 * 1024 * 1024
 
 
 class GluonPrefillUnavailableError(RuntimeError):
@@ -353,6 +354,15 @@ def _unit_or_none(scale) -> bool:
     return scale is None or scale == 1.0
 
 
+def _kv_dtype_supported(
+    q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> bool:
+    if k_cache.dtype != v_cache.dtype:
+        return False
+    # An fp8 pool with a bf16/fp16 q is dequantized in-register with per-tensor scales.
+    return k_cache.dtype in (q.dtype, fp8_dtype)
+
+
 def can_use_gluon_prefill(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -373,8 +383,8 @@ def can_use_gluon_prefill(
         or block_size_k != SPARSE_BLOCK_SIZE
     ):
         return False
-    # The gather requires a contiguous, single-head NHD pool. Calibrated and
-    # unsupported cache formats stay on the Triton path.
+    # The gather requires a contiguous, single-head NHD pool; other cache
+    # formats and calibrated q / same-dtype K/V stay on the Triton path.
     return (
         q.dim() == 3
         and q.shape[-1] == HEAD_DIM
@@ -385,13 +395,15 @@ def can_use_gluon_prefill(
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k_cache.dtype == q.dtype
-        and v_cache.dtype == q.dtype
+        and _kv_dtype_supported(q, k_cache, v_cache)
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
-        and _unit_or_none(k_scale)
-        and _unit_or_none(v_scale)
+        # Only an fp8 pool forwards k/v scales to the kernel.
+        and (
+            k_cache.dtype == fp8_dtype
+            or (_unit_or_none(k_scale) and _unit_or_none(v_scale))
+        )
     )
 
 
@@ -409,6 +421,8 @@ def gluon_sparse_prefill(
     seq_lens_cpu: torch.Tensor,
     block_size_k: int,
     sm_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Run Gluon sparse prefill over the NHD KV pool via the SHUFFLE scratch.
 
@@ -435,10 +449,11 @@ def gluon_sparse_prefill(
             cu_seqlens, prefix_lens, seq_lens, seq_lens_cpu, total_q
         )
     )
-    if total_pages > _MAX_SCRATCH_PAGES:
+    max_pages = _MAX_SCRATCH_BYTES // (_PAGE_ELEMS * k_cache.dtype.itemsize)
+    if total_pages > max_pages:
         raise GluonPrefillUnavailableError(
             f"gluon prefill context span too large for scratch: {total_pages} pages "
-            f"> cap {_MAX_SCRATCH_PAGES}"
+            f"> cap {max_pages}"
         )
 
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
@@ -456,6 +471,16 @@ def gluon_sparse_prefill(
     sparse_bt, sparse_ctx = _build_gluon_sparse_bt_prefill(
         topk_idx, req_id, abs_pos, page_start, block_size_k
     )
+
+    key_scale = value_scale = None
+    if k_cache.dtype == fp8_dtype:
+        # Per-tensor fp32 [1] dequant scales (the kernel's kv_quant_mode 0).
+        key_scale, value_scale = (
+            torch.full(
+                (1,), 1.0 if s is None else s, dtype=torch.float32, device=q.device
+            )
+            for s in (k_scale, v_scale)
+        )
 
     out = torch.empty_like(q)
     num_seqs = total_q
@@ -480,8 +505,8 @@ def gluon_sparse_prefill(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
