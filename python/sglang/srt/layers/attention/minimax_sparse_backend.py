@@ -23,6 +23,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -162,6 +165,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
         self._linear_verify_meta: Optional[SimpleNamespace] = None
+        # (owning ForwardBatch, per-row view) of the current small extend.
+        self._small_extend_rows: Optional[tuple] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -423,13 +428,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_cache_owner = None
         # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
+        small_extend = self._is_small_extend(forward_batch)
         if self.index_cache_enabled and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (self.is_hip and forward_batch.forward_mode.is_target_verify())
+            or small_extend
         ):
             bs = forward_batch.seq_lens.shape[0]
             if forward_batch.forward_mode.is_target_verify():
                 bs *= self.speculative_num_draft_tokens
+            elif small_extend:
+                bs = sum(forward_batch.extend_seq_lens_cpu)
             if bs > 0 and bs not in self._decode_topk_buf:
                 _nkv = self.kv_pool.main_pool.head_num
                 self._decode_topk_buf[bs] = torch.empty(
@@ -1441,6 +1450,50 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta_key = id(forward_batch)
         return cu_seqlens, seq_lens, prefix_lens
 
+    # Largest per-request extend served by the decode kernels; arbitrary, it
+    # covers a new user turn's template tokens and a cached-prefix restart.
+    SMALL_EXTEND_MAX_TOKENS = 8
+
+    def _is_small_extend(self, forward_batch: ForwardBatch) -> bool:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        return (
+            not self.is_npu
+            # forward_decode's MSA / dense-main / hisparse paths need decode metadata
+            and not self._use_msa_decode
+            and not self.use_dense_sparse_decode
+            and self.hisparse_coordinator is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and extend_lens is not None
+            and len(extend_lens) > 0
+            and max(extend_lens) <= self.SMALL_EXTEND_MAX_TOKENS
+            and forward_batch.extend_prefix_lens_cpu is not None
+        )
+
+    def _small_extend_row_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
+        """The batch as one decode row per new token: row j of a request attends KV[0:prefix+j+1]."""
+        cached = self._small_extend_rows
+        if cached is not None and cached[0] is forward_batch:
+            return cached[1]
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        device = forward_batch.seq_lens.device
+        row_batch = copy.copy(forward_batch)
+        row_batch.seq_lens = torch.tensor(
+            [
+                prefix + j + 1
+                for prefix, extend in zip(
+                    forward_batch.extend_prefix_lens_cpu, extend_lens
+                )
+                for j in range(extend)
+            ],
+            dtype=forward_batch.seq_lens.dtype,
+            device=device,
+        )
+        row_batch.req_pool_indices = forward_batch.req_pool_indices.repeat_interleave(
+            torch.tensor(extend_lens, device=device), output_size=sum(extend_lens)
+        )
+        self._small_extend_rows = (forward_batch, row_batch)
+        return row_batch
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1470,6 +1523,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 v,
                 layer,
                 verify_batch,
+                save_kv_cache,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_v=idx_v,
+            )
+        if (
+            self._is_small_extend(forward_batch)
+            # Row metadata comes from host lists, so a captured copy would replay
+            # capture-time lengths; DP-padded q has no row for its padding.
+            and not is_in_breakable_cuda_graph()
+            and q.shape[0] == sum(forward_batch.extend_seq_lens_cpu)
+        ):
+            # The prefill indexer reads the whole index K for a few query rows;
+            # the decode kernels are bandwidth-bound on it.
+            return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                self._small_extend_row_batch(forward_batch),
                 save_kv_cache,
                 idx_q=idx_q,
                 idx_k=idx_k,

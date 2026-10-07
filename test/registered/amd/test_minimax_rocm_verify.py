@@ -1,4 +1,5 @@
-"""Causal verify metadata and routing with no ordinary prefill metadata."""
+"""Causal verify metadata and routing with no ordinary prefill metadata;
+small extends served as flattened decode rows."""
 
 import unittest
 from types import SimpleNamespace
@@ -121,6 +122,110 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
                 idx_k=self.q,
                 idx_v=None,
             )
+
+
+@unittest.skipUnless(torch.version.hip, "ROCm verify integration")
+class TestMiniMaxSmallExtendRows(unittest.TestCase):
+    def test_decode_rows_match_sparse_prefill(self):
+        """Each flattened row must attend exactly its causal prefix, as the prefill path does."""
+        from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+            get_cu_seqblocks,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_backend import (
+            MiniMaxSparseAttnBackend,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+            minimax_sparse_decode,
+            minimax_sparse_prefill,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
+        backend.is_npu = False
+        backend._use_msa_decode = False
+        backend.use_dense_sparse_decode = False
+        backend.hisparse_coordinator = None
+        backend._small_extend_rows = None
+        # The first request's new tokens cross into a new 128-token block.
+        prefixes, extends, slots = [128 * 20 - 3, 5000], [8, 3], [2, 1]
+        seq_lens = [p + e for p, e in zip(prefixes, extends)]
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=extends,
+            extend_prefix_lens_cpu=prefixes,
+            seq_lens=torch.tensor(seq_lens, device="cuda"),
+            req_pool_indices=torch.tensor(slots, device="cuda"),
+        )
+        self.assertTrue(backend._is_small_extend(batch))
+        rows = backend._small_extend_row_batch(batch)
+        self.assertIs(backend._small_extend_row_batch(batch), rows)
+        self.assertEqual(batch.seq_lens.tolist(), seq_lens)
+
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        max_len, num_rows = max(seq_lens), sum(extends)
+        num_slots = len(slots) * max_len + 1
+        req_to_token = torch.zeros(3, max_len, dtype=torch.int32, device="cuda")
+        perm = torch.randperm(num_slots - 1, device="cuda", generator=gen) + 1
+        req_to_token[slots] = perm.to(torch.int32).view(len(slots), max_len)
+
+        def randn(*shape):
+            return torch.randn(*shape, device="cuda", generator=gen).bfloat16()
+
+        q, idx_q = randn(num_rows, 16, 128), randn(num_rows, 1, 128)
+        k_cache, v_cache, idx_k_cache = (randn(num_slots, 1, 128) for _ in "kvi")
+        cu_seqlens = torch.tensor([0, 8, 11], dtype=torch.int32, device="cuda")
+        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+            cu_seqlens, max(extends), 1, 128, extends
+        )
+        ref = minimax_sparse_prefill(
+            q,
+            k_cache,
+            v_cache,
+            None,
+            idx_q,
+            idx_k_cache,
+            None,
+            None,
+            req_to_token,
+            batch.req_pool_indices,
+            cu_seqlens,
+            batch.seq_lens.int(),
+            torch.tensor(prefixes, dtype=torch.int32, device="cuda"),
+            max(extends),
+            max_len,
+            1,
+            128,
+            16,
+            0,
+            1,
+            disable_index_value=True,
+            seqlens_cpu=extends,
+            seq_lens_cpu=batch.seq_lens.cpu(),
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+        )[1]
+        out = minimax_sparse_decode(
+            q,
+            None,
+            k_cache,
+            v_cache,
+            idx_q,
+            None,
+            idx_k_cache,
+            None,
+            req_to_token,
+            rows.req_pool_indices,
+            rows.seq_lens,
+            max_len,
+            1,
+            128,
+            16,
+            0,
+            1,
+            disable_index_value=True,
+        )[1]
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":
