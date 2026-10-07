@@ -1705,6 +1705,115 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
+    def _chunkable_req(self, rid, prefix_len, total_len, max_new_tokens=64):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
+        req.prefix_indices = list(range(prefix_len))
+        req.full_untruncated_fill_ids = list(range(total_len))
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def _fairness_adder(self, waiting_queue_len, available=1_000_000):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = available
+        override = (
+            schedule_policy.envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.override(0.5)
+        )
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+        return self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=16384,
+            rem_chunk_tokens=8192,
+            waiting_queue_len=waiting_queue_len,
+        )
+
+    def test_fairness_fitting_waiters_ride_along_chunk_needing_waiters_wait(self):
+        """A waiter that fits rides along; one that needs chunking waits, since
+        the scheduler tracks a single unfinished chunked request."""
+        adder = self._fairness_adder(waiting_queue_len=3)
+        chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range.length, 4096)
+        self.assertEqual(adder.rem_chunk_tokens, 4096)
+
+        big = self._chunkable_req("big", prefix_len=100_000, total_len=110_000)
+        res = adder.add_one_req(big, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(res, AddReqResult.CONTINUE)
+        self.assertNotIn(big, adder.can_run_list)
+
+        # The radix-disabled ignore_eos path chunks on its own branch.
+        big_eos = self._chunkable_req("big_eos", prefix_len=0, total_len=10_000)
+        big_eos.sampling_params.ignore_eos = True
+        self.mock_tree_cache.disable = True
+        res = adder.add_one_req(
+            big_eos, has_chunked_req=True, truncation_align_size=None
+        )
+        self.mock_tree_cache.disable = False
+        self.assertEqual(res, AddReqResult.CONTINUE)
+        self.assertNotIn(big_eos, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
+
+        small = self._chunkable_req("small", prefix_len=150_000, total_len=151_500)
+        res = adder.add_one_req(small, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(res, AddReqResult.CONTINUE)
+        self.assertIn(small, adder.can_run_list)
+        self.assertEqual(adder.rem_chunk_tokens, 4096 - 1500)
+
+        # The reserve the waiters left unused goes back to the chunked request.
+        self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range, Range(8192, 8192 + 4096 + 2596))
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+        self.assertEqual(adder.budget_state(), AddReqResult.OTHER)
+
+    def test_fairness_regrow_touches_only_the_request_it_capped(self):
+        """Budget another limit held back (the shortest-prefill-first reserve)
+        is not the fairness reserve, and must stay with the waiters."""
+        adder = self._fairness_adder(waiting_queue_len=1)
+        chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=14192)
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range.length, 4096)
+        # Nothing else was admitted, so the regrow finishes the request.
+        self.assertIsNone(adder.regrow_capped_chunked_req(chunked))
+        self.assertEqual(chunked.extend_range.length, 6000)
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 6000)
+
+        adder = self._fairness_adder(waiting_queue_len=0)
+        adder.chunked_req_limit = 2048
+        chunked = self._chunkable_req("uncapped", prefix_len=0, total_len=30000)
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range.length, 2048)
+
+    def test_fairness_regrow_stays_within_the_pool(self):
+        """A continuation may overrun an exhausted pool to make progress; a
+        regrow on top of it must not claim tokens the pool does not have."""
+        # The capped chunk plus its page fill the pool exactly.
+        adder = self._fairness_adder(waiting_queue_len=1, available=4097)
+        chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
+        self.assertIs(adder.add_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range.length, 4096)
+        self.assertIs(adder.regrow_capped_chunked_req(chunked), chunked)
+        self.assertEqual(chunked.extend_range.length, 4096)
+
+    def test_fairness_cap_applies_only_with_waiters_and_a_long_tail(self):
+        """A cap with nothing waiting, or on a tail that fits, only adds a chunk."""
+        adder = self._fairness_adder(waiting_queue_len=0)
+        chunked = self._chunkable_req("chunked", prefix_len=8192, total_len=28192)
+        adder.add_chunked_req(chunked)
+        self.assertEqual(chunked.extend_range.length, 8192)
+
+        adder = self._fairness_adder(waiting_queue_len=2)
+        tail = self._chunkable_req("tail", prefix_len=8192, total_len=8192 + 3000)
+        self.assertIsNone(adder.add_chunked_req(tail))
+        self.assertEqual(tail.extend_range.length, 3000)
+
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.can_run_list = [

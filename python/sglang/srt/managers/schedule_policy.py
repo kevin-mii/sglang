@@ -760,6 +760,10 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.chunked_prefill_fairness_reserve = min(
+            max(envs.SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE.get(), 0.0), 0.9
+        )
+        self._capped_chunked_req: Optional[Req] = None
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1140,6 +1144,8 @@ class PrefillAdder:
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
                 _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+            else:
+                _rem_tokens = self._cap_chunk_for_waiters(req, _rem_tokens)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1193,6 +1199,76 @@ class PrefillAdder:
         # Return if chunked prefill not finished
         return req if truncated else None
 
+    def _cap_chunk_for_waiters(self, req: Req, rem_tokens: int) -> int:
+        """Cap a continuing chunked request's chunk so waiting requests share the pass.
+
+        No-op when the reserve is off, nothing waits, or the rest of the prompt
+        fits under the cap anyway.
+        """
+        if (
+            self.chunked_prefill_fairness_reserve <= 0
+            or self.waiting_queue_len <= 0
+            or self.rem_chunk_tokens is None
+        ):
+            return rem_tokens
+        cap = self.rem_chunk_tokens - int(
+            self.rem_chunk_tokens * self.chunked_prefill_fairness_reserve
+        )
+        cap = max(cap // self.page_size * self.page_size, self.page_size)
+        remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        if remaining <= cap or rem_tokens <= cap:
+            return rem_tokens
+        self._capped_chunked_req = req
+        return cap
+
+    def regrow_capped_chunked_req(self, req: Optional[Req]) -> Optional[Req]:
+        """Give the chunk budget the waiting queue left unused back to the capped request.
+
+        Call once after the waiting queue is scanned. Returns the request while
+        it is still truncated, else None, like `add_chunked_req`.
+        """
+        if req is None or req is not self._capped_chunked_req:
+            return req
+        self._capped_chunked_req = None
+        if not self.rem_chunk_tokens or self.rem_chunk_tokens <= 0:
+            return req
+        # Unlike a continuation, a regrow must not exceed what the pool holds.
+        extra = self.memory_budget.available_chunk_tokens(self.rem_chunk_tokens)
+        if extra is None:
+            return req
+        extra = min(extra, int(self.memory_budget.remaining_total))
+        remaining = len(req.full_untruncated_fill_ids) - req.extend_range.end
+        if extra <= 0 or remaining <= 0:
+            return req
+        extra = self.memory_budget.fit_chunk(
+            extend_input_len=remaining,
+            max_new_tokens=self._swa_new_tokens(req),
+            chunk_limit=extra,
+        )
+        if extra is None:
+            return req
+        extra = min(extra, remaining)
+        if extra < remaining:
+            extra = extra // self.page_size * self.page_size
+        if extra <= 0:
+            return req
+        truncated = remaining > extra
+        req.set_extend_range(req.extend_range.start, req.extend_range.end + extra)
+        # add_chunked_req already charged this request's mamba_gap_reserve.
+        self._update_prefill_budget(
+            0,
+            extra,
+            (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if not truncated
+                else 0
+            ),
+            req.retracted_stain,
+            is_chunked_continuation=True,
+            compute_charge=extra if self.exact_chunk_fill else None,
+        )
+        return req if truncated else None
+
     @contextmanager
     def _lock_node(self, last_node: TreeNode, *, lock_host: bool = False):
         host_lock_params = (
@@ -1210,7 +1286,7 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1329,6 +1405,8 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
+                return AddReqResult.CONTINUE
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -1364,7 +1442,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1569,6 +1647,10 @@ class PrefillAdder:
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
+            if has_chunked_req and self.chunked_prefill_fairness_reserve > 0:
+                # The reserve is for waiters that fit whole; one chunked
+                # request is tracked at a time.
+                return AddReqResult.CONTINUE
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
