@@ -72,8 +72,12 @@ __global__ void store_kvcache_kernel(const __grid_constant__ StoreKVCacheParams 
   const auto v = warp::load_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_src);
 
   PDLTriggerSecondary<kUsePDL>();
+  // HIP device asserts need hostcall, which hipGraph capture rejects on nodes
+  // without it, so ROCm drops an out-of-range write instead of trapping.
+#ifndef USE_ROCM
   assert(index >= 0 && index < size_limit);
-  if (index != reserved_skip_index) {
+#endif
+  if (index >= 0 && index < size_limit && index != reserved_skip_index) {
     const auto k_dst = pointer::offset(k_cache, index * stride_k_cache, split_id * kKSplitBytes);
     const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitBytes);
     warp::store_bytes<kKSplitBytes, WARP_UNIFORM_16B>(k_dst, k);

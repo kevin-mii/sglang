@@ -132,6 +132,28 @@ def test_store_cache_zero_index_can_be_written_when_skip_disabled() -> None:
     torch.testing.assert_close(v_cache[0], v[0], rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(not torch.version.hip, reason="CUDA traps on the device assert")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_store_cache_rocm_skips_out_of_range_index(index_dtype: torch.dtype) -> None:
+    """ROCm has no device assert here (hipGraph capture rejects it without
+    hostcall), so an index at or past size_limit must not be written."""
+    element_dim, size_limit = 64, 32
+    k = torch.randn((3, element_dim), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((3, element_dim), dtype=DTYPE, device=DEVICE)
+    # Rows past size_limit are real memory, so a stray write is observable.
+    k_cache = torch.randn((2 * size_limit, element_dim), dtype=DTYPE, device=DEVICE)
+    v_cache = torch.randn((2 * size_limit, element_dim), dtype=DTYPE, device=DEVICE)
+    k_tail, v_tail = k_cache[size_limit:].clone(), v_cache[size_limit:].clone()
+    indices = torch.tensor([5, size_limit, 2 * size_limit - 1], dtype=index_dtype)
+
+    store_cache(k, v, k_cache, v_cache, indices.to(DEVICE), size_limit=size_limit)
+
+    torch.testing.assert_close(k_cache[5], k[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[5], v[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(k_cache[size_limit:], k_tail, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(v_cache[size_limit:], v_tail, rtol=0.0, atol=0.0)
+
+
 # Asymmetric K/V (head_dim != v_head_dim): different row widths AND cache strides.
 # MiMoV2 is 192/128. Both orderings, since nothing may assume K is the wider one.
 ASYM_DIM_PAIRS = get_ci_test_range(
