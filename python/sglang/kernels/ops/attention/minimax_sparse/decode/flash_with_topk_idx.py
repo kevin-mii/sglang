@@ -890,6 +890,7 @@ def flash_decode_with_topk_idx(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     packed_queries: int = 1,
+    topk_idx_out: Optional[torch.Tensor] = None,  # [heads, batch, topk] int32
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -1141,11 +1142,15 @@ def flash_decode_with_topk_idx(
 
     # get topk index
     if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
+        topk_idx = topk_idx_out
+        if topk_idx is None:
+            topk_idx = torch.empty(
+                (num_q_heads, batch_size, topk),
+                device=score.device,
+                dtype=torch.int32,
+            )
+        assert topk_idx.shape == (num_q_heads, batch_size, topk)
+        assert topk_idx.dtype == torch.int32
 
     if _skip_block_topk:
         pass

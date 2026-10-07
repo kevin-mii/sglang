@@ -8,6 +8,9 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
     flash_decode_with_topk_idx,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+    minimax_sparse_decode,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +134,51 @@ class TestPackedIndexScoring(CustomTestCase):
     def test_no_local_blocks_falls_back_to_per_row(self):
         """Without local blocks packing cannot be exact, so it must be skipped."""
         self._run([BLOCK_SIZE * 25 - 1, 5000], req_slots=[1, 3], local_blocks=0)
+
+
+class TestSharedTopkPublish(CustomTestCase):
+    def test_source_layer_publishes_packed_topk(self):
+        """Reuse layers must read exactly the source layer's selection from the shared buffer."""
+        dev = get_device()
+        gen = torch.Generator(device=dev).manual_seed(0)
+        prefixes, req_slots = [BLOCK_SIZE * 30 - 2, 6000], [2, 1]
+        max_len = max(prefixes) + NUM_DRAFT_TOKENS
+        num_slots = len(prefixes) * max_len + 1
+        req_to_token = torch.zeros(3, max_len, dtype=torch.int32, device=dev)
+        perm = torch.randperm(num_slots - 1, device=dev, generator=gen) + 1
+        req_to_token[req_slots] = perm.to(torch.int32).view(len(prefixes), max_len)
+        rows = len(prefixes) * NUM_DRAFT_TOKENS
+
+        def randn(*shape):
+            return torch.randn(*shape, device=dev, generator=gen).to(torch.bfloat16)
+
+        q, idx_q = randn(rows, 16, HEAD_DIM), randn(rows, 1, HEAD_DIM)
+        k_cache, v_cache, idx_k_cache = (randn(num_slots, 1, HEAD_DIM) for _ in "kvi")
+        args = (q, None, k_cache, v_cache, idx_q, None, idx_k_cache, None)
+        kwargs = dict(
+            req_to_token=req_to_token,
+            slot_ids=torch.tensor(req_slots, device=dev).repeat_interleave(
+                NUM_DRAFT_TOKENS
+            ),
+            seq_lens=torch.tensor(
+                [p + j + 1 for p in prefixes for j in range(NUM_DRAFT_TOKENS)],
+                device=dev,
+            ),
+            max_seqlen=max_len,
+            block_size_q=1,
+            block_size_k=BLOCK_SIZE,
+            topk=TOPK,
+            init_blocks=0,
+            local_blocks=1,
+            disable_index_value=True,
+            packed_queries=NUM_DRAFT_TOKENS,
+        )
+        _, ref_o = minimax_sparse_decode(*args, **kwargs)
+        shared = torch.full((1, rows, TOPK), -7, dtype=torch.int32, device=dev)
+        _, source_o = minimax_sparse_decode(*args, **kwargs, topk_out=shared)
+        _, reuse_o = minimax_sparse_decode(*args, **kwargs, cached_topk_idx=shared)
+        torch.testing.assert_close(source_o, ref_o, rtol=0, atol=0)
+        torch.testing.assert_close(reuse_o, ref_o, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
