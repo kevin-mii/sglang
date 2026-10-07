@@ -327,6 +327,7 @@ def minimax_sparse_decode(
     topk_out: Optional[torch.Tensor] = None,
     hisparse_swap_in_fn: Optional[Callable] = None,
     indexer_cp=None,
+    packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -390,6 +391,7 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
+            packed_queries=packed_queries,
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
