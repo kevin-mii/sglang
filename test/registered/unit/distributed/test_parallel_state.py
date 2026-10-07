@@ -172,6 +172,65 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def _small_message_coordinator(max_bytes, small_disabled=False):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.qr_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.pynccl_comm = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.small_ca_comm = Mock(disabled=small_disabled)
+    coordinator.small_ca_comm.should_custom_ar.return_value = True
+    coordinator._small_ca_max_bytes = max_bytes
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "rows, small_disabled, expected",
+    [
+        (8, False, "ca_small"),  # 96 KB
+        (16, False, "ca_small"),  # 192 KB, at the threshold
+        (17, False, "ca"),  # 204 KB, above it
+        (8, True, "ca"),  # a disabled small communicator falls through
+    ],
+)
+def test_small_message_all_reduce_routes_by_size(rows, small_disabled, expected):
+    coordinator = _small_message_coordinator(16 * 6144 * 2, small_disabled)
+    input_ = torch.empty((rows, 6144), dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == expected
+
+
+def test_small_message_all_reduce_dispatches_to_its_communicator():
+    coordinator = _small_message_coordinator(1 << 20)
+    input_ = torch.empty((4, 6144), dtype=torch.bfloat16)
+    out = coordinator._all_reduce_out_place(input_, "auto")
+    assert out is coordinator.small_ca_comm.custom_all_reduce.return_value
+    coordinator.small_ca_comm.custom_all_reduce.assert_called_once_with(input_)
+    coordinator.ca_comm.custom_all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "is_hip, max_size_kb, deterministic_ca",
+    [(False, 256, False), (True, 0, False), (True, 256, True)],
+)
+def test_small_message_communicator_not_built(is_hip, max_size_kb, deterministic_ca):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.ca_comm = Mock(use_amd_deterministic_impl=deterministic_ca)
+    with (
+        patch.object(parallel_state, "is_hip", return_value=is_hip),
+        parallel_state.envs.SGLANG_CUSTOM_ALL_REDUCE_1STAGE_MAX_SIZE_KB.override(
+            max_size_kb
+        ),
+    ):
+        assert coordinator._make_small_message_ca_comm() is None
+
+
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
 def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """

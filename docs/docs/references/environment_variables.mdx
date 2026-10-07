@@ -1706,6 +1706,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUSTOM_ALL_REDUCE_1STAGE_MAX_SIZE_KB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>AMD: route custom all-reduces of at most this many KB to a second communicator running the 1-stage kernel, which is faster than the default 2-stage kernel for small decode messages. The default communicator keeps larger messages. <code>0</code> keeps a single communicator.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PCIE_IPC_ALLREDUCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's PCIe-IPC all-reduce on switch-free intra-node hosts (no NVLink, no multicast), where the other custom all-reduce backends do not apply. Serves bf16 decode reductions that fit the workspace bound; everything else stays on NCCL. Left off under deterministic inference.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
