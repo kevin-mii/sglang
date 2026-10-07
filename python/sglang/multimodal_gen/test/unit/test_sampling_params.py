@@ -26,8 +26,13 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    QUALITY_LEVELS,
     SamplingParams,
+    SkipSoftmaxParams,
     _json_safe,
+    normalize_quality,
+    quality_allows,
+    resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
@@ -50,16 +55,58 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(num_outputs_per_prompt=0)
 
     def test_quality_defaults_to_lossless(self):
+        # The default runs every fast path that keeps the reference math;
+        # "exact" is the opt-in for bit-identical output.
         self.assertEqual(SamplingParams().quality, "lossless")
 
-    def test_quality_accepts_the_two_validated_levels(self):
-        self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
-        self.assertEqual(SamplingParams(quality="high").quality, "high")
+    def test_quality_levels_are_cumulative(self):
+        self.assertEqual(QUALITY_LEVELS, ("exact", "lossless", "high"))
+        for quality in QUALITY_LEVELS:
+            with self.subTest(quality=quality):
+                self.assertEqual(SamplingParams(quality=quality).quality, quality)
+
+        # A request admits the fast paths of its own tier and of every
+        # stricter one, so the levels stay cumulative.
+        for request, admits in (
+            ("exact", {"exact"}),
+            ("lossless", {"exact", "lossless"}),
+            ("high", {"exact", "lossless", "high"}),
+        ):
+            for tier in QUALITY_LEVELS:
+                with self.subTest(request=request, tier=tier):
+                    self.assertEqual(quality_allows(request, tier), tier in admits)
+
+    def test_extra_high_is_accepted_as_the_former_name_of_lossless(self):
+        self.assertEqual(SamplingParams(quality="extra-high").quality, "lossless")
+        self.assertEqual(normalize_quality("extra-high"), "lossless")
 
     def test_quality_rejects_invalid_values(self):
         for bad in ("ultra", "draft", "fast", "", True, 1):
             with self.assertRaisesRegex(ValueError, r"quality must be one of"):
                 SamplingParams(quality=bad)  # type: ignore[arg-type]
+
+    def test_skip_softmax_params(self):
+        params = {"threshold_scale_factor": 500, "start_step": 14}
+        self.assertEqual(
+            resolve_skip_softmax_params(params),
+            SkipSoftmaxParams(threshold_scale_factor=500.0, start_step=14),
+        )
+        self.assertEqual(
+            SamplingParams(skip_softmax_params=params).skip_softmax_params, params
+        )
+
+    def test_skip_softmax_params_reject_invalid_values(self):
+        invalid = (
+            {},
+            {"threshold_scale_factor": 0},
+            {"threshold_scale_factor": math.inf},
+            {"threshold_scale_factor": 1, "start_step": -1},
+            {"threshold_scale_factor": 1, "unknown": True},
+        )
+        for params in invalid:
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(ValueError, "skip_softmax_params"):
+                    SamplingParams(skip_softmax_params=params)
 
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
@@ -158,6 +205,9 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     params._adjust(server_args)
 
                 self.assertEqual((params.width, params.height), expected)
+                self.assertEqual(
+                    (params.requested_width, params.requested_height), requested
+                )
                 mock_warning.assert_called_once_with(
                     "GLM-Image requires dimensions divisible by %s; adjusted "
                     "requested resolution from %sx%s to %sx%s",
@@ -335,9 +385,11 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
-        self.assertEqual(
-            self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
-        )
+        for quality in ("exact", "lossless", "high", "extra-high"):
+            with self.subTest(quality=quality):
+                self.assertEqual(
+                    self._parse_cli_kwargs(["--quality", quality])["quality"], quality
+                )
 
     def test_get_cli_args_maps_spectrum_prefixed_flags(self):
         kwargs = self._parse_cli_kwargs(
@@ -459,8 +511,10 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         )
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
-        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
-        import dataclasses
+        """Per-prompt clones retain explicit and model-internal fields."""
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
 
         server_args = MagicMock()
         server_args.backend = "sglang"
@@ -484,24 +538,41 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", sampling_params_orig._explicit_fields)
         self.assertIn("height", sampling_params_orig._explicit_fields)
 
-        cloned = dataclasses.replace(
+        cloned = _replace_sampling_params_for_prompt(
             sampling_params_orig,
             prompt="new",
             output_file_name=None,
             image_path="/tmp/in2.png",
         )
-        self.assertFalse(hasattr(cloned, "_explicit_fields"))
-
-        # Mirror the restore done in DiffGenerator.generate().
-        cloned._explicit_fields = getattr(
-            sampling_params_orig, "_explicit_fields", set()
-        ) | {"prompt", "output_file_name", "image_path"}
 
         explicit = set(cloned.build_request_extra()["explicit_fields"])
         self.assertIn("width", explicit)
         self.assertIn("height", explicit)
         self.assertIn("prompt", explicit)
         self.assertIn("image_path", explicit)
+
+    def test_per_prompt_clone_preserves_glm_image_crop_size(self):
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            _replace_sampling_params_for_prompt,
+        )
+
+        sampling_params_orig = GlmImageSamplingParams(
+            prompt="orig",
+            width=1024,
+            height=1024,
+        )
+        sampling_params_orig.requested_width = 1000
+        sampling_params_orig.requested_height = 999
+
+        cloned = _replace_sampling_params_for_prompt(
+            sampling_params_orig,
+            prompt="new",
+            output_file_name=None,
+            image_path=None,
+        )
+
+        self.assertEqual((cloned.width, cloned.height), (1024, 1024))
+        self.assertEqual((cloned.requested_width, cloned.requested_height), (1000, 999))
 
 
 if __name__ == "__main__":

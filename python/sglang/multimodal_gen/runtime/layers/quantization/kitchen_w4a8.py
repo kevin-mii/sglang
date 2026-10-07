@@ -15,6 +15,21 @@ except ImportError:  # pragma: no cover - optional dependency
     w4a8_int8_linear = None
 
 
+def _register_weight(
+    layer: torch.nn.Module,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    weight_attrs: dict,
+    parallel_dims: dict[str, int] | None = None,
+) -> None:
+    weight = Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+    if parallel_dims is not None:
+        set_weight_attrs(weight, parallel_dims)
+    set_weight_attrs(weight, weight_attrs)
+    layer.register_parameter(name, weight)
+
+
 class KitchenW4A8LinearMethod(LinearMethodBase):
     """Load packed INT4 weights and execute the W4A8 ConvRot kernel."""
 
@@ -36,21 +51,6 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
         self.has_codebook = has_codebook
         self.has_correction = has_correction
 
-    @staticmethod
-    def _register_weight(
-        layer: torch.nn.Module,
-        name: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        weight_attrs: dict,
-        parallel_dims: dict[str, int] | None = None,
-    ) -> None:
-        weight = Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
-        if parallel_dims is not None:
-            set_weight_attrs(weight, parallel_dims)
-        set_weight_attrs(weight, weight_attrs)
-        layer.register_parameter(name, weight)
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -70,7 +70,7 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
             )
 
         output_size_per_partition = sum(output_partition_sizes)
-        self._register_weight(
+        _register_weight(
             layer,
             "weight",
             (output_size_per_partition, input_size_per_partition // 2),
@@ -78,7 +78,7 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
             extra_weight_attrs,
             {"input_dim": 1, "output_dim": 0},
         )
-        self._register_weight(
+        _register_weight(
             layer,
             "weight_s_rel",
             (output_size_per_partition, input_size_per_partition // self.group_size),
@@ -86,7 +86,7 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
             extra_weight_attrs,
             {"input_dim": 1, "output_dim": 0},
         )
-        self._register_weight(
+        _register_weight(
             layer,
             "weight_s_channel",
             (output_size_per_partition,),
@@ -95,7 +95,7 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
             {"output_dim": 0},
         )
         if self.has_codebook:
-            self._register_weight(
+            _register_weight(
                 layer,
                 "weight_codebook",
                 (16,),
@@ -105,7 +105,7 @@ class KitchenW4A8LinearMethod(LinearMethodBase):
         else:
             layer.register_parameter("weight_codebook", None)
         if self.has_correction:
-            self._register_weight(
+            _register_weight(
                 layer,
                 "weight_correction",
                 (

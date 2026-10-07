@@ -32,6 +32,7 @@ MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 _LAYER_WEIGHT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 _PARAM_NAMES_MAPPING = {
     r"^model\.(embed_tokens|layers|norm|rotary_emb)\.": r"model.language_model.\1.",
+    r"^language_model\.": r"model.language_model.",
     r"^visual\.": r"model.visual.",
     r"^(model\.visual\.blocks\.\d+\.attn\.)qkv\.": r"\1qkv_proj.",
 }
@@ -207,6 +208,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     supports_dp_encode = True
     param_names_mapping = _PARAM_NAMES_MAPPING
+    # Comfy packs the vision tower across whole tensors rather than rows. Keep
+    # its language/vocabulary matrices packed and restore this smaller tower.
+    gguf_dequantize_prefixes = ("visual.", "model.visual.")
 
     @classmethod
     def configure_component_paths(
@@ -406,6 +410,14 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
+                if (
+                    name == "model.visual.patch_embed.proj.weight"
+                    and param.ndim == 5
+                    and tuple(loaded_weight.shape)
+                    == (param.shape[0] * param.shape[1], *param.shape[2:])
+                ):
+                    # H3 GGUF folds the Conv3D output and input channel axes.
+                    loaded_weight = loaded_weight.reshape(param.shape)
                 can_keep_checkpoint_tensor = bool(
                     getattr(self, "_keep_checkpoint_mapping", False)
                     and weight_loader is default_weight_loader
