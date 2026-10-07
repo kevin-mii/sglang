@@ -137,8 +137,13 @@ class PrefillBudget:
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available = min(chunk_limit, int(self.remaining_total))
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        if available > 0:
+            return available
+        # Decode headroom can exceed the pool; a continuation still makes progress, but
+        # only into tokens that exist now, keeping a page in hand as SWAPrefillBudget does.
+        existing = int(self.remaining_current) - self.page_size
+        existing = existing // self.page_size * self.page_size
+        return min(chunk_limit, existing) if existing > 0 else None
 
     def fit_chunk(
         self,
