@@ -148,6 +148,7 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator._fi_workspace_hint = None
     coordinator.ca_comm = Mock(disabled=False)
     coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.small_ca_comm = None
     coordinator.pynccl_comm = Mock()
     coordinator.pynccl_comm.change_state.return_value = nullcontext()
     coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
@@ -214,21 +215,45 @@ def test_small_message_all_reduce_dispatches_to_its_communicator():
 
 
 @pytest.mark.parametrize(
-    "is_hip, max_size_kb, deterministic_ca",
-    [(False, 256, False), (True, 0, False), (True, 256, True)],
+    "is_hip, max_size_kb, one_stage_everywhere, built",
+    [
+        (True, 256, False, True),
+        (False, 256, False, False),
+        (True, 0, False, False),
+        # ca_comm already runs the 1-stage kernel at every size
+        (True, 256, True, False),
+    ],
 )
-def test_small_message_communicator_not_built(is_hip, max_size_kb, deterministic_ca):
+def test_small_message_communicator_built_only_when_useful(
+    is_hip, max_size_kb, one_stage_everywhere, built
+):
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
     )
-    coordinator.ca_comm = Mock(use_amd_deterministic_impl=deterministic_ca)
+    coordinator.ca_comm = Mock()
+    coordinator.cpu_group = Mock()
+    coordinator.device = Mock()
+    coordinator._small_ca_max_bytes = 0
+    car_module = "sglang.srt.distributed.device_communicators.custom_all_reduce"
     with (
         patch.object(parallel_state, "is_hip", return_value=is_hip),
+        patch(f"{car_module}.CustomAllreduce") as car_cls,
+        patch(
+            f"{car_module}._use_amd_deterministic_impl",
+            return_value=one_stage_everywhere,
+        ),
         parallel_state.envs.SGLANG_CUSTOM_ALL_REDUCE_1STAGE_MAX_SIZE_KB.override(
             max_size_kb
         ),
     ):
-        assert coordinator._make_small_message_ca_comm() is None
+        comm = coordinator._make_small_message_ca_comm()
+    if built:
+        assert comm is car_cls.return_value
+        assert comm.use_amd_deterministic_impl is True
+        assert coordinator._small_ca_max_bytes == max_size_kb * 1024
+    else:
+        assert comm is None
+        car_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])

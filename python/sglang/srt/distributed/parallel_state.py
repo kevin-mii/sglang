@@ -485,6 +485,7 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.small_ca_comm: Optional[Any] = None
+        self._small_ca_max_bytes = 0
         self.qr_comm: Optional[QuickAllReduce] = None
 
         self.pcie_ipc_comm: Optional[Any] = None
@@ -640,7 +641,7 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
-        small_ca_comm = getattr(self, "small_ca_comm", None)
+        small_ca_comm = self.small_ca_comm
         maybe_small_ca_context = (
             nullcontext() if small_ca_comm is None else small_ca_comm.capture()
         )
@@ -968,11 +969,13 @@ class GroupCoordinator:
         max_size_kb = envs.SGLANG_CUSTOM_ALL_REDUCE_1STAGE_MAX_SIZE_KB.get()
         if not is_hip() or max_size_kb <= 0 or self.ca_comm is None:
             return None
-        if getattr(self.ca_comm, "use_amd_deterministic_impl", False):
-            return None  # ca_comm already runs the 1-stage kernel at every size
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
+            _use_amd_deterministic_impl,
         )
+
+        if _use_amd_deterministic_impl():
+            return None  # ca_comm already runs the 1-stage kernel at every size
 
         try:
             comm = CustomAllreduce(group=self.cpu_group, device=self.device)
@@ -984,7 +987,7 @@ class GroupCoordinator:
         return comm
 
     def _use_small_message_ca(self, input_: torch.Tensor) -> bool:
-        comm = getattr(self, "small_ca_comm", None)
+        comm = self.small_ca_comm
         return (
             comm is not None
             and not comm.disabled
