@@ -96,6 +96,22 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                         self.assertTrue(torch.equal(ref[0], out[0]), (seqs, topk, nb))
                         self.assertTrue(torch.equal(ref[1], out[1]), (seqs, topk, nb))
 
+    def test_draft_grid_equivalence_sink_window(self):
+        # The token-block branch remaps each block through the sink + recent split.
+        torch.manual_seed(0)
+        for seqs in LENSETS:
+            for topk, page_size in [(1, 1), (4, 1)]:
+                inputs = _draft_inputs(seqs, topk, 3, "cuda")
+                for window_size, sink_size in [(4096, 4), (50_000, 600)]:
+                    kw = {"window_size": window_size, "sink_size": sink_size}
+                    ref = _run_draft(inputs, topk, 3, page_size, 1, kw)
+                    nb = kv_indices_num_token_blocks(POOL_LEN, 3 * len(seqs) * topk)
+                    out = _run_draft(
+                        inputs, topk, 3, page_size, nb, {**kw, "NUM_STEPS": 3}
+                    )
+                    self.assertTrue(torch.equal(ref[0], out[0]), (seqs, topk, kw))
+                    self.assertTrue(torch.equal(ref[1], out[1]), (seqs, topk, kw))
+
     def test_draft_reference(self):
         torch.manual_seed(1)
         seqs, steps = [100_000, 33, 4096, 16], 3
