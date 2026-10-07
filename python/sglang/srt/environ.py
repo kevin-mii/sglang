@@ -1153,6 +1153,10 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # gfx950 kill-switch: extends over a long cached prefix sweep the prefix in
+    # parallel slices (or take AITER's ASM fp8 prefill for large chunks) instead
+    # of one serial pass per query tile.
+    SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX = EnvBool(True)
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.

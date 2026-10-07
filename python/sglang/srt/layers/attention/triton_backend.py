@@ -170,6 +170,7 @@ class TritonAttnBackend(AttentionBackend):
             can_use_dense_prefill_fp8,
             dense_prefill_attention_fwd,
             extend_attention_fwd,
+            extend_attention_fwd_long_prefix,
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
@@ -184,6 +185,24 @@ class TritonAttnBackend(AttentionBackend):
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
         self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.extend_attention_fwd_long_prefix = torch.compiler.disable(
+            extend_attention_fwd_long_prefix
+        )
+        self.use_long_prefix_extend = (
+            is_gfx95_supported() and envs.SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX.get()
+        )
+        # Large chunks over a long prefix: AITER's gfx950 ASM fp8 prefill (the
+        # kernel the aiter backend uses for HD128 FP8 KV), same kill-switch.
+        self.long_prefix_asm_prefill = None
+        if self.use_long_prefix_extend and envs.SGLANG_AITER_ASM_PREFILL_HD128.get():
+            try:
+                from aiter import flash_attn_varlen_fp8_pertensor_func
+            except ImportError:
+                flash_attn_varlen_fp8_pertensor_func = None
+            self.long_prefix_asm_prefill = flash_attn_varlen_fp8_pertensor_func
+        self.unit_descale = torch.ones(
+            1, dtype=torch.float32, device=model_runner.device
+        )
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -1811,6 +1830,23 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        if (
+            causal
+            and self.forward_metadata.custom_mask is None
+            and sinks is None
+            and score_mod is None
+            and aux_tensors is None
+            and sliding_window_size <= 0
+            and logits_soft_cap <= 0
+            and layer.xai_temperature_len <= 0
+            and self.dllm_attention is None
+            and self._use_long_prefix_extend(forward_batch, kv_indices)
+        ):
+            self._forward_extend_long_prefix(
+                q, k, v, o, layer, forward_batch, kv_indptr, kv_indices
+            )
+            return o
+
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1840,6 +1876,131 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
+
+    # Average cached prefix per request above which an extend takes the long-prefix route.
+    LONG_PREFIX_MIN_TOKENS = 8192
+    # (KV head, 128-row query tile) work items from which the ASM prefill beats the split sweep.
+    LONG_PREFIX_ASM_MIN_TILES = 16
+
+    def _use_long_prefix_extend(
+        self, forward_batch: ForwardBatch, kv_indices: Optional[torch.Tensor]
+    ) -> bool:
+        """Should this eager EXTEND / MIXED / draft-extend take the long-prefix route?"""
+        if not self.use_long_prefix_extend or kv_indices is None:
+            return False
+        if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
+            return False
+        # The split count and partial buffers follow host-side shapes. A breakable
+        # prefill graph runs attention as an eager break, so only full capture opts out.
+        from sglang.srt.model_executor.runner_utils import capture_mode
+
+        if capture_mode.is_capture_mode:
+            return False
+        bs = forward_batch.batch_size
+        return bs > 0 and kv_indices.numel() >= bs * self.LONG_PREFIX_MIN_TOKENS
+
+    def _use_long_prefix_asm_prefill(
+        self, layer: RadixAttention, forward_batch: ForwardBatch, k_buffer
+    ) -> bool:
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if (
+            self.long_prefix_asm_prefill is None
+            or self.page_size != 1
+            or k_buffer.dtype != torch.float8_e4m3fn
+            or layer.qk_head_dim != 128
+            or layer.v_head_dim != 128
+            or layer.tp_q_head_num % layer.tp_k_head_num != 0
+            or layer.tp_q_head_num // layer.tp_k_head_num not in (1, 2, 4, 8, 16)
+            or forward_batch.out_cache_loc is None
+            or forward_batch.extend_start_loc is None
+            or forward_batch.extend_seq_lens is None
+            or forward_batch.seq_lens_cpu is None
+            or not extend_lens
+        ):
+            return False
+        tiles = sum((n + 127) // 128 for n in extend_lens) * layer.tp_k_head_num
+        return tiles >= self.LONG_PREFIX_ASM_MIN_TILES
+
+    def _forward_extend_long_prefix(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ):
+        """Causal extend over a long cached prefix, written into ``o``."""
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if self._use_long_prefix_asm_prefill(layer, forward_batch, k_buffer):
+            # One varlen call over prefix + chunk read back from the quantized
+            # cache, which already holds this chunk's K/V.
+            bs = forward_batch.batch_size
+            seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
+            extend_kv_indices = self.forward_metadata.out_cache_loc_full_physical
+            if extend_kv_indices is None:
+                extend_kv_indices = forward_batch.out_cache_loc
+            cu_k, slots, _ = self.build_unified_kv_indices(
+                kv_indptr,
+                kv_indices,
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
+                extend_kv_indices,
+                bs,
+            )
+            slots = slots[: int(seq_lens_cpu.sum())]
+            unit = self.unit_descale
+            if layer.k_scale is not None and layer.v_scale is not None:
+                k_descale, v_descale = (
+                    layer.k_scale.reshape(1),
+                    layer.v_scale.reshape(1),
+                )
+            else:
+                k_descale = v_descale = unit
+            out = self.long_prefix_asm_prefill(
+                q.view(-1, layer.tp_q_head_num, 128).to(k_buffer.dtype),
+                k_buffer.view(torch.uint8).index_select(0, slots).view(k_buffer.dtype),
+                v_buffer.view(torch.uint8).index_select(0, slots).view(v_buffer.dtype),
+                unit,  # Q is cast at unit scale.
+                k_descale,
+                v_descale,
+                self.forward_metadata.qo_indptr.to(torch.int32),
+                cu_k.to(torch.int32),
+                self.forward_metadata.max_extend_len,
+                int(seq_lens_cpu.max()),
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+            o.view_as(out).copy_(out)
+            return
+
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale, v_descale = layer.k_scale_float, layer.v_scale_float
+        else:
+            k_descale = v_descale = 1.0
+        self.extend_attention_fwd_long_prefix(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k_buffer,
+            v_buffer,
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            True,
+            self.forward_metadata.max_extend_len,
+            k_descale,
+            v_descale,
+            sm_scale=layer.scaling,
+            page_size=self.page_size,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:
