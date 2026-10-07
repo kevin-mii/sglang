@@ -68,28 +68,37 @@ def _store_kv_index_quant_kernel(
     loc = tl.load(loc_ptr + t).to(tl.int64)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_dv = tl.arange(0, V_HEAD_DIM)
-    for h in tl.static_range(NUM_KV_HEADS):
-        k = tl.load(k_ptr + t * sk_t + h * sk_h + offs_d)
-        tl.store(
-            kc_ptr + loc * skc_t + h * skc_h + offs_d,
-            _scale_cast(k, k_inv_scale, kc_ptr, K_SCALED),
-        )
-        v = tl.load(v_ptr + t * sv_t + h * sv_h + offs_dv)
-        tl.store(
-            vc_ptr + loc * svc_t + h * svc_h + offs_dv,
-            _scale_cast(v, v_inv_scale, vc_ptr, V_SCALED),
-        )
+    # Match the unfused stores on the reserved cuda-graph padding slot 0 (padding
+    # rows may hold NaN): store_cache skips it, the K-only index scatter does not.
+    if loc != 0:
+        for h in tl.static_range(NUM_KV_HEADS):
+            k = tl.load(k_ptr + t * sk_t + h * sk_h + offs_d)
+            tl.store(
+                kc_ptr + loc * skc_t + h * skc_h + offs_d,
+                _scale_cast(k, k_inv_scale, kc_ptr, K_SCALED),
+            )
+            v = tl.load(v_ptr + t * sv_t + h * sv_h + offs_dv)
+            tl.store(
+                vc_ptr + loc * svc_t + h * svc_h + offs_dv,
+                _scale_cast(v, v_inv_scale, vc_ptr, V_SCALED),
+            )
     offs_i = tl.arange(0, IDX_DIM)
+    idx_mask = offs_i < IDX_DIM
+    if HAS_IDX_V:
+        # the K+V index pool stores through store_cache
+        idx_mask = idx_mask & (loc != 0)
     ik = tl.load(ik_ptr + t * sik_t + offs_i)
     tl.store(
         ikc_ptr + loc * sikc_t + offs_i,
         _scale_cast(ik, ik_inv_scale, ikc_ptr, IK_SCALED),
+        mask=idx_mask,
     )
     if HAS_IDX_V:
         iv = tl.load(iv_ptr + t * siv_t + offs_i)
         tl.store(
             ivc_ptr + loc * sivc_t + offs_i,
             _scale_cast(iv, iv_inv_scale, ivc_ptr, IV_SCALED),
+            mask=idx_mask,
         )
 
 

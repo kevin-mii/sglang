@@ -98,7 +98,8 @@ def _caches(pool, layer_id):
 @pytest.mark.parametrize("layer_id", [K_ONLY_LAYER, KV_INDEX_LAYER])
 @pytest.mark.parametrize("scales", SCALE_SETS)
 @pytest.mark.parametrize(
-    "num_tokens,num_pad,loc_dtype", [(1, 0, torch.int64), (200, 7, torch.int32)]
+    "num_tokens,num_pad,loc_dtype",
+    [(1, 0, torch.int64), (13, 1, torch.int64), (200, 7, torch.int32)],
 )
 def test_fused_store_matches_unfused_pool(
     main_dtype, index_dtype, head_num, layer_id, scales, num_tokens, num_pad, loc_dtype
@@ -124,13 +125,15 @@ def test_fused_store_matches_unfused_pool(
     _store(unfused, layer_id, loc, row, head_num, scales)
     torch.cuda.synchronize()
 
-    # Several padding tokens race on slot 0, so its bytes are only defined for one.
-    first_slot = 1 if num_pad > 1 else 0
+    # Several padding tokens race on the K-only index slot 0, so its bytes are
+    # only defined for one; the store_cache-backed caches never write slot 0.
     for name, got, want in zip(
         ("k", "v", "idx_k", "idx_v"),
         _caches(fused, layer_id),
         _caches(unfused, layer_id),
     ):
+        racy_slot0 = num_pad > 1 and layer_id == K_ONLY_LAYER and name == "idx_k"
+        first_slot = 1 if racy_slot0 else 0
         got_bytes = got[first_slot:].view(torch.uint8)
         want_bytes = want[first_slot:].view(torch.uint8)
         mismatched = (got_bytes != want_bytes).any(dim=-1).sum().item()
