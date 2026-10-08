@@ -250,17 +250,11 @@ class TritonAttnBackend(AttentionBackend):
             self.use_verify_splitkv,
             target_hf_config,
         )
-        # M3's EAGLE3 draft also runs draft extend and draft decode through the verify kernel
-        self.use_shared_kv_for_draft_steps = (
+        # M3's EAGLE3 draft also runs draft extend through the verify kernel
+        self.use_shared_kv_for_draft_extend = (
             self.use_verify_shared_kv
             and model_runner.is_draft_worker
             and is_minimax_sparse(target_hf_config)
-        )
-        # decode is one extend row per request
-        self._decode_shared_kv_qo_indptr = (
-            torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
-            if self.use_shared_kv_for_draft_steps
-            else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1808,7 +1802,7 @@ class TritonAttnBackend(AttentionBackend):
             and (
                 forward_batch.forward_mode.is_target_verify()
                 or (
-                    self.use_shared_kv_for_draft_steps
+                    self.use_shared_kv_for_draft_extend
                     and forward_batch.forward_mode.is_draft_extend_v2()
                 )
             )
@@ -2399,40 +2393,6 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
-        # grouped-head decode: the new token is the extend row, so trim it from the prefix
-        if (
-            self._decode_shared_kv_qo_indptr is not None
-            and score_mod is None
-            and k is not None
-            and v is not None
-            and q.shape[0] < self._decode_shared_kv_qo_indptr.shape[0]
-            and self.verify_shared_kv_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self._decode_shared_kv_qo_indptr[: q.shape[0] + 1],
-                kv_indptr,
-                kv_indices,
-                None,
-                True,
-                None,
-                1,
-                k_descale,
-                v_descale,
-                layer.scaling,
-                logit_cap=logits_soft_cap,
-                sliding_window_size=layer.sliding_window_size,
-                sinks=sinks,
-                xai_temperature_len=layer.xai_temperature_len,
-                max_bs=self.req_to_token_pool.size,
-                kv_len_adjust=-1,
-            )
-        ):
-            return o
-
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -2477,7 +2437,6 @@ class TritonMultiStepDraftBackend:
         model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
-        target_hf_config=None,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -2497,7 +2456,6 @@ class TritonMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
-                    target_hf_config=target_hf_config,
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len

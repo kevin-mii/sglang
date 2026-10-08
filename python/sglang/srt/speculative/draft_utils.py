@@ -259,10 +259,7 @@ class DraftBackendFactory:
         return (
             "triton",
             TritonMultiStepDraftBackend(
-                self.draft_model_runner,
-                self.topk,
-                self.speculative_num_steps,
-                target_hf_config=self.target_hf_config,
+                self.draft_model_runner, self.topk, self.speculative_num_steps
             ),
         )
 

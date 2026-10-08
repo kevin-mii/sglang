@@ -94,7 +94,6 @@ def _verify_mla_prefix_stage1(
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    KV_LEN_ADJUST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -104,10 +103,7 @@ def _verify_mla_prefix_stage1(
     R: tl.constexpr = BLOCK_H * L_EXT
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    # decode passes -1: the page table already holds the new token, which is the extend row
-    cur_batch_seq_len = (
-        tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx + KV_LEN_ADJUST
-    )
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
     active = _active_splits(cur_batch_seq_len, num_splits, BLOCK_N)
 
     # skip idle workgroups
@@ -267,7 +263,6 @@ def _verify_mla_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
-    KV_LEN_ADJUST: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -287,11 +282,7 @@ def _verify_mla_combine_stage2(
     mask_l = offs_l < l_ext
 
     # ---- (a) combine prefix splits (online logsumexp over active splits) ---
-    seqlen = (
-        tl.load(kv_indptr + cur_batch + 1)
-        - tl.load(kv_indptr + cur_batch)
-        + KV_LEN_ADJUST
-    )
+    seqlen = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     active = _active_splits(seqlen, num_splits, BLOCK_N)
 
     m = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
@@ -463,7 +454,6 @@ class VerifyMLA:
         sm_scale,
         k_scale,
         v_scale,
-        kv_len_adjust=0,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
         _verify_mla_prefix_stage1[grid](
@@ -504,7 +494,6 @@ class VerifyMLA:
             BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
-            KV_LEN_ADJUST=kv_len_adjust,
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,
@@ -522,7 +511,6 @@ class VerifyMLA:
         kv_indptr,
         sm_scale,
         is_causal=True,
-        kv_len_adjust=0,
     ):
         grid = (bs, self.h_q)
         _verify_mla_combine_stage2[grid](
@@ -560,7 +548,6 @@ class VerifyMLA:
             KV_GROUP_NUM=self.kv_group_num,
             HAS_KV_HEADS=self.has_kv_heads,
             IS_CAUSAL=is_causal,
-            KV_LEN_ADJUST=kv_len_adjust,
             num_warps=4,
             num_stages=1,
         )
@@ -580,7 +567,6 @@ class VerifyMLA:
         k_scale=1.0,
         v_scale=1.0,
         is_causal=True,
-        kv_len_adjust=0,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -603,7 +589,6 @@ class VerifyMLA:
             sm_scale,
             k_scale,
             v_scale,
-            kv_len_adjust=kv_len_adjust,
         )
         self._run_combine_kernel(
             bs,
@@ -616,7 +601,6 @@ class VerifyMLA:
             kv_indptr,
             sm_scale,
             is_causal=is_causal,
-            kv_len_adjust=kv_len_adjust,
         )
         return o_out
 
@@ -768,7 +752,6 @@ def verify_shared_kv_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     max_bs=None,
-    kv_len_adjust=0,
 ):
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
@@ -838,6 +821,5 @@ def verify_shared_kv_fwd(
         k_scale=k_scale,
         v_scale=v_scale,
         is_causal=is_causal,
-        kv_len_adjust=kv_len_adjust,
     )
     return True
