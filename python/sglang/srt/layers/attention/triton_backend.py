@@ -15,6 +15,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_llama_eagle3_draft,
     is_minimax_sparse,
     is_qwen3_5,
 )
@@ -86,9 +87,7 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
-def _should_use_verify_shared_kv(
-    model_config, topk, use_mla, use_verify_splitkv, target_hf_config
-):
+def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
     if use_mla:
@@ -97,8 +96,11 @@ def _should_use_verify_shared_kv(
         return use_verify_splitkv
     return (
         use_verify_splitkv
-        # M3's EAGLE3 draft has its target's attention shape, so it follows the target
-        and (is_qwen3_5(model_config.hf_config) or is_minimax_sparse(target_hf_config))
+        and (
+            is_qwen3_5(model_config.hf_config)
+            or is_minimax_sparse(model_config.hf_config)
+            or is_llama_eagle3_draft(model_config.hf_config)
+        )
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -160,7 +162,6 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         *,
         dllm_fa4: bool = False,
-        target_hf_config=None,
     ):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
@@ -238,23 +239,17 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
-        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3 and its EAGLE3 draft).
-        # a draft runner's own config does not name the target it drafts for, so the
-        # speculative worker passes the target's; a target runner is its own target
-        if target_hf_config is None:
-            target_hf_config = model_runner.model_config.hf_config
+        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3, Llama EAGLE3 drafts).
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
-            target_hf_config,
         )
-        # M3's EAGLE3 draft also runs draft extend through the verify kernel
+        # A Llama EAGLE3 draft's v2 draft extend is the same constant-length chain
         self.use_shared_kv_for_draft_extend = (
             self.use_verify_shared_kv
-            and model_runner.is_draft_worker
-            and is_minimax_sparse(target_hf_config)
+            and is_llama_eagle3_draft(model_runner.model_config.hf_config)
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1789,7 +1784,7 @@ class TritonAttnBackend(AttentionBackend):
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
-        # per-head split-KV kernel. M3's v2 draft-extend is the same constant-length chain.
+        # per-head split-KV kernel.
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:

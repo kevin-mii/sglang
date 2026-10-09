@@ -249,42 +249,46 @@ class TestVerifySharedKV(CustomTestCase):
                 get_num_kv_heads=lambda _tp, _dcp: local_kv_heads,
             )
 
-        def gate(config, *, target=None, topk=1, use_mla=False, splitkv=True):
-            return _should_use_verify_shared_kv(
-                config, topk, use_mla, splitkv, (target or config).hf_config
-            )
-
         qwen = model_config("Qwen3_5MoeForCausalLM")
-        self.assertTrue(gate(qwen))
-        self.assertFalse(gate(qwen, topk=2))
-        self.assertFalse(gate(qwen, splitkv=False))
-        self.assertFalse(gate(model_config("Qwen3_5MoeForCausalLM", local_kv_heads=2)))
-        self.assertFalse(gate(model_config("LlamaForCausalLM")))
-        m3 = model_config("MiniMaxM3SparseForConditionalGeneration")
-        self.assertTrue(gate(m3))
+        self.assertTrue(_should_use_verify_shared_kv(qwen, 1, False, True))
+        self.assertFalse(_should_use_verify_shared_kv(qwen, 2, False, True))
+        self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, False))
         self.assertFalse(
-            gate(
-                model_config(
-                    "MiniMaxM3SparseForConditionalGeneration", local_kv_heads=2
-                )
+            _should_use_verify_shared_kv(
+                model_config("Qwen3_5MoeForCausalLM", local_kv_heads=2),
+                1,
+                False,
+                True,
             )
         )
-        # a draft follows its target, not its own architecture
-        draft = model_config("LlamaForCausalLMEagle3")
-        self.assertTrue(gate(draft, target=m3))
-        self.assertFalse(gate(draft, target=model_config("LlamaForCausalLM")))
+        self.assertFalse(
+            _should_use_verify_shared_kv(
+                model_config("LlamaForCausalLM"), 1, False, True
+            )
+        )
         self.assertTrue(
-            gate(
-                model_config("KimiK3ForConditionalGeneration"),
-                use_mla=True,
-                splitkv=False,
+            _should_use_verify_shared_kv(
+                model_config("MiniMaxM3SparseForConditionalGeneration"),
+                1,
+                False,
+                True,
+            )
+        )
+        self.assertTrue(
+            _should_use_verify_shared_kv(
+                model_config("LlamaForCausalLMEagle3"), 1, False, True
+            )
+        )
+        self.assertTrue(
+            _should_use_verify_shared_kv(
+                model_config("KimiK3ForConditionalGeneration"), 1, True, False
             )
         )
         with patch(
             "sglang.srt.layers.attention.triton_backend.is_gfx95_supported",
             return_value=False,
         ):
-            self.assertFalse(gate(qwen))
+            self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
 
 
 if __name__ == "__main__":

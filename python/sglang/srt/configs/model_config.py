@@ -255,6 +255,10 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) == "DSparkDraftModel"
 
 
+def is_llama_eagle3_draft(config) -> bool:
+    return _hf_arch(config) == "LlamaForCausalLMEagle3"
+
+
 @lru_cache
 def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
     """decision_config.json of a checkpoint whose LM head is a decision readout."""

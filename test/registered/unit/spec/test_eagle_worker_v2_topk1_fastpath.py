@@ -77,12 +77,6 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     return worker
 
 
-def _fake_target_worker(hf_config):
-    return SimpleNamespace(
-        model_runner=SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
-    )
-
-
 def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=None):
     class FakeDraftBackendFactory:
         def __init__(self, *args, **kwargs):
@@ -276,7 +270,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
-        worker.target_worker = _fake_target_worker(SimpleNamespace())
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
@@ -302,8 +295,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
-        target_hf_config = SimpleNamespace()
-        worker.target_worker = _fake_target_worker(target_hf_config)
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True
@@ -322,7 +313,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
         self.assertIs(worker.draft_runner.attn_backend, draft_extend_backend)
         self.assertTrue(factory_kwargs["seed_dsa_topk_from_draft_extend"])
-        self.assertIs(factory_kwargs["target_hf_config"], target_hf_config)
 
     def _make_adaptive_worker(self, runner_attn_backend):
         """An EAGLEWorkerV2 with a draft worker whose state-machine fields are
