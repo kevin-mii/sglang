@@ -33,6 +33,19 @@ class RouteSortOutput(NamedTuple):
     a1_scale: Optional[torch.Tensor] = None
 
 
+class BankPartials(NamedTuple):
+    """The next layer's attention-residual bank partials, computed by the route
+    sort's spare workgroups (csrc/kimi_k3/attn_res/bank_partial_hip.cuh)."""
+
+    bank: torch.Tensor  # [T, NB, H] bf16, read over rows [0, nvb)
+    nvb: int
+    # [H] fp32 each, score norm weight * proj weight: side 0's, and side 1's or None
+    score_weights: tuple[torch.Tensor, Optional[torch.Tensor]]
+    score_eps: float
+    acc: torch.Tensor  # [2, >= T, H] fp32, side s in acc[s]
+    ms: torch.Tensor  # [2, >= T, 2] fp32
+
+
 @cache_once
 def _jit_route_sort_module(
     num_experts: int,
@@ -69,6 +82,13 @@ def covered(
     )
 
 
+def direct_covered(num_tokens: int, topk: int, num_experts: int, block_m: int) -> bool:
+    """Whether aiter's sort buffer sizes hold one block per route."""
+    return (
+        num_tokens * topk * block_m <= num_tokens * topk + num_experts * block_m - topk
+    )
+
+
 def quant_covered(quant_input: torch.Tensor) -> bool:
     cols = quant_input.shape[-1]
     return (
@@ -94,12 +114,17 @@ def route_sort(
     renormalize: bool,
     quant_input: Optional[torch.Tensor] = None,
     topk_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    direct: bool = False,
+    partials: Optional[BankPartials] = None,
 ) -> RouteSortOutput:
     """Top-k of sigmoid(router_logits) + bias, sorted into aiter's block-padded
     route layout; moe_buf ([M, model_dim], allocated when None) is zeroed.
     With quant_input ([M, D] bf16, the routed activations) the stage-1 MXFP8
     quant + scale sort is fused in as well. topk_output = (weights [M, topk]
-    fp32, ids [M, topk] int32) from an earlier kernel skips the top-k."""
+    fp32, ids [M, topk] int32) from an earlier kernel skips the top-k. direct
+    keeps the routes in selection order, one block each (direct_covered()),
+    instead of grouping them by expert. partials adds the workgroups that compute
+    them, one per row of partials.bank."""
     num_tokens, num_experts = router_logits.shape
     device = router_logits.device
     # Same sizes as aiter.fused_moe._moe_sorting_impl.
@@ -153,6 +178,24 @@ def route_sort(
         block_m,
         float(routed_scaling_factor),
         renormalize,
+        direct,
+        *(
+            (sorted_ids,) * 5 + (0, 0, 0, 0.0)
+            if partials is None
+            else (
+                partials.bank,
+                partials.score_weights[0],
+                partials.score_weights[1]
+                if partials.score_weights[1] is not None
+                else partials.score_weights[0],
+                partials.acc,
+                partials.ms,
+                partials.nvb,
+                1 if partials.score_weights[1] is None else 2,
+                partials.bank.shape[0],
+                float(partials.score_eps),
+            )
+        ),
     )
     return RouteSortOutput(
         topk_weights,

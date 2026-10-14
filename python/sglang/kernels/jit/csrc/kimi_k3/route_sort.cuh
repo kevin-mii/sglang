@@ -9,6 +9,11 @@
 //                         expert's rows; padding (topk << 24) | num_tokens, weight 0
 //   num_valid_ids         {num_blocks * block_m, num_tokens}
 // Entries past the valid range are left untouched, as aiter's kernel does.
+// With direct set the routes are not grouped by expert: route t * topk + k is block
+// t * topk + k (expert ids in route order, repeats allowed) with one valid row, so the
+// expert GEMMs walk each token's routes as selected.
+// Workgroups past the first compute the next layer's attention-residual bank partials
+// (attn_res/bank_partial_hip.cuh), one per token row, while the first sorts.
 // Scores follow topk_reg_kernel: sig = rcp(1 + 2^(-log2e * x)), the selection
 // key is sig + bias, the weight is the pre-bias sig, renormalized in descending
 // order; exact score ties go to the lower expert id.
@@ -23,6 +28,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "attn_res/bank_partial_hip.cuh"
 #include "route_topk.cuh"
 #include <cstdint>
 
@@ -55,6 +61,8 @@ struct K3RouteSortParams {
   int32_t block_m;
   float routed_scaling_factor;
   bool renormalize;
+  bool direct;
+  k3_attn_res_read::PartialParams partials;
 };
 
 inline constexpr int kRouteSortThreads = 1024;
@@ -126,6 +134,12 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
   __shared__ uint8_t s_qscale[kFuseQuant ? kRouteSortMaxTokens : 1][kFuseQuant ? kRouteSortMaxGroups : 1];
   __shared__ int32_t s_route_row[kFuseQuant ? kRouteSortMaxTokens * kTopK : 1];  // sorted row of each route
 
+  static_assert(k3_attn_res_read::kThreads <= kRouteSortThreads, "a partial workgroup covers a row");
+  if (blockIdx.x > 0) {
+    __shared__ k3_attn_res_read::PartialShared s_partial;
+    k3_attn_res_read::attn_res_partials(p.partials, s_partial, static_cast<int>(blockIdx.x) - 1);
+    return;
+  }
   const int tid = threadIdx.x;
   const int lane = tid % kRouteSortWave;
   const int wave = tid / kRouteSortWave;
@@ -200,63 +214,86 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
   if (tid == 0) k3rs_ts[7] = __builtin_amdgcn_s_memtime();
 #endif
 
-  // ---- block layout: exclusive scan of ceil(count / block_m) over experts (one per thread)
   const int block_m = p.block_m;
-  const int count = tid < kExperts ? __popcll(s_mask[tid]) : 0;
-  const int nblk = (count + block_m - 1) / block_m;
-  int incl;
-  if (num_tokens <= block_m) {
-    // nblk is 0 or 1: the in-wave prefix is a popcount of the ballot.
-    const uint64_t active = __ballot(nblk > 0);
-    incl = __popcll(active & lanemask_lt) + nblk;
-    if (lane == 0) s_wave_prefix[wave] = __popcll(active);
-  } else {
-    incl = nblk;
-#pragma unroll
-    for (int offset = 1; offset < kRouteSortWave; offset <<= 1) {
-      const int v = __shfl_up(incl, offset, kRouteSortWave);
-      if (lane >= offset) incl += v;
-    }
-    if (lane == kRouteSortWave - 1) s_wave_prefix[wave] = incl;
-  }
-  __syncthreads();
-  int wave_base = 0;
-  int total_blocks = 0;
-#pragma unroll
-  for (int w = 0; w < kRouteSortWaves; ++w) {
-    const int v = s_wave_prefix[w];
-    wave_base += w < wave ? v : 0;
-    total_blocks += v;
-  }
-
-  // Every valid row first gets the padding entry (16-byte stores spread over
-  // all threads); after the barrier the route rows overwrite theirs.
   const int pad_id = (kTopK << 24) | num_tokens;
-  if (tid < kExperts && nblk > 0) {
-    const int boff = incl - nblk + wave_base;
-    s_boff[tid] = boff;
-    for (int j = 0; j < nblk; ++j)
-      p.sorted_expert_ids[boff + j] = tid;
-  }
-  const int total_rows = total_blocks * block_m;
-  if (tid == 0) {
-    p.num_valid_ids[0] = total_rows;
-    p.num_valid_ids[1] = num_tokens;
-  }
-  for (int v = tid; v < total_rows / 4; v += kRouteSortThreads) {
-    reinterpret_cast<int4*>(p.sorted_ids)[v] = make_int4(pad_id, pad_id, pad_id, pad_id);
-    reinterpret_cast<float4*>(p.sorted_weights)[v] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-  }
-  __syncthreads();
+  if (p.direct) {
+    // ---- route-direct layout: block r holds route r alone, in its first row
+    const int routes = num_tokens * kTopK;
+    const int total_rows = routes * block_m;
+    if (tid == 0) {
+      p.num_valid_ids[0] = total_rows;
+      p.num_valid_ids[1] = num_tokens;
+    }
+    for (int v = tid; v < total_rows / 4; v += kRouteSortThreads) {
+      reinterpret_cast<int4*>(p.sorted_ids)[v] = make_int4(pad_id, pad_id, pad_id, pad_id);
+      reinterpret_cast<float4*>(p.sorted_weights)[v] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    __syncthreads();
+    for (int route = tid; route < routes; route += kRouteSortThreads) {
+      const int t = route / kTopK;
+      const int k = route % kTopK;
+      p.sorted_expert_ids[route] = s_ids[t][k];
+      p.sorted_ids[route * block_m] = (k << 24) | t;
+      p.sorted_weights[route * block_m] = s_w[t][k];
+      if constexpr (kFuseQuant) s_route_row[route] = route * block_m;
+    }
+  } else {
+    // ---- block layout: exclusive scan of ceil(count / block_m) over experts (one per thread)
+    const int count = tid < kExperts ? __popcll(s_mask[tid]) : 0;
+    const int nblk = (count + block_m - 1) / block_m;
+    int incl;
+    if (num_tokens <= block_m) {
+      // nblk is 0 or 1: the in-wave prefix is a popcount of the ballot.
+      const uint64_t active = __ballot(nblk > 0);
+      incl = __popcll(active & lanemask_lt) + nblk;
+      if (lane == 0) s_wave_prefix[wave] = __popcll(active);
+    } else {
+      incl = nblk;
+#pragma unroll
+      for (int offset = 1; offset < kRouteSortWave; offset <<= 1) {
+        const int v = __shfl_up(incl, offset, kRouteSortWave);
+        if (lane >= offset) incl += v;
+      }
+      if (lane == kRouteSortWave - 1) s_wave_prefix[wave] = incl;
+    }
+    __syncthreads();
+    int wave_base = 0;
+    int total_blocks = 0;
+#pragma unroll
+    for (int w = 0; w < kRouteSortWaves; ++w) {
+      const int v = s_wave_prefix[w];
+      wave_base += w < wave ? v : 0;
+      total_blocks += v;
+    }
 
-  for (int route = tid; route < num_tokens * kTopK; route += kRouteSortThreads) {
-    const int t = route / kTopK;
-    const int k = route % kTopK;
-    const int e = s_ids[t][k];
-    const int row = s_boff[e] * block_m + __popcll(s_mask[e] & ((1ull << t) - 1ull));
-    p.sorted_ids[row] = (k << 24) | t;
-    p.sorted_weights[row] = s_w[t][k];
-    if constexpr (kFuseQuant) s_route_row[route] = row;
+    // Every valid row first gets the padding entry (16-byte stores spread over
+    // all threads); after the barrier the route rows overwrite theirs.
+    if (tid < kExperts && nblk > 0) {
+      const int boff = incl - nblk + wave_base;
+      s_boff[tid] = boff;
+      for (int j = 0; j < nblk; ++j)
+        p.sorted_expert_ids[boff + j] = tid;
+    }
+    const int total_rows = total_blocks * block_m;
+    if (tid == 0) {
+      p.num_valid_ids[0] = total_rows;
+      p.num_valid_ids[1] = num_tokens;
+    }
+    for (int v = tid; v < total_rows / 4; v += kRouteSortThreads) {
+      reinterpret_cast<int4*>(p.sorted_ids)[v] = make_int4(pad_id, pad_id, pad_id, pad_id);
+      reinterpret_cast<float4*>(p.sorted_weights)[v] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    __syncthreads();
+
+    for (int route = tid; route < num_tokens * kTopK; route += kRouteSortThreads) {
+      const int t = route / kTopK;
+      const int k = route % kTopK;
+      const int e = s_ids[t][k];
+      const int row = s_boff[e] * block_m + __popcll(s_mask[e] & ((1ull << t) - 1ull));
+      p.sorted_ids[row] = (k << 24) | t;
+      p.sorted_weights[row] = s_w[t][k];
+      if constexpr (kFuseQuant) s_route_row[route] = row;
+    }
   }
   if constexpr (kFuseQuant) {
     __syncthreads();
@@ -320,7 +357,17 @@ struct K3RouteSortKernel {
       const tvm::ffi::TensorView a1_scale,
       const int64_t block_m,
       const double routed_scaling_factor,
-      const bool renormalize) {
+      const bool renormalize,
+      const bool direct,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw0,
+      const tvm::ffi::TensorView cw1,
+      const tvm::ffi::TensorView bank_acc,
+      const tvm::ffi::TensorView bank_ms,
+      const int64_t nvb,
+      const int64_t sides,
+      const int64_t partial_rows,
+      const double score_eps) {
     using namespace host;
 
     auto M = SymbolicSize{"num_tokens"};
@@ -342,6 +389,9 @@ struct K3RouteSortKernel {
         max_rows >= num_tokens * kTopK + kExperts * block_m - kTopK && sorted_weights.numel() >= max_rows &&
             sorted_expert_ids.numel() * block_m >= max_rows,
         "sorted buffers are smaller than aiter's moe_sorting sizes");
+    RuntimeCheck(
+        !direct || (num_tokens * kTopK * block_m <= max_rows && sorted_expert_ids.numel() >= num_tokens * kTopK),
+        "the route-direct layout needs a block per route");
     const int64_t moe_buf_bytes = moe_buf.numel() * static_cast<int64_t>(moe_buf.dtype().bits / 8);
     RuntimeCheck(moe_buf_bytes % 16 == 0, "moe_buf must be a whole number of 16-byte vectors");
     int32_t quant_cols = 0, scale_n_pad = 0;
@@ -357,6 +407,45 @@ struct K3RouteSortKernel {
       RuntimeCheck(a1_scale.numel() >= (max_rows + 31) / 32 * 32 * scale_n_pad, "a1_scale too small");
     }
 
+    k3_attn_res_read::PartialParams partials{};
+    if (partial_rows > 0) {
+      // bank [R, NB, H] bf16 read over rows [0, nvb); cw0 (and cw1 with two sides) [H] fp32;
+      // bank_acc [2, >= R, H] and bank_ms [2, >= R, 2] fp32, side s in [s].
+      namespace ar = k3_attn_res_read;
+      auto R = SymbolicSize{"partial_rows"};
+      auto NB = SymbolicSize{"bank_blocks"};
+      auto RA = SymbolicSize{"partial_capacity"};
+      TensorMatcher({R, NB, ar::kHidden})
+          .with_dtype<bf16_t>()
+          .with_device(device_)
+          .with_strides({-1, -1, 1})
+          .verify(bank);
+      TensorMatcher({ar::kHidden}).with_dtype<float>().with_device(device_).verify(cw0);
+      if (sides == 2) TensorMatcher({ar::kHidden}).with_dtype<float>().with_device(device_).verify(cw1);
+      TensorMatcher({2, RA, ar::kHidden}).with_dtype<float>().with_device(device_).verify(bank_acc);
+      TensorMatcher({2, RA, 2}).with_dtype<float>().with_device(device_).verify(bank_ms);
+      RuntimeCheck(R.unwrap() == partial_rows && partial_rows <= RA.unwrap(), "bank partial rows");
+      RuntimeCheck(sides == 1 || sides == 2, "one or two score vectors");
+      RuntimeCheck(1 <= nvb && nvb <= ar::kMaxNvb && nvb <= NB.unwrap(), "bank partials take 1-8 bank rows");
+      RuntimeCheck(
+          bank.stride(0) % ar::kVec == 0 && bank.stride(1) % ar::kVec == 0, "bank rows must be 16-byte aligned");
+      auto* acc = static_cast<float*>(bank_acc.data_ptr());
+      auto* ms = static_cast<float*>(bank_ms.data_ptr());
+      const int64_t capacity = RA.unwrap();
+      partials = ar::PartialParams{
+          .bank = static_cast<const bf16_t*>(bank.data_ptr()),
+          .bank_stride_t = bank.stride(0),
+          .bank_stride_b = bank.stride(1),
+          .cw =
+              {static_cast<const float4*>(cw0.data_ptr()),
+               sides == 2 ? static_cast<const float4*>(cw1.data_ptr()) : nullptr},
+          .acc = {reinterpret_cast<float4*>(acc), reinterpret_cast<float4*>(acc + capacity * ar::kHidden)},
+          .ms = {reinterpret_cast<float2*>(ms), reinterpret_cast<float2*>(ms + capacity * 2)},
+          .score_eps = static_cast<float>(score_eps),
+          .nvb = static_cast<int32_t>(nvb),
+          .rows = static_cast<int32_t>(partial_rows),
+      };
+    }
     const auto params = K3RouteSortParams{
         .logits = static_cast<const bf16_t*>(logits.data_ptr()),
         .bias = bias.data_ptr(),
@@ -379,8 +468,10 @@ struct K3RouteSortKernel {
         .block_m = static_cast<int32_t>(block_m),
         .routed_scaling_factor = static_cast<float>(routed_scaling_factor),
         .renormalize = renormalize,
+        .direct = direct,
+        .partials = partials,
     };
-    LaunchKernel(1, kRouteSortThreads, device_.unwrap())(
+    LaunchKernel(1 + static_cast<uint32_t>(partial_rows), kRouteSortThreads, device_.unwrap())(
         k3_route_sort_kernel<kExperts, kTopK, TBias, kFuseQuant, kPrecomputed>, params);
   }
 };

@@ -2190,6 +2190,9 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        # One launch for the q_a / kv_a RMSNorms and q_b_proj on ROCm decode-sized
+        # batches (kernels/ops/attention/mla_q_norm_proj.py); a model sets it after loading.
+        self.fused_q_norm_proj = False
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2260,9 +2263,7 @@ class DeepseekV2AttentionMLA(
         [T, heads * v_head_dim] o_proj input, or None to take the plain bmm.
         On ROCm a decode-sized bf16 bmm runs as one Triton kernel."""
         if not (
-            _is_hip
-            and isinstance(self.w_scale, (int, float))
-            and self.w_scale == 1.0
+            _is_hip and isinstance(self.w_scale, (int, float)) and self.w_scale == 1.0
         ):
             return None
         from sglang.kernels.ops.attention import mla_v_up_gate

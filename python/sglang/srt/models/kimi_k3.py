@@ -35,7 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
+from sglang.srt.layers.attn_residual import BankPartial, aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -180,6 +180,8 @@ _fused_route_sort_max_tokens = (
 if _fused_route_sort_max_tokens > 0:
     from sglang.kernels.ops.moe import kimi_k3_route_sort
     from sglang.srt.layers.moe import moe_sort_handoff
+_route_direct_max_tokens = envs.SGLANG_ROCM_K3_MOE_ROUTE_DIRECT_MAX_TOKENS.get()
+_bank_partials_enabled = envs.SGLANG_ROCM_K3_ATTN_RES_BANK_PARTIALS.get()
 # aiter's tuned K3 A8W4 MoE rows (model_configs/kimik3_a8w4_tuned_fmoe.csv) all
 # sort with block_m 32; the handoff falls back to aiter's sort on a mismatch.
 _ROUTE_SORT_BLOCK_M = 32
@@ -191,6 +193,9 @@ _SPLIT_FRONT_MAX_TOKENS = 64
 # From here the front gather also runs the router top-k: its extra ~3.5 us plus the
 # precomputed sort beat route_sort's own top-k from 16 tokens on MI350X (7.9 vs 9.8 us).
 _GATHER_TOPK_MIN_TOKENS = 16
+# Decode batches whose attention-residual reads take bank partials from the route
+# sort. MI350X EAGLE3 decode cycle: C1 -1.6%, C4 -0.6%; C16 (64 rows) +3%, so not there.
+_BANK_PARTIALS_MAX_TOKENS = 16
 # The fused route+quant kernel quantizes on one workgroup: a win up to 8 tokens
 # (10.2 vs 22.4 us at 4 on MI350X), even with aiter's quant launch at 16.
 _ROUTE_QUANT_MAX_TOKENS = 8
@@ -540,6 +545,9 @@ class NextAttnRead(msgspec.Struct, frozen=True):
     norm: nn.Module
     writes_block: bool
     comm: object  # k3_ll_comm_hip.get_comm()
+    # The next layer's FFN-side read scoring, for its bank partials.
+    ffn_score_proj: nn.Module
+    ffn_score_norm: nn.Module
 
 
 class KimiK3MoE(nn.Module):
@@ -860,9 +868,17 @@ class KimiK3MoE(nn.Module):
             "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
+            "_front_situ_eligible",
         ):
             self.__dict__.pop(prop, None)
         self._build_split_front()
+        if self._front_situ_eligible:
+            from sglang.kernels.ops.gemm import kimi_k3_front_situ
+
+            act = self.shared_experts.act_fn
+            kimi_k3_front_situ.warmup(
+                self._front_w, self._front_sizes[0], act.beta, act.linear_beta
+            )
 
     def _build_split_front(self) -> None:
         """The column-parallel front's weight: the TP-sharded shared gate_up and
@@ -1526,6 +1542,71 @@ class KimiK3MoE(nn.Module):
             # The A8W4 experts quantize these rows first; fold that in too.
             quant_input=routed_input if fuse_quant else None,
             topk_output=topk_output,
+            direct=self._route_direct(router_logits.shape[0]),
+            partials=self._next_bank_partials(router_logits.shape[0]),
+        )
+
+    def _next_bank_partials(
+        self, num_tokens: int
+    ) -> Optional["kimi_k3_route_sort.BankPartials"]:
+        """The next layer's attention-residual bank partials for the route sort's
+        spare workgroups to compute, staged for that layer's fused reads: the
+        attention side (the column tail's all-gather read) and, unless the layer
+        writes a block, the FFN side when its all-reduce read takes the batch."""
+        read = self.next_attn_read
+        if read is None or not (_bank_partials_enabled and _use_fused_latent_tail):
+            return None
+        bank = read.bank.require()
+        nvb = bank.num_valid_blocks
+        # One bank row reads faster than its fp32 partial (64 rows: 15.5 vs 16.7 us).
+        if (
+            not 2 <= nvb <= k3_attn_res_read_hip.MAX_NVB
+            or bank.written_on_slice
+            or bank.block_residual.shape[0] != num_tokens
+            or num_tokens > _BANK_PARTIALS_MAX_TOKENS
+        ):
+            return None
+        comm = read.comm
+        eps = read.score_norm.variance_epsilon
+        ffn = (
+            not read.writes_block
+            and read.ffn_score_norm.variance_epsilon == eps
+            and (
+                num_tokens in k3_attn_res_read_hip.AR_READ_ROWS
+                or num_tokens in k3_attn_res_read_hip.AR2_READ_ROWS
+            )
+        )
+        reads = [(read.score_proj, read.score_norm)]
+        if ffn:
+            reads.append((read.ffn_score_proj, read.ffn_score_norm))
+        for side, (proj, _) in enumerate(reads):
+            bank.stage_bank_partial(
+                side,
+                BankPartial(
+                    proj, nvb, num_tokens, comm.bank_acc[side], comm.bank_ms[side]
+                ),
+            )
+        return kimi_k3_route_sort.BankPartials(
+            bank=bank.block_residual,
+            nvb=nvb,
+            score_weights=(
+                get_cw(*reads[0]),
+                get_cw(*reads[1]) if ffn else None,
+            ),
+            score_eps=eps,
+            acc=comm.bank_acc,
+            ms=comm.bank_ms,
+        )
+
+    def _route_direct(self, num_tokens: int) -> bool:
+        return (
+            num_tokens <= _route_direct_max_tokens
+            and kimi_k3_route_sort.direct_covered(
+                num_tokens,
+                self.topk.topk_config.top_k,
+                self.gate.weight.shape[0],
+                _ROUTE_SORT_BLOCK_M,
+            )
         )
 
     def _forward_routed(
@@ -1638,6 +1719,8 @@ class KimiK3MoE(nn.Module):
         quantized = routes = activated = None
         if front is not None:
             gate_up, router_logits, routed_input, quantized, routes, activated = front
+        elif (front := self._front_situ(hidden_states)) is not None:
+            gate_up, router_logits, routed_input, activated = front
         else:
             fused = _k3_bf16_gemm(
                 hidden_states,
@@ -1705,7 +1788,7 @@ class KimiK3MoE(nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
+                self._forward_shared(gate_up, shared_output, activated)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
                 k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
@@ -1805,7 +1888,11 @@ class KimiK3MoE(nn.Module):
         return (
             _is_hip
             and 0 < min_tokens <= num_tokens
-            and num_tokens > _COLUMN_TAIL_MAX_TOKENS
+            # A threshold inside the column tail's range takes those batches from it.
+            and (
+                num_tokens > _COLUMN_TAIL_MAX_TOKENS
+                or min_tokens <= _COLUMN_TAIL_MAX_TOKENS
+            )
             and self.tp_size > 1
             and has_prefix
             and not k3_ar_fusion.enabled()
@@ -1897,6 +1984,39 @@ class KimiK3MoE(nn.Module):
         quantized = (g.a1, g.a1_scale) if quant else None
         routes = None if bias is None else (g.topk_weights, g.topk_ids)
         return gate_up, g.logits, g.latent, quantized, routes, g.situ
+
+    @cached_property
+    def _front_situ_eligible(self) -> bool:
+        act = self.shared_experts.act_fn if self.shared_experts is not None else None
+        return (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_FRONT_SITU.get()
+            and self._eligible_for_fused_front
+            and not self._front_fp32
+            and self._front_w.dtype == torch.bfloat16
+            and isinstance(act, SituAndMul)
+            and act.linear_beta is not None
+        )
+
+    def _front_situ(self, hidden_states: torch.Tensor):
+        """(None, router logits, latent, SiTU of the shared gate_up) from one GEMM
+        over the merged front weight with the activation in its epilogue, for the
+        prefill sizes where it beats the GEMM + SiTU pair; None otherwise."""
+        from sglang.kernels.ops.gemm import kimi_k3_front_situ
+
+        num_tokens = hidden_states.shape[0]
+        if not (
+            self._front_situ_eligible
+            and kimi_k3_front_situ.covered(num_tokens)
+            and hidden_states.stride(-1) == 1
+        ):
+            return None
+        act = self.shared_experts.act_fn  # type: ignore
+        gate_up_rows, num_experts = self._front_sizes[0], self._front_sizes[1]
+        activated, rest = kimi_k3_front_situ.front_situ(
+            hidden_states, self._front_w, gate_up_rows, act.beta, act.linear_beta
+        )
+        return None, rest[:, :num_experts], rest[:, num_experts:], activated
 
     def _column_tail_and_next_read(
         self,
@@ -3201,6 +3321,8 @@ class KimiK3DecoderLayer(nn.Module):
         """ROCm: the batch-size predicate under which the FFN read completes the
         attention output's sum on this rank's rows and leaves the written
         residual there for the row-sharded latent-MoE tail, or None."""
+        if self._sp_moe or self.all_reduce_fusion:
+            return None
         if not (
             _is_hip
             and envs.SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ.get()
@@ -3208,11 +3330,13 @@ class KimiK3DecoderLayer(nn.Module):
             and isinstance(self.mlp, KimiK3MoE)
         ):
             return None
-        if self._sp_moe or self.all_reduce_fusion:
-            return None
         if get_parallel().attn_tp_size != get_parallel().tp_size:
             return None
-        return self.mlp.takes_row_sharded_tail
+        attn_min = envs.SGLANG_ROCM_K3_ROW_SHARDED_ATTN_MIN_TOKENS.get()
+        if attn_min <= 0:
+            return self.mlp.takes_row_sharded_tail
+        tail = self.mlp.takes_row_sharded_tail
+        return lambda num_tokens: num_tokens >= attn_min and tail(num_tokens)
 
     def _ffn_input_fusions(self):
         """K3's kernels that complete the attention output's sum with the
@@ -3420,6 +3544,8 @@ class KimiK3LinearModel(nn.Module):
                 norm=nxt.input_layernorm,
                 writes_block=nxt.is_block_write_layer,
                 comm=comm,
+                ffn_score_proj=nxt.mlp_res_proj,
+                ffn_score_norm=nxt.mlp_res_norm,
             )
 
     def forward(
@@ -4035,6 +4161,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            self_attn.fused_q_norm_proj = (
+                _is_hip
+                and envs.SGLANG_ROCM_K3_MLA_Q_NORM_PROJ.get()
+                and self_attn.q_lora_rank is not None
+                and self_attn.q_b_proj.weight.dtype == torch.bfloat16
+                and self_attn.q_b_proj.weight.is_contiguous()
+            )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the

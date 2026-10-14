@@ -31,6 +31,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include "../comm/ll_hip.cuh"
+#include "bank_partial_hip.cuh"
 #include <cstdint>
 #include <custom_all_reduce.cuh>  // AITER csrc/include: CustomAllreduce, Signal
 
@@ -44,12 +45,6 @@ namespace k3_attn_res_read {
 using namespace k3_ll;
 
 inline constexpr int kWorld = 8;
-inline constexpr int kHidden = 7168;
-inline constexpr int kVec = 8;  // bf16 per thread: one 16-byte vector of the row
-inline constexpr int kThreads = kHidden / kVec;
-inline constexpr int kWave = 64;
-inline constexpr int kWaves = kThreads / kWave;
-inline constexpr int kMaxNvb = 8;
 inline constexpr int kMaxRows = 64;
 inline constexpr int kSlice = kHidden / kWorld;  // all-gather columns per rank
 inline constexpr int kSliceThreads = kSlice / kVec;
@@ -71,6 +66,14 @@ inline constexpr int kArLinesPerRow = 2 * kThreads;
 inline constexpr int64_t kArEpochLines = int64_t{kWorld} * kArMaxRows * kArLinesPerRow;
 inline constexpr int64_t kArRegionLine = 2 * kAgEpochLines + 2 * int64_t{kWorld} * kMaxRows * 144;
 inline constexpr int kArPushers = kWorld - 1;  // pusher workgroups per row, one per peer
+// The two-shot variant (k3_ar2_attn_res_kernel): row t belongs to rank t % kWorld. Its sum region
+// takes the other ranks' partials of the owner's rows, its out region the owners' sums.
+inline constexpr int kAr2MaxRows = 64;
+inline constexpr int kAr2OwnedRows = kAr2MaxRows / kWorld;
+inline constexpr int64_t kAr2SumEpochLines = int64_t{kWorld} * kAr2OwnedRows * kArLinesPerRow;
+inline constexpr int64_t kAr2SumRegionLine = kArRegionLine + 2 * kArEpochLines;
+inline constexpr int64_t kAr2OutEpochLines = int64_t{kAr2MaxRows} * kArLinesPerRow;
+inline constexpr int64_t kAr2OutRegionLine = kAr2SumRegionLine + 2 * kAr2SumEpochLines;
 static_assert(kThreads % kWave == 0 && kSlice % kVec == 0, "whole waves and vectors");
 
 struct Params {
@@ -87,7 +90,10 @@ struct Params {
   int32_t* __restrict__ epochs;  // [kEpochs], rank-local
   int64_t bank_stride_t;         // elements
   int64_t bank_stride_b;
-  int32_t nvb_write;  // bank row the prefix is snapshotted into, or -1
+  // AttnResRead<0>: the bank's softmax partials for this read (bank_partial_hip.cuh).
+  const float4* __restrict__ bank_acc;  // [T, H] fp32
+  const float2* __restrict__ bank_ms;   // [T] (m, sum)
+  int32_t nvb_write;                    // bank row the prefix is snapshotted into, or -1
   int32_t rank;
   float score_eps;
   float out_eps;
@@ -105,53 +111,12 @@ struct Params {
   const uint4* __restrict__ residual;
   int32_t* __restrict__ ar_epochs;  // [kArMaxRows], rank-local
   int32_t* __restrict__ ar_pushed;  // [kArMaxRows], rank-local, left at 0
+  // Two-shot all-reduce read: per-row flags and, per row, the count of this rank's workgroups
+  // done with the row's flag (left at 0 between launches).
+  int32_t* __restrict__ ar2_epochs;  // [kAr2MaxRows], rank-local
+  int32_t* __restrict__ ar2_done;    // [kAr2MaxRows], rank-local
+  int32_t rows;
 };
-
-SGL_DEVICE float bf16_lo(uint32_t w) {
-  return __uint_as_float(w << 16);
-}
-
-SGL_DEVICE float bf16_hi(uint32_t w) {
-  return __uint_as_float(w & 0xffff0000u);
-}
-
-// Round to nearest even, as torch and Triton convert fp32 to bf16.
-SGL_DEVICE uint32_t bf16_bits(float f) {
-  const uint32_t u = __float_as_uint(f);
-  if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fc0u;
-  return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
-}
-
-SGL_DEVICE uint32_t pack_bf16(float lo, float hi) {
-  return bf16_bits(lo) | (bf16_bits(hi) << 16);
-}
-
-SGL_DEVICE void unpack8(const uint4& v, float (&f)[kVec]) {
-  f[0] = bf16_lo(v.x), f[1] = bf16_hi(v.x), f[2] = bf16_lo(v.y), f[3] = bf16_hi(v.y);
-  f[4] = bf16_lo(v.z), f[5] = bf16_hi(v.z), f[6] = bf16_lo(v.w), f[7] = bf16_hi(v.w);
-}
-
-SGL_DEVICE uint4 pack8(const float (&f)[kVec]) {
-  return make_uint4(pack_bf16(f[0], f[1]), pack_bf16(f[2], f[3]), pack_bf16(f[4], f[5]), pack_bf16(f[6], f[7]));
-}
-
-template <int kCtrl>
-SGL_DEVICE float dpp(float v) {
-  return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), kCtrl, 0xf, 0xf, false));
-}
-
-// Sum over the wave, uniform in every lane: DPP butterflies inside each 16-lane row
-// (quad_perm [1,0,3,2], [2,3,0,1], row_half_mirror, row_mirror), then the four row sums
-// via readlane. __shfl_xor would run every step through the LDS crossbar.
-SGL_DEVICE float wave_sum(float v) {
-  v += dpp<0xb1>(v);
-  v += dpp<0x4e>(v);
-  v += dpp<0x141>(v);
-  v += dpp<0x140>(v);
-  const int bits = __float_as_int(v);
-  return (__int_as_float(__builtin_amdgcn_readlane(bits, 0)) + __int_as_float(__builtin_amdgcn_readlane(bits, 16))) +
-         (__int_as_float(__builtin_amdgcn_readlane(bits, 32)) + __int_as_float(__builtin_amdgcn_readlane(bits, 48)));
-}
 
 // The attention-residual read of one row: bank rows + cw are this thread's vectors.
 template <int kNvb>
@@ -258,6 +223,85 @@ struct AttnResRead {
       sq += mix[e] * mix[e];
     sq = wave_sum(sq);
     if (lane == 0) s.sq[wave] = sq;
+    lds_barrier();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w)
+      total += s.sq[w];
+    const float scale = 1.0f / sqrtf(total / kHidden + p.out_eps);
+
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      mix[e] = mix[e] * scale * ow[e];
+    return pack8(mix);
+  }
+};
+
+// The read with the bank's softmax partials computed ahead (bank_acc, bank_ms): only the
+// stream is scored once the collective completes, then merged as one more candidate.
+template <>
+struct AttnResRead<0> {
+  struct Shared {
+    float part[kWaves][2];  // the stream's (dot, sumsq)
+    float weight[2];        // the partial's scale and the stream's weight
+    float sq[kWaves];
+  };
+
+  float acc[kVec];
+  float2 ms;
+  float cw[kVec];
+  float ow[kVec];
+
+  SGL_DEVICE void load(const Params& p, int t, int tid) {
+    load_fp32x8(p.bank_acc + (static_cast<int64_t>(t) * kThreads + tid) * 2, acc);
+    ms = p.bank_ms[t];
+    load_fp32x8(p.cw + 2 * tid, cw);
+    // Loaded up front: a load after the collective's stores would wait for their acks.
+    load_fp32x8(p.ow + 2 * tid, ow);
+  }
+
+  // Nothing to score, but the kernels' push and poll sides must stay apart: a convergent
+  // point keeps a wave's pushing lanes from being held back behind its polling lanes.
+  SGL_DEVICE void score_bank(Shared&, int, int, int) const {
+    __builtin_amdgcn_wave_barrier();
+  }
+
+  SGL_DEVICE uint4 finish(Shared& s, const Params& p, const float (&prefix)[kVec], int tid, int wave, int lane) const {
+    float dot = 0.f, sq = 0.f;
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      dot += prefix[e] * cw[e], sq += prefix[e] * prefix[e];
+    dot = wave_sum(dot);
+    sq = wave_sum(sq);
+    if (lane == 0) s.part[wave][0] = dot, s.part[wave][1] = sq;
+    lds_barrier();
+    if (tid == 0) {
+      float d = 0.f, q = 0.f;
+#pragma unroll
+      for (int w = 0; w < kWaves; ++w)
+        d += s.part[w][0], q += s.part[w][1];
+      const float score = d / sqrtf(q / kHidden + p.score_eps);
+      const float m = fmaxf(ms.x, score);
+      const float bank_scale = __expf(ms.x - m);
+      const float stream = __expf(score - m);
+      const float inv = 1.0f / (ms.y * bank_scale + stream);
+      s.weight[0] = bank_scale * inv;
+      s.weight[1] = stream * inv;
+    }
+    lds_barrier();
+
+    float mix[kVec];
+    const float wb = s.weight[0], wp = s.weight[1];
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      mix[e] = prefix[e] * wp + acc[e] * wb;
+
+    float total_sq = 0.f;
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      total_sq += mix[e] * mix[e];
+    total_sq = wave_sum(total_sq);
+    if (lane == 0) s.sq[wave] = total_sq;
     lds_barrier();
     float total = 0.f;
 #pragma unroll
@@ -460,6 +504,114 @@ __global__ __launch_bounds__(kThreads, 1) void k3_ar_attn_res_kernel(const Param
   }
 }
 
+// LL lines v and kThreads + v of a whole row, polled until both carry the flag.
+SGL_DEVICE uint4 ll_poll_row(const uint4* s, uint32_t flag) {
+  uint4 a, b;
+  do {
+    a = ll_load(s);
+    b = ll_load(s + kThreads);
+  } while (!ll_ready(a, b, flag));
+  return ll_payload(a, b);
+}
+
+// Two-shot all-reduce of the attention output's TP partials fused with the residual add and the
+// FFN-side read; same result as k3_ar_attn_res_kernel, bit for bit. Row t belongs to rank
+// t % kWorld: every other rank pushes its partial row to the owner, whose reader and seven
+// forwarders each sum the eight partials in rank order; the forwarders push the bf16 sum to the
+// peers. Every rank then runs the residual add and the read on every row. A rank pushes about
+// 2 T rows instead of the one-shot's 7 T, so the LL lines' doubled bytes stop dominating past
+// a few rows. Workgroups [0, T) read row t; workgroup T + 7 k + j forwards this rank's k-th row
+// to its j-th next peer. The row's flag is ar2_epochs[t] + 1; the last of the row's workgroups
+// on this rank (8 on its owner, 1 elsewhere) to finish advances it.
+template <int kNvb, bool kHasResidual>
+__global__ __launch_bounds__(kThreads, 1) void k3_ar2_attn_res_kernel(const Params p) {
+  using Read = AttnResRead<kNvb>;
+  __shared__ typename Read::Shared smem;
+  const int rows = p.rows;
+  const int tid = threadIdx.x;
+  const int wave = tid / kWave;
+  const int lane = tid % kWave;
+  const bool forwarder = static_cast<int>(blockIdx.x) >= rows;
+  int t = static_cast<int>(blockIdx.x);
+  int peer = 0;
+  if (forwarder) {
+    const int j = t - rows;
+    t = p.rank + (j / kArPushers) * kWorld;
+    if (t >= rows) return;
+    peer = (p.rank + 1 + j % kArPushers) % kWorld;
+  }
+  const int owner = t % kWorld;
+  const bool own_row = owner == p.rank;
+  const uint32_t flag = next_flag(p.ar2_epochs, t);
+  const int64_t parity = flag & 1u;
+  const int64_t row_vec = static_cast<int64_t>(t) * kThreads + tid;
+  const int64_t sum_line = kAr2SumRegionLine + parity * kAr2SumEpochLines;
+  const int64_t out_line = kAr2OutRegionLine + parity * kAr2OutEpochLines + static_cast<int64_t>(t) * kArLinesPerRow;
+  const uint4 mine = p.partial[row_vec];
+
+  Read read;
+  uint4 res = make_uint4(0, 0, 0, 0);
+  if (!forwarder) {
+    // Loads before the push: vmcnt retires in order, so a later load would wait for its acks.
+    if constexpr (kHasResidual) res = p.residual[row_vec];
+    read.load(p, t, tid);
+    if (!own_row) {
+      const int64_t slot = (static_cast<int64_t>(p.rank) * kAr2OwnedRows + t / kWorld) * kArLinesPerRow;
+      ll_push(peer_scratch(p, owner) + sum_line + slot, tid, kThreads, mine, flag);
+    }
+    read.score_bank(smem, tid, wave, lane);
+  }
+
+  uint4 sum_v;
+  if (own_row) {
+    float sum[kVec] = {};
+#pragma unroll
+    for (int src = 0; src < kWorld; ++src) {
+      uint4 v = mine;
+      if (src != p.rank) {
+        const int64_t slot = (static_cast<int64_t>(src) * kAr2OwnedRows + t / kWorld) * kArLinesPerRow;
+        v = ll_poll_row(p.self_scratch + sum_line + slot + tid, flag);
+      }
+      float f[kVec];
+      unpack8(v, f);
+#pragma unroll
+      for (int e = 0; e < kVec; ++e)
+        sum[e] += f[e];
+    }
+    sum_v = pack8(sum);
+    if (forwarder) ll_push(peer_scratch(p, peer) + out_line, tid, kThreads, sum_v, flag);
+  } else {
+    sum_v = ll_poll_row(p.self_scratch + out_line + tid, flag);
+  }
+
+  if (!forwarder) {
+    // The all-reduce's bf16 output, then the residual add rounded as the unfused read does.
+    float prefix[kVec];
+    uint4 pv = sum_v;
+    unpack8(pv, prefix);
+    if constexpr (kHasResidual) {
+      float r[kVec];
+      unpack8(res, r);
+#pragma unroll
+      for (int e = 0; e < kVec; ++e)
+        prefix[e] = r[e] + prefix[e];
+      pv = pack8(prefix);
+      unpack8(pv, prefix);
+    }
+    p.prefix_out[row_vec] = pv;
+    p.out[row_vec] = read.finish(smem, p, prefix, tid, wave, lane);
+  }
+  // Every lane has read the flag.
+  lds_barrier();
+  if (tid == 0) {
+    const int expected = own_row ? 1 + kArPushers : 1;
+    if (atomicAdd(p.ar2_done + t, 1) == expected - 1) {
+      p.ar2_done[t] = 0;
+      p.ar2_epochs[t] = static_cast<int32_t>(flag);
+    }
+  }
+}
+
 template <int kNvb, int kSource>
 void launch_gather(const Params& params, bool write_bank, int rows, DLDevice device) {
   if (write_bank) {
@@ -479,6 +631,17 @@ void launch(const Params& params, int mode, bool has_residual, bool write_bank, 
   } else {
     launch_gather<kNvb, 1>(params, write_bank, rows, device);
   }
+}
+
+// The bank partials a read takes instead of the bank rows: acc [T, H] and ms [T, 2], fp32.
+inline void verify_bank_partial(
+    const tvm::ffi::TensorView acc,
+    const tvm::ffi::TensorView ms,
+    host::SymbolicSize& T,
+    host::SymbolicDevice& device) {
+  using namespace host;
+  TensorMatcher({T, kHidden}).with_dtype<float>().with_device(device).verify(acc);
+  TensorMatcher({T, 2}).with_dtype<float>().with_device(device).verify(ms);
 }
 
 struct K3AttnResReadKernel {
@@ -502,10 +665,13 @@ struct K3AttnResReadKernel {
       const tvm::ffi::TensorView tail_part,
       const tvm::ffi::TensorView tail_sq,
       const tvm::ffi::TensorView tail_shared,
+      const tvm::ffi::TensorView bank_acc,
+      const tvm::ffi::TensorView bank_ms,
       int64_t nvb,
       int64_t mode,
       bool has_residual,
       bool write_bank,
+      bool bank_partial,
       double score_eps,
       double out_eps,
       double tail_eps) {
@@ -537,6 +703,7 @@ struct K3AttnResReadKernel {
     RuntimeCheck(1 <= nvb && nvb <= kMaxNvb && nvb <= NB.unwrap(), "k3 attn-res read takes 1-8 bank rows");
     RuntimeCheck(!write_bank || nvb < NB.unwrap(), "bank write needs a free row");
     RuntimeCheck(bank.stride(0) % kVec == 0 && bank.stride(1) % kVec == 0, "bank rows must be 16-byte aligned");
+    if (bank_partial) verify_bank_partial(bank_acc, bank_ms, T, device);
 
     Params params{
         .x = mode == 1 ? static_cast<const uint4*>(x.data_ptr()) : nullptr,
@@ -550,6 +717,8 @@ struct K3AttnResReadKernel {
         .epochs = static_cast<int32_t*>(epochs.data_ptr()),
         .bank_stride_t = bank.stride(0),
         .bank_stride_b = bank.stride(1),
+        .bank_acc = bank_partial ? static_cast<const float4*>(bank_acc.data_ptr()) : nullptr,
+        .bank_ms = bank_partial ? static_cast<const float2*>(bank_ms.data_ptr()) : nullptr,
         .nvb_write = write_bank ? static_cast<int32_t>(nvb) : -1,
         .rank = 0,
         .score_eps = static_cast<float>(score_eps),
@@ -573,6 +742,7 @@ struct K3AttnResReadKernel {
     const DLDevice dev = device.unwrap();
     const int n = static_cast<int>(rows);
     const int m = static_cast<int>(mode);
+    if (bank_partial) return launch<0>(params, m, has_residual, write_bank, n, dev);
     switch (nvb) {
       case 1:
         return launch<1>(params, m, has_residual, write_bank, n, dev);
@@ -595,8 +765,15 @@ struct K3AttnResReadKernel {
 };
 
 template <int kNvb>
-void launch_ar(const Params& params, bool has_residual, int rows, DLDevice device) {
-  if (has_residual) {
+void launch_ar(const Params& params, bool has_residual, bool two_shot, int rows, DLDevice device) {
+  if (two_shot) {
+    const int grid = rows + kArPushers * ((rows + kWorld - 1) / kWorld);
+    if (has_residual) {
+      host::LaunchKernel(grid, kThreads, device)(k3_ar2_attn_res_kernel<kNvb, true>, params);
+    } else {
+      host::LaunchKernel(grid, kThreads, device)(k3_ar2_attn_res_kernel<kNvb, false>, params);
+    }
+  } else if (has_residual) {
     host::LaunchKernel(rows * kWorld, kThreads, device)(k3_ar_attn_res_kernel<kNvb, true>, params);
   } else {
     host::LaunchKernel(rows * kWorld, kThreads, device)(k3_ar_attn_res_kernel<kNvb, false>, params);
@@ -618,8 +795,14 @@ struct K3AttnResArReadKernel {
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView ar_epochs,
       const tvm::ffi::TensorView ar_pushed,
+      const tvm::ffi::TensorView ar2_epochs,
+      const tvm::ffi::TensorView ar2_done,
+      const tvm::ffi::TensorView bank_acc,
+      const tvm::ffi::TensorView bank_ms,
       int64_t nvb,
       bool has_residual,
+      bool two_shot,
+      bool bank_partial,
       double score_eps,
       double out_eps) {
     using namespace host;
@@ -632,10 +815,13 @@ struct K3AttnResArReadKernel {
     TensorMatcher({T, NB, kHidden}).with_dtype<bf16_t>().with_device(device).with_strides({-1, -1, 1}).verify(bank);
     TensorMatcher({kHidden}).with_dtype<float>().with_device(device).verify(cw).verify(ow);
     TensorMatcher({kArMaxRows}).with_dtype<int32_t>().with_device(device).verify(ar_epochs).verify(ar_pushed);
+    TensorMatcher({kAr2MaxRows}).with_dtype<int32_t>().with_device(device).verify(ar2_epochs).verify(ar2_done);
     const int64_t rows = T.unwrap();
-    RuntimeCheck(rows >= 1 && rows <= kArMaxRows, "the all-reduce read takes 1-", kArMaxRows, " rows");
+    const int64_t max_rows = two_shot ? kAr2MaxRows : kArMaxRows;
+    RuntimeCheck(rows >= 1 && rows <= max_rows, "the all-reduce read takes 1-", max_rows, " rows");
     RuntimeCheck(1 <= nvb && nvb <= kMaxNvb && nvb <= NB.unwrap(), "k3 attn-res read takes 1-8 bank rows");
     RuntimeCheck(bank.stride(0) % kVec == 0 && bank.stride(1) % kVec == 0, "bank rows must be 16-byte aligned");
+    if (bank_partial) verify_bank_partial(bank_acc, bank_ms, T, device);
     auto* communicator = reinterpret_cast<aiter::CustomAllreduce*>(comm);
     RuntimeCheck(communicator->world_size_ == kWorld, "the all-reduce read requires TP", kWorld);
     Params params{
@@ -649,6 +835,8 @@ struct K3AttnResArReadKernel {
         .epochs = nullptr,
         .bank_stride_t = bank.stride(0),
         .bank_stride_b = bank.stride(1),
+        .bank_acc = bank_partial ? static_cast<const float4*>(bank_acc.data_ptr()) : nullptr,
+        .bank_ms = bank_partial ? static_cast<const float2*>(bank_ms.data_ptr()) : nullptr,
         .nvb_write = -1,
         .rank = communicator->rank_,
         .score_eps = static_cast<float>(score_eps),
@@ -657,6 +845,9 @@ struct K3AttnResArReadKernel {
         .residual = has_residual ? static_cast<const uint4*>(residual.data_ptr()) : nullptr,
         .ar_epochs = static_cast<int32_t*>(ar_epochs.data_ptr()),
         .ar_pushed = static_cast<int32_t*>(ar_pushed.data_ptr()),
+        .ar2_epochs = static_cast<int32_t*>(ar2_epochs.data_ptr()),
+        .ar2_done = static_cast<int32_t*>(ar2_done.data_ptr()),
+        .rows = static_cast<int32_t>(rows),
     };
     for (int i = 0; i < kWorld; ++i) {
       params.scratch[i] =
@@ -665,23 +856,24 @@ struct K3AttnResArReadKernel {
     params.self_scratch = params.scratch[communicator->rank_];
     const DLDevice dev = device.unwrap();
     const int n = static_cast<int>(rows);
+    if (bank_partial) return launch_ar<0>(params, has_residual, two_shot, n, dev);
     switch (nvb) {
       case 1:
-        return launch_ar<1>(params, has_residual, n, dev);
+        return launch_ar<1>(params, has_residual, two_shot, n, dev);
       case 2:
-        return launch_ar<2>(params, has_residual, n, dev);
+        return launch_ar<2>(params, has_residual, two_shot, n, dev);
       case 3:
-        return launch_ar<3>(params, has_residual, n, dev);
+        return launch_ar<3>(params, has_residual, two_shot, n, dev);
       case 4:
-        return launch_ar<4>(params, has_residual, n, dev);
+        return launch_ar<4>(params, has_residual, two_shot, n, dev);
       case 5:
-        return launch_ar<5>(params, has_residual, n, dev);
+        return launch_ar<5>(params, has_residual, two_shot, n, dev);
       case 6:
-        return launch_ar<6>(params, has_residual, n, dev);
+        return launch_ar<6>(params, has_residual, two_shot, n, dev);
       case 7:
-        return launch_ar<7>(params, has_residual, n, dev);
+        return launch_ar<7>(params, has_residual, two_shot, n, dev);
       default:
-        return launch_ar<8>(params, has_residual, n, dev);
+        return launch_ar<8>(params, has_residual, two_shot, n, dev);
     }
   }
 };

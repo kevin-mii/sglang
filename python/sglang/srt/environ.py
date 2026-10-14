@@ -958,6 +958,16 @@ class Envs:
     # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at
     # most 8 tokens: past that the single workgroup's quant outweighs a launch).
     SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Batches up to this many tokens hand the A8W4 experts their routes in selection
+    # order, one block each, instead of grouped by expert; 0 disables.
+    SGLANG_ROCM_K3_MOE_ROUTE_DIRECT_MAX_TOKENS = EnvInt(0)
+    # Let the route sort kernel's spare workgroups compute the next layer's
+    # attention-residual bank partials (softmax over the bank rows), so its fused
+    # all-gather / all-reduce reads only fold in the new stream.
+    SGLANG_ROCM_K3_ATTN_RES_BANK_PARTIALS = EnvBool(True)
+    # Run the K3 MLA q_a / kv_a RMSNorms and q_b projection of decode-sized batches as
+    # one launch (kernels/ops/attention/mla_q_norm_proj.py).
+    SGLANG_ROCM_K3_MLA_Q_NORM_PROJ = EnvBool(True)
     # Run the K3 latent-MoE up-projection tail column-parallel over TP8 (each rank
     # reads 1/8 of the replicated weight) and fuse its all-gather with the next
     # layer's attention-residual read, for decode batches of at most 64 tokens.
@@ -966,9 +976,16 @@ class Envs:
     # output columns over TP8 (each rank reads 1/8 of them) and all-gather the
     # logits and latent, for decode batches of at most 64 tokens.
     SGLANG_ROCM_K3_SPLIT_FRONT = EnvBool(True)
+    # Run the merged MoE front of the prefill sizes where it is faster (see
+    # kernels/ops/gemm/kimi_k3_front_situ.py) as one Triton GEMM with the shared
+    # experts' SiTU in its epilogue, instead of the tuned GEMM + a SiTU kernel.
+    SGLANG_ROCM_K3_FRONT_SITU = EnvBool(True)
     # Complete the attention output's TP8 all-reduce, the residual add and the FFN-side
     # attention-residual read in one LL kernel, for 4-token batches (EAGLE C1 verify).
     SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
+    # With it, batches of 5 up to this many rows (<= 64) take the two-shot variant of that
+    # kernel; slower than the all-reduce + read pair on MI350X, so 4 (off) by default.
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ_MAX_ROWS = EnvInt(4)
     # SiTU MXFP4 MoE calls of at least this many tokens quantize activations to MXFP4
     # (aiter a4w4 on the a8w4 gate/up-interleaved weights) instead of MXFP8; 0 disables.
     # 1025: aiter's K3 a4w4 table has an interleave-capable stage 1 from the 2048 bucket.
@@ -987,6 +1004,9 @@ class Envs:
     # rows (reduce-scatter), read the FFN input there and all-gather it, leaving the
     # residual on the shard for the tail.
     SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ = EnvBool(True)
+    # Row-shard the attention side only from this many tokens (0: with the tail); below it
+    # the tail takes the residual on every row (the blog's 56 attention / 40 MoE split).
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_MIN_TOKENS = EnvInt(0)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1026,6 +1046,15 @@ class Envs:
     # through kv_b_proj; 0 disables. Both costs scale with the prefix; the absorbed
     # kernel is faster up to ~64 new tokens on MI350X.
     SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS = EnvInt(64)
+    # ROCm KDA chunked prefill (K = V = 128): store the gated key chunk-major
+    # ([chunks, H, K, 64], tokens contiguous) for the state scan, with its tuned tile.
+    SGLANG_ROCM_KDA_CHUNK_MAJOR_SCAN = EnvBool(True)
+    # With it, extends of at most this many tokens run the scan that writes the output
+    # in the same pass (kernels/ops/attention/fla/kda_chunk_scan.py) instead of a
+    # per-chunk state checkpoint read back by a separate output kernel; 0 disables.
+    # MI350X, 12 heads: one launch less, -34 us per call up to 3K tokens, where the call
+    # is launch-bound; at 4K+ the longer serial chunk step costs more on the GPU.
+    SGLANG_ROCM_KDA_FUSED_OUTPUT_MAX_TOKENS = EnvInt(3072)
     # Run the head-padded asm MLA target verify with a unit-scale fp8 query
     # (the a8w8 kernel) instead of bf16, as the qlen > 4 path already does.
     # Kimi-K3 on MI350X: 42.6 -> ~24 us per verify call; GSM8K (400) 0.9875 vs

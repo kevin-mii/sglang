@@ -28,9 +28,13 @@ _LINES_PER_ROW = (
 # Then the all-reduce read's region: whole rows, two 16-byte lines per 8 bf16.
 AR_MAX_ROWS: int = 16
 _AR_LINES_PER_ROW = 2 * 7168 // 8
+# Then the two-shot all-reduce read's: the owner's rows from each rank, then each row's sum.
+AR2_MAX_ROWS: int = 64
 _SCRATCH_BYTES: int = (
     sum(2 * WORLD_SIZE * MAX_ROWS * n * 16 for n in _LINES_PER_ROW)
     + 2 * WORLD_SIZE * AR_MAX_ROWS * _AR_LINES_PER_ROW * 16
+    + 2 * WORLD_SIZE * (AR2_MAX_ROWS // WORLD_SIZE) * _AR_LINES_PER_ROW * 16
+    + 2 * AR2_MAX_ROWS * _AR_LINES_PER_ROW * 16
 )
 
 
@@ -42,6 +46,15 @@ class LLComm(NamedTuple):
     # count of this rank's pushers that took its flag (kept at 0 between launches)
     ar_epochs: torch.Tensor
     ar_pushed: torch.Tensor
+    # rank-local, [AR2_MAX_ROWS] each: the two-shot all-reduce read's row flags, and per
+    # row the count of this rank's workgroups done with its flag (kept at 0 between launches)
+    ar2_epochs: torch.Tensor
+    ar2_done: torch.Tensor
+    # The attention-residual reads' bank partials, computed ahead of them (rank-local
+    # fp32): [2, MAX_ROWS, H] weighted sums and [2, MAX_ROWS, 2] (max, sum), one slot per
+    # read kind (attention side, FFN side).
+    bank_acc: torch.Tensor
+    bank_ms: torch.Tensor
 
 
 def create_ll_comm(cpu_group, device: torch.device) -> Optional[LLComm]:
@@ -56,4 +69,10 @@ def create_ll_comm(cpu_group, device: torch.device) -> Optional[LLComm]:
     epochs = torch.zeros(2 * MAX_ROWS, dtype=torch.int32, device=device)
     ar_epochs = torch.zeros(AR_MAX_ROWS, dtype=torch.int32, device=device)
     ar_pushed = torch.zeros(AR_MAX_ROWS, dtype=torch.int32, device=device)
-    return LLComm(comm, epochs, ar_epochs, ar_pushed)
+    ar2_epochs = torch.zeros(AR2_MAX_ROWS, dtype=torch.int32, device=device)
+    ar2_done = torch.zeros(AR2_MAX_ROWS, dtype=torch.int32, device=device)
+    bank_acc = torch.zeros(2, MAX_ROWS, 7168, dtype=torch.float32, device=device)
+    bank_ms = torch.zeros(2, MAX_ROWS, 2, dtype=torch.float32, device=device)
+    return LLComm(
+        comm, epochs, ar_epochs, ar_pushed, ar2_epochs, ar2_done, bank_acc, bank_ms
+    )
