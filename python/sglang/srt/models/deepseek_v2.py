@@ -2252,6 +2252,25 @@ class DeepseekV2AttentionMLA(
             else:
                 yield
 
+    def fused_absorb_v_epilogue(
+        self, attn_output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Override point for a model that folds its post-attention epilogue
+        (e.g. an output gate) into the absorbed-V projection: return the
+        [T, heads * v_head_dim] o_proj input, or None to take the plain bmm.
+        On ROCm a decode-sized bf16 bmm runs as one Triton kernel."""
+        if not (
+            _is_hip
+            and isinstance(self.w_scale, (int, float))
+            and self.w_scale == 1.0
+        ):
+            return None
+        from sglang.kernels.ops.attention import mla_v_up_gate
+
+        if not mla_v_up_gate.covered(attn_output, self.w_vc, None):
+            return None
+        return mla_v_up_gate.mla_v_up_gate(attn_output, self.w_vc, None)
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:

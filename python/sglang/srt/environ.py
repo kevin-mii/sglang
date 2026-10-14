@@ -948,6 +948,45 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Run the K3 latent-MoE tail (latent RMSNorm, up-projection, and the add of
+    # the shared output and residual) as one kernel for decode-sized batches.
+    SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
+    # Fuse the K3 router top-k with aiter's MoE route sort (one kernel instead of
+    # three) for decode batches up to this many tokens; 0 disables. Faster than
+    # aiter's top-k + sort up to 16 tokens on MI350X (6.5 vs 14.8 us at 4).
+    SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS = EnvInt(16)
+    # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at
+    # most 8 tokens: past that the single workgroup's quant outweighs a launch).
+    SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Run the K3 latent-MoE up-projection tail column-parallel over TP8 (each rank
+    # reads 1/8 of the replicated weight) and fuse its all-gather with the next
+    # layer's attention-residual read, for decode batches of at most 64 tokens.
+    SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
+    # Split the K3 MoE front's replicated router and latent down-projection by
+    # output columns over TP8 (each rank reads 1/8 of them) and all-gather the
+    # logits and latent, for decode batches of at most 64 tokens.
+    SGLANG_ROCM_K3_SPLIT_FRONT = EnvBool(True)
+    # Complete the attention output's TP8 all-reduce, the residual add and the FFN-side
+    # attention-residual read in one LL kernel, for 4-token batches (EAGLE C1 verify).
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
+    # SiTU MXFP4 MoE calls of at least this many tokens quantize activations to MXFP4
+    # (aiter a4w4 on the a8w4 gate/up-interleaved weights) instead of MXFP8; 0 disables.
+    # 1025: aiter's K3 a4w4 table has an interleave-capable stage 1 from the 2048 bucket.
+    SGLANG_ROCM_K3_PREFILL_MOE_A4W4_MIN_TOKENS = EnvInt(1025)
+    # Combine the split MLA decode/verify partials, the W_vc up-projection and the
+    # output gate in one kernel (kernels/ops/attention/mla_decode_epilogue.py) for
+    # batches of up to 64 query rows, instead of the split reduce + v_up_gate pair.
+    SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE = EnvBool(True)
+    # Batches of at least this many tokens reduce-scatter the K3 MoE's [latent | shared]
+    # partials by rows, run the latent norm, up-projection and shared + residual add on
+    # this rank's 1/TP of the rows and all-gather the stream; 0 disables. Measured on
+    # MI350X TP8: -3.6% on a 50K prefill (8K chunks), +2.5% TTFT on a 1.9K-token turn,
+    # where RCCL's reduce-scatter + all-gather cost more than the INT8 quick all-reduce.
+    SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS = EnvInt(4096)
+    # With the row-sharded tail, also complete the attention output's sum on this rank's
+    # rows (reduce-scatter), read the FFN input there and all-gather it, leaving the
+    # residual on the shard for the tail.
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ = EnvBool(True)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -978,6 +1017,20 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # Per-request cap on those planned splits; unset gives a request every CU,
+    # which makes the split reduce the bottleneck for a lone long request.
+    SGLANG_AITER_MLA_MAX_SPLITS_PER_BATCH = EnvInt(None)
+    # gfx950, FP8 latent cache: an extend whose requests each add at most this many
+    # tokens after a cached prefix attends the latent cache with absorbed queries
+    # (kernels/ops/attention/mla_absorbed_extend.py) instead of expanding the prefix
+    # through kv_b_proj; 0 disables. Both costs scale with the prefix; the absorbed
+    # kernel is faster up to ~64 new tokens on MI350X.
+    SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS = EnvInt(64)
+    # Run the head-padded asm MLA target verify with a unit-scale fp8 query
+    # (the a8w8 kernel) instead of bf16, as the qlen > 4 path already does.
+    # Kimi-K3 on MI350X: 42.6 -> ~24 us per verify call; GSM8K (400) 0.9875 vs
+    # 0.985 with the bf16 query.
+    SGLANG_AITER_MLA_VERIFY_FP8_Q = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 

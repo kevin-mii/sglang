@@ -6,6 +6,8 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import contextlib
+import functools
 import logging
 import os
 import re
@@ -15,6 +17,7 @@ from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 from torch import nn
 
@@ -38,7 +41,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_ll_comm_hip,
+    k3_sp_collective,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -160,6 +167,33 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_aiter_tgemm = _is_hip and envs.SGLANG_USE_AITER.get()
+_use_fused_latent_tail = _is_hip and envs.SGLANG_ROCM_K3_FUSED_LATENT_TAIL.get()
+if _use_fused_latent_tail:
+    from sglang.kernels.ops.attention import k3_attn_res_read_hip
+    from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
+if _is_hip:
+    from sglang.kernels.ops.moe import k3_front_gather_hip
+_fused_route_sort_max_tokens = (
+    envs.SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS.get() if _use_aiter_tgemm else 0
+)
+if _fused_route_sort_max_tokens > 0:
+    from sglang.kernels.ops.moe import kimi_k3_route_sort
+    from sglang.srt.layers.moe import moe_sort_handoff
+# aiter's tuned K3 A8W4 MoE rows (model_configs/kimik3_a8w4_tuned_fmoe.csv) all
+# sort with block_m 32; the handoff falls back to aiter's sort on a mismatch.
+_ROUTE_SORT_BLOCK_M = 32
+# The all-gather read's row limit; the column tail's split-K partial GEMM beats the
+# replicated tail throughout (4.6 vs 20.4 us at 32 tokens on MI350X, HBM weights).
+_COLUMN_TAIL_MAX_TOKENS = 64
+# The front gather's row limit.
+_SPLIT_FRONT_MAX_TOKENS = 64
+# From here the front gather also runs the router top-k: its extra ~3.5 us plus the
+# precomputed sort beat route_sort's own top-k from 16 tokens on MI350X (7.9 vs 9.8 us).
+_GATHER_TOPK_MIN_TOKENS = 16
+# The fused route+quant kernel quantizes on one workgroup: a win up to 8 tokens
+# (10.2 vs 22.4 us at 4 on MI350X), even with aiter's quant launch at 16.
+_ROUTE_QUANT_MAX_TOKENS = 8
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -202,6 +236,34 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _aiter_flydsl_params(m: int, n: int, k: int) -> Optional[dict]:
+    """Launch params of aiter's tuned bf16 FlyDSL kernel for [m, k] x [n, k]^T,
+    or None when the tuned table picks another backend for this shape."""
+    from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+    from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+    bf16 = str(torch.bfloat16)
+    config = get_GEMM_A16W16_config(M=m, N=n, K=k, bias=False, dtype=bf16, otype=bf16)
+    if config.get("libtype") != "flydsl":
+        return None
+    p = get_flydsl_hgemm_kernel_params(config["kernelName"])
+    if p is None:
+        return None
+    return dict(
+        block_m=p["block_m"],
+        block_n=p["block_n"],
+        block_k=p["block_k"],
+        stages=p["stages"],
+        split_k=p["split_k"],
+        m_waves=p["m_waves"],
+        n_waves=p["n_waves"],
+        k_waves=p["k_waves"],
+        group_m=p["group_m"],
+        policy="ht" if p["use_half_tile_interleaved"] else "ft",
+    )
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -231,9 +293,32 @@ def _k3_bf16_gemm(
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
     if out is None:
+        if (
+            _use_aiter_tgemm
+            and x.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+        ):
+            # aiter's tuned table (model_configs/kimik3_bf16_tuned_gemm.csv)
+            # beats hipBLASLt on the merged MoE front at decode sizes.
+            from aiter.tuned_gemm import tgemm
+
+            return tgemm.mm(x, weight, otype=x.dtype)
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
         return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
+    if (
+        _use_aiter_tgemm
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and out.is_contiguous()
+    ):
+        # torch.mm(out=) lands on hipBLASLt; aiter's tuned FlyDSL kernel writes
+        # out= directly (the shared down GEMM into the all-reduce buffer).
+        params = _aiter_flydsl_params(x.shape[0], weight.shape[0], weight.shape[1])
+        if params is not None:
+            from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+            return flydsl_hgemm(x, weight, out=out, **params)
     return torch.mm(x, weight.t(), out=out)
 
 
@@ -443,6 +528,18 @@ def _uses_ep_a2a() -> bool:
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
     )
+
+
+class NextAttnRead(msgspec.Struct, frozen=True):
+    """The next layer's attention read of the stream a latent MoE writes, which
+    the column-parallel tail's all-gather runs ahead (ROCm TP8)."""
+
+    bank: AttnBank
+    score_proj: nn.Module
+    score_norm: nn.Module
+    norm: nn.Module
+    writes_block: bool
+    comm: object  # k3_ll_comm_hip.get_comm()
 
 
 class KimiK3MoE(nn.Module):
@@ -701,6 +798,21 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+        self._fused_latent_tail_eligible = (
+            _use_fused_latent_tail
+            and self.routed_expert_norm is not None
+            and self.routed_expert_up_proj is not None
+            and isinstance(
+                getattr(self.routed_expert_up_proj, "weight", None), torch.Tensor
+            )
+            and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+        )
+        # Set by the model when the next layer's attention read can ride the
+        # column-parallel tail's all-gather.
+        self.next_attn_read: Optional[NextAttnRead] = None
+        # [shared gate_up | this rank's router rows | its latent down rows], the
+        # column-parallel front (_build_split_front).
+        self._front_w_split: Optional[torch.Tensor] = None
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -750,6 +862,35 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+        self._build_split_front()
+
+    def _build_split_front(self) -> None:
+        """The column-parallel front's weight: the TP-sharded shared gate_up and
+        this rank's 1/TP of the replicated router and latent down-projection rows
+        (a copy: the full front keeps serving the batches the gather does not)."""
+        if not (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_SPLIT_FRONT.get()
+            and self._eligible_for_fused_front
+            and not self._front_fp32
+            and self.tp_size == k3_front_gather_hip.WORLD_SIZE
+            and self.gate.weight.shape[0] == k3_front_gather_hip.NUM_EXPERTS
+            and self.moe_hidden_size == k3_front_gather_hip.LATENT_SIZE
+            and k3_ll_comm_hip.get_comm() is not None
+        ):
+            return
+        rank = get_parallel().tp_rank
+        experts = k3_front_gather_hip.NUM_EXPERTS // self.tp_size
+        latent = self.moe_hidden_size // self.tp_size
+        self._front_w_split = torch.cat(
+            [
+                self.shared_experts.gate_up_proj.weight,
+                self.gate.weight[rank * experts : (rank + 1) * experts],
+                self.routed_expert_down_proj.weight[
+                    rank * latent : (rank + 1) * latent
+                ],
+            ]
+        ).contiguous()
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1269,6 +1410,10 @@ class KimiK3MoE(nn.Module):
         runner backend is the same."""
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
+        if _use_aiter_tgemm and not self._front_fp32:
+            # aiter's fused_moe takes the bf16 front slice as is: its activation
+            # quant-sort kernel reads rows through input.stride(0).
+            return False
         method = self.experts.quant_method
         return not (
             isinstance(method, Mxfp4MoEMethod)
@@ -1295,12 +1440,141 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
-    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+    @cached_property
+    def _fused_route_sort_eligible(self) -> bool:
+        """ROCm: whether the router top-k and aiter's route sort may run as one
+        kernel (kernels/ops/moe/kimi_k3_route_sort.py), bypassing select_experts.
+        Its post-processing is a no-op here: K3 passes no padding mask or EPLB
+        dispatch info and fuses no shared experts into the top-k."""
+        if _fused_route_sort_max_tokens <= 0 or not self.use_latent_moe:
+            return False
+        cfg = self.topk.topk_config
+        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
+            return False
+        if get_moe_runner_backend().is_triton_kernels():
+            return False
+        if not (
+            cfg.scoring_func == "sigmoid"
+            and cfg.use_grouped_topk
+            and cfg.correction_bias is not None
+            and (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1
+            and cfg.num_fused_shared_experts == 0
+            and cfg.custom_routing_function is None
+            and cfg.routed_scaling_factor in (None, 1.0)
+        ):
+            return False
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            return False
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            install_moe_sorting_handoff,
+        )
+
+        install_moe_sorting_handoff()
+        return True
+
+    @cached_property
+    def _fused_route_quant(self) -> bool:
+        """Also emit the MXFP8 stage-1 activations aiter's A8W4 experts quantize
+        right after the sort. A runner that quantizes differently never asks
+        the handoff for them, so a mismatch only wastes the fused quant."""
+        return envs.SGLANG_ROCM_K3_FUSED_ROUTE_QUANT.get()
+
+    def _fused_route_sort(
+        self,
+        router_logits: torch.Tensor,
+        latent: torch.Tensor,
+        routed_input: torch.Tensor,
+        quantized: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        topk_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Optional["kimi_k3_route_sort.RouteSortOutput"]:
+        """topk_output: (weights, ids) the front gather selected; the sort alone
+        then beats aiter's moe_sorting at every size route_sort covers."""
+        if not self._fused_route_sort_eligible or (
+            topk_output is None
+            and router_logits.shape[0] > _fused_route_sort_max_tokens
+        ):
+            return None
+        cfg = self.topk.topk_config
+        bias = cfg.correction_bias_for_dtype(router_logits.dtype)
+        if not kimi_k3_route_sort.covered(router_logits, bias, cfg.top_k):
+            return None
+        # Rows the front gather quantized get their scales sorted by aiter's
+        # scale-only sort (the caller stages them), faster than placing them here.
+        fuse_quant = (
+            quantized is None
+            and topk_output is None
+            and self._fused_route_quant
+            and router_logits.shape[0] <= _ROUTE_QUANT_MAX_TOKENS
+        )
+        if fuse_quant and not kimi_k3_route_sort.quant_covered(routed_input):
+            return None
+        return kimi_k3_route_sort.route_sort(
+            router_logits,
+            bias,
+            topk=cfg.top_k,
+            block_m=_ROUTE_SORT_BLOCK_M,
+            model_dim=latent.shape[-1],
+            moe_buf=latent,
+            routed_scaling_factor=1.0,
+            renormalize=cfg.renormalize,
+            # The A8W4 experts quantize these rows first; fold that in too.
+            quant_input=routed_input if fuse_quant else None,
+            topk_output=topk_output,
+        )
+
+    def _forward_routed(
+        self,
+        hidden_states,
+        router_logits,
+        routed_input,
+        latent,
+        quantized=None,
+        topk_output=None,
+    ):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            with zero_copy_context.set_moe_output(latent):
+            routes = self._fused_route_sort(
+                router_logits, latent, routed_input, quantized, topk_output
+            )
+            if routes is None:
+                topk_output = self.topk(hidden_states, router_logits)
+                sort_ctx = contextlib.nullcontext()
+            else:
+                topk_output = build_precomputed_topk_output(
+                    routes.topk_weights,
+                    routes.topk_ids,
+                    self.topk.topk_config,
+                    self.layer_idx,
+                )
+                sort_ctx = moe_sort_handoff.stage(
+                    moe_sort_handoff.StagedSort(
+                        topk_ids=routes.topk_ids,
+                        block_m=_ROUTE_SORT_BLOCK_M,
+                        sorted_ids=routes.sorted_ids,
+                        sorted_weights=routes.sorted_weights,
+                        sorted_expert_ids=routes.sorted_expert_ids,
+                        num_valid_ids=routes.num_valid_ids,
+                        moe_buf=routes.moe_buf,
+                        quant_input=routed_input if routes.a1 is not None else None,
+                        a1=routes.a1,
+                        a1_scale=routes.a1_scale,
+                    )
+                )
+            quant_ctx = (
+                contextlib.nullcontext()
+                if quantized is None
+                else moe_sort_handoff.stage_quant(
+                    moe_sort_handoff.StagedQuant(routed_input, *quantized)
+                )
+            )
+            with zero_copy_context.set_moe_output(latent), sort_ctx, quant_ctx:
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1320,7 +1594,8 @@ class KimiK3MoE(nn.Module):
         finally:
             route_quant_handoff.clear()
 
-    def _forward_shared(self, gate_up, shared_output):
+    def _forward_shared(self, gate_up, shared_output, activated=None):
+        """activated: the SiTU of gate_up when an earlier kernel applied it."""
         shared = self.shared_experts
         if TYPE_CHECKING:
             assert shared is not None and isinstance(
@@ -1328,7 +1603,7 @@ class KimiK3MoE(nn.Module):
             )
         assert shared is not None
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared.act_fn(gate_up) if activated is None else activated,
             shared.down_proj.weight,
             out=shared_output,
         )
@@ -1359,14 +1634,19 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        front = self._split_front(hidden_states)
+        quantized = routes = activated = None
+        if front is not None:
+            gate_up, router_logits, routed_input, quantized, routes, activated = front
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1374,6 +1654,9 @@ class KimiK3MoE(nn.Module):
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
+        row_sharded = self._row_sharded_tail_eligible(
+            num_tokens, prefix_sum is not None
+        )
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
             # symm_buffer slice for every rank to resolve the same offset
@@ -1383,14 +1666,29 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size + hidden_size,
                 hidden_states.dtype,
             ).view(-1)
+        elif row_sharded:
+            # rows padded to a multiple of TP for equal reduce-scatter shards
+            padded_rows = _cdiv(num_tokens, self.tp_size) * self.tp_size
+            buf = hidden_states.new_empty(
+                padded_rows * (self.moe_hidden_size + hidden_size)
+            )
         else:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
 
-        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
-        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if row_sharded:
+            latent_rows = buf[: padded_rows * self.moe_hidden_size].view(
+                padded_rows, self.moe_hidden_size
+            )
+            shared_rows = buf[padded_rows * self.moe_hidden_size :].view(
+                padded_rows, hidden_size
+            )
+            latent, shared_output = latent_rows[:num_tokens], shared_rows[:num_tokens]
+        else:
+            latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+            shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
@@ -1448,8 +1746,10 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            self._forward_shared(gate_up, shared_output, activated)
+            self._forward_routed(
+                hidden_states, router_logits, routed_input, latent, quantized, routes
+            )
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
@@ -1459,11 +1759,37 @@ class KimiK3MoE(nn.Module):
                 )
             elif k3_ar_fusion.enabled():
                 k3_ar_fusion.all_reduce(buf)
+            elif row_sharded:
+                return self._row_sharded_tail(
+                    latent_rows, shared_rows, num_tokens, prefix_sum
+                )
             else:
                 buf = self._reduce_latent_and_shared(buf)
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if not fused_norm and self.next_attn_read is not None:
+            stream = self._column_tail_and_next_read(latent, shared_output, prefix_sum)
+            if stream is not None:
+                return stream
+        if (
+            not fused_norm
+            and self._fused_latent_tail_eligible
+            and kimi_k3_latent_tail_hip.supports_latent_tail(
+                latent,
+                self.routed_expert_up_proj.weight,  # type: ignore
+                shared_output,
+                prefix_sum,
+            )
+        ):
+            return kimi_k3_latent_tail_hip.k3_latent_tail(
+                latent,
+                self.routed_expert_norm.weight,  # type: ignore
+                self.routed_expert_norm.variance_epsilon,  # type: ignore
+                self.routed_expert_up_proj.weight,  # type: ignore
+                shared_output,
+                prefix_sum,
+            )
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
@@ -1471,6 +1797,151 @@ class KimiK3MoE(nn.Module):
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    def _row_sharded_tail_eligible(self, num_tokens: int, has_prefix: bool) -> bool:
+        """Whether the tail runs on this rank's 1/TP of the rows (ROCm prefill
+        batches; see _row_sharded_tail)."""
+        min_tokens = envs.SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS.get()
+        return (
+            _is_hip
+            and 0 < min_tokens <= num_tokens
+            and num_tokens > _COLUMN_TAIL_MAX_TOKENS
+            and self.tp_size > 1
+            and has_prefix
+            and not k3_ar_fusion.enabled()
+            and self.routed_expert_up_proj is not None
+        )
+
+    def takes_row_sharded_tail(self, num_tokens: int) -> bool:
+        """Whether a batch of num_tokens runs _row_sharded_tail, which then
+        also takes the written residual on this rank's padded rows."""
+        return self._eligible_for_fused_front and self._row_sharded_tail_eligible(
+            num_tokens, True
+        )
+
+    def _row_sharded_tail(
+        self,
+        latent_rows: torch.Tensor,
+        shared_rows: torch.Tensor,
+        num_tokens: int,
+        prefix_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce-scatter the [latent | shared] partials by rows, run the latent
+        norm, up-projection and shared + residual add on this rank's 1/TP of
+        the rows, and all-gather the stream. latent_rows / shared_rows hold
+        num_tokens rows padded to a multiple of TP; prefix_sum is the residual
+        on every row or already on this rank's padded rows."""
+        tp_group = get_parallel().tp_group
+        padded_rows, hidden_size = shared_rows.shape
+        rows = padded_rows // self.tp_size
+        if padded_rows > num_tokens:
+            latent_rows[num_tokens:].zero_()
+            shared_rows[num_tokens:].zero_()
+        latent = latent_rows.new_empty(rows, latent_rows.shape[1])
+        shared = shared_rows.new_empty(rows, hidden_size)
+        tp_group.reduce_scatter_tensor(latent, latent_rows)
+        tp_group.reduce_scatter_tensor(shared, shared_rows)
+        start = get_parallel().tp_rank * rows
+        if prefix_sum.shape[0] == num_tokens:
+            prefix = prefix_sum[start : min(start + rows, num_tokens)]
+        else:
+            assert prefix_sum.shape[0] == rows
+            prefix = prefix_sum
+        if prefix.shape[0] < rows:
+            prefix = torch.cat(
+                [prefix, prefix.new_zeros(rows - prefix.shape[0], hidden_size)]
+            )
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        stream_rows = _add3(out, shared, prefix)
+        stream = stream_rows.new_empty(padded_rows, hidden_size)
+        tp_group.all_gather_into_tensor(stream, stream_rows)
+        return stream[:num_tokens]
+
+    def _split_front(self, hidden_states: torch.Tensor):
+        """(gate_up, router logits, latent, MXFP8 latent, routes, SiTU of gate_up)
+        from the column-parallel front GEMM and its all-gather (the last three
+        None when not computed), or None when they do not take the batch."""
+        num_tokens = hidden_states.shape[0]
+        if self._front_w_split is None or num_tokens > _SPLIT_FRONT_MAX_TOKENS:
+            return None
+        fused = _k3_bf16_gemm(hidden_states, self._front_w_split)
+        gate_up_rows = self.shared_experts.gate_up_proj.weight.shape[0]  # type: ignore
+        gate_up, slices = fused.split(
+            [gate_up_rows, fused.shape[1] - gate_up_rows], dim=-1
+        )
+        if not k3_front_gather_hip.covered(slices):
+            return None
+        # Only aiter's A8W4 runner asks the handoff for these rows (through its
+        # moe_sorting hook, installed with the fused route sort).
+        quant = self._fused_route_quant and self._fused_route_sort_eligible
+        bias = None
+        if self._fused_route_sort_eligible and num_tokens >= _GATHER_TOPK_MIN_TOKENS:
+            cfg = self.topk.topk_config
+            bias = cfg.correction_bias_for_dtype(torch.bfloat16)
+        act = self.shared_experts.act_fn  # type: ignore
+        situ = (
+            isinstance(act, SituAndMul)
+            and act.linear_beta is not None
+            and k3_front_gather_hip.situ_covered(gate_up, slices)
+        )
+        g = k3_front_gather_hip.front_gather(
+            slices,
+            k3_ll_comm_hip.get_comm(),
+            quant=quant,
+            bias=bias,
+            renormalize=self.topk.topk_config.renormalize,
+            gate_up=gate_up if situ else None,
+            situ_beta=act.beta if situ else 1.0,
+            situ_linear_beta=act.linear_beta if situ else 1.0,
+        )
+        quantized = (g.a1, g.a1_scale) if quant else None
+        routes = None if bias is None else (g.topk_weights, g.topk_ids)
+        return gate_up, g.logits, g.latent, quantized, routes, g.situ
+
+    def _column_tail_and_next_read(
+        self,
+        latent: torch.Tensor,
+        shared_output: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """The latent tail's GEMM on this rank's 1/TP of the up_proj rows (1/TP
+        of the replicated weight), finished by the all-gather of the stream,
+        which also stages the next layer's attention read. None, before
+        anything runs, when the kernels do not take the batch."""
+        read = self.next_attn_read
+        assert read is not None
+        num_tokens = latent.shape[0]
+        slice_width = shared_output.shape[1] // self.tp_size
+        bank = read.bank.require()
+        if not (
+            self._fused_latent_tail_eligible
+            and num_tokens <= _COLUMN_TAIL_MAX_TOKENS
+            and latent.stride(-1) == 1
+            and k3_attn_res_read_hip.tail_covered(shared_output, prefix_sum)
+            and bank.gather_covers(num_tokens, slice_width, read.writes_block)
+        ):
+            return None
+        rank = get_parallel().tp_rank
+        up_weight = self.routed_expert_up_proj.weight[  # type: ignore
+            rank * slice_width : (rank + 1) * slice_width
+        ]
+        part, sq = kimi_k3_latent_tail_hip.k3_latent_tail_partials(
+            latent,
+            self.routed_expert_norm.weight,
+            up_weight,  # type: ignore
+        )
+        return bank.gather_tail_read(
+            part,
+            sq,
+            shared_output,
+            prefix_sum,
+            self.routed_expert_norm.variance_epsilon,  # type: ignore
+            read.score_proj,
+            read.score_norm,
+            read.norm,
+            read.writes_block,
+            read.comm,
+        )
 
     def forward(
         self,
@@ -1887,7 +2358,9 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        # Not do_fuse_qkvbfg: that also requires quant_config is None, which the
+        # MXFP4 checkpoint never meets although its attention stays bf16.
+        if not (self.use_full_rank_gate and self.attn_tp_size == self.tp_size):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -2321,6 +2794,89 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
+    def fused_absorb_v_epilogue(
+        self, attn_output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """ROCm: absorbed-V bmm and output gate in one kernel
+        (kernels/ops/attention/mla_v_up_gate.py), or, when the backend deferred
+        its split-KV combine, combine + bmm + gate in one kernel
+        (mla_decode_epilogue.py). Consumes the pending gate, so the o_proj
+        wrapper below finds none and passes x through."""
+        from sglang.srt.layers.attention import mla_epilogue_handoff
+
+        deferred = mla_epilogue_handoff.take(attn_output)
+        # A bf16 w_vc with a unit scale is what the plain bmm reads as is.
+        if not (
+            _is_hip
+            and self.use_output_gate
+            and self._gate_hidden_states is not None
+            and self._unit_w_vc_scale()
+        ):
+            if deferred is not None:
+                deferred.finish()
+            return super().fused_absorb_v_epilogue(attn_output)
+        from sglang.kernels.ops.attention import mla_decode_epilogue, mla_v_up_gate
+
+        rows = attn_output.shape[0]
+        if deferred is not None and mla_decode_epilogue.covered(rows, self.w_vc, None):
+            gate = self._take_output_gate()
+            if mla_decode_epilogue.covered(rows, self.w_vc, gate):
+                return mla_decode_epilogue.mla_decode_epilogue(
+                    deferred.partial_output,
+                    deferred.partial_lse,
+                    deferred.reduce_indptr,
+                    deferred.reduce_final_map,
+                    deferred.reduce_partial_map,
+                    deferred.o,
+                    self.w_vc,
+                    gate,
+                    max_q=deferred.max_q,
+                    max_splits=deferred.max_splits,
+                )
+            deferred.finish()
+            return self._absorb_v_then_gate(attn_output, gate)
+        if deferred is not None:
+            deferred.finish()
+        if not mla_v_up_gate.covered(attn_output, self.w_vc, None):
+            return None
+        gate = self._take_output_gate()
+        if not mla_v_up_gate.covered(attn_output, self.w_vc, gate):
+            # Shape mismatch after all: apply the gate the unfused way.
+            return self._absorb_v_then_gate(attn_output, gate)
+        return mla_v_up_gate.mla_v_up_gate(attn_output, self.w_vc, gate)
+
+    def _unit_w_vc_scale(self) -> bool:
+        return isinstance(self.w_scale, (int, float)) and self.w_scale == 1.0
+
+    def _take_output_gate(self) -> torch.Tensor:
+        gate_input = self._gate_hidden_states
+        self._gate_hidden_states = None
+        return self._compute_output_gate(gate_input)
+
+    def _absorb_v_then_gate(self, attn_output, gate):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+            rocm_absorb_v_bmm,
+        )
+
+        return rocm_absorb_v_bmm(self, attn_output) * torch.sigmoid(gate)
+
+    def _defers_mla_epilogue(self) -> bool:
+        """Whether this call's absorbed-V epilogue certainly runs, so the
+        backend may hand it the split-KV combine (forward_mla_rocm skips the
+        epilogue under the kv_b LoRA paths)."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE.get()):
+            return False
+        from sglang.srt.lora.deepseek_mla_correction import is_kv_b_lora_active
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mla_rocm,
+        )
+
+        return (
+            not forward_mla_rocm._SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and not self.use_deep_gemm_bmm
+        )
+
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
@@ -2356,9 +2912,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+        from sglang.srt.layers.attention import mla_epilogue_handoff
+
+        with mla_epilogue_handoff.expecting(
+            self.attn_mqa if self._defers_mla_epilogue() else None
+        ):
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
 
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -2616,6 +3177,8 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config, sp_collective),
+                attn_all_reduce_comm=self._attn_all_reduce_read_comm(),
+                ffn_row_shards=self._ffn_row_shards(),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2624,6 +3187,32 @@ class KimiK3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+
+    def _attn_all_reduce_read_comm(self):
+        """ROCm TP8: the LL communicator of the attention output's all-reduce
+        fused with the FFN-side bank read, or None."""
+        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSED_ATTN_AR_READ.get()):
+            return None
+        if self._sp_moe or self.all_reduce_fusion:
+            return None
+        return k3_ll_comm_hip.get_comm()
+
+    def _ffn_row_shards(self):
+        """ROCm: the batch-size predicate under which the FFN read completes the
+        attention output's sum on this rank's rows and leaves the written
+        residual there for the row-sharded latent-MoE tail, or None."""
+        if not (
+            _is_hip
+            and envs.SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ.get()
+            and self._ffn_writes_stream
+            and isinstance(self.mlp, KimiK3MoE)
+        ):
+            return None
+        if self._sp_moe or self.all_reduce_fusion:
+            return None
+        if get_parallel().attn_tp_size != get_parallel().tp_size:
+            return None
+        return self.mlp.takes_row_sharded_tail
 
     def _ffn_input_fusions(self):
         """K3's kernels that complete the attention output's sum with the
@@ -2805,6 +3394,33 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        self._link_column_tails(config)
+
+    def _link_column_tails(self, config: KimiLinearConfig) -> None:
+        """Hand each stream-writing latent MoE the next layer's attention read,
+        which its column-parallel tail's all-gather then runs (ROCm TP8)."""
+        if self.attn_bank is None or not envs.SGLANG_ROCM_K3_COLUMN_TAIL.get():
+            return
+        comm = k3_ll_comm_hip.get_comm()
+        if comm is None:
+            return
+        for idx in range(self.start_layer, self.end_layer - 1):
+            layer, nxt = self.layers[idx], self.layers[idx + 1]
+            if not (
+                isinstance(layer.mlp, KimiK3MoE)
+                and layer._ffn_writes_stream
+                and not layer._sp_moe
+                and not nxt._sp_moe
+            ):
+                continue
+            layer.mlp.next_attn_read = NextAttnRead(
+                bank=self.attn_bank,
+                score_proj=nxt.self_attention_res_proj,
+                score_norm=nxt.self_attention_res_norm,
+                norm=nxt.input_layernorm,
+                writes_block=nxt.is_block_write_layer,
+                comm=comm,
+            )
 
     def forward(
         self,

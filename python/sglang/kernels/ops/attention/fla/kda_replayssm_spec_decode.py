@@ -37,6 +37,91 @@ import triton.language as tl
 
 
 @triton.jit
+def _fold_step_inputs(
+    rawk_cache,
+    rawv_cache,
+    gk_cache,
+    beta_cache,
+    state_idx,
+    stride_rawk_slot,
+    stride_rawv_slot,
+    stride_gk_slot,
+    stride_beta_slot,
+    i_h,
+    i_hv,
+    t,
+    live,
+    o_k,
+    o_v,
+    mask_k,
+    mask_v,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+):
+    b_k = tl.load(
+        rawk_cache + state_idx * stride_rawk_slot + (i_h * MAX_CACHE_LEN + t) * K + o_k,
+        mask=mask_k & live,
+        other=0.0,
+    ).to(tl.float32)
+    b_v = tl.load(
+        rawv_cache
+        + state_idx * stride_rawv_slot
+        + (i_hv * MAX_CACHE_LEN + t) * V
+        + o_v,
+        mask=mask_v & live,
+        other=0.0,
+    ).to(tl.float32)
+    b_gk = tl.load(
+        gk_cache + state_idx * stride_gk_slot + (i_hv * MAX_CACHE_LEN + t) * K + o_k,
+        mask=mask_k & live,
+        other=0.0,
+    ).to(tl.float32)
+    b_beta = tl.load(
+        beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + t,
+        mask=live,
+        other=0.0,
+    ).to(tl.float32)
+    return b_k, b_v, b_gk, b_beta
+
+
+@triton.jit
+def _fold_step(b_h, b_k, b_v, b_gk, b_beta, USE_QK_L2NORM_IN_KERNEL: tl.constexpr):
+    # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+    b_h *= tl.exp(b_gk[:, None])  # per-K gate decay, broadcast over V
+    b_v -= tl.sum(b_h * b_k[:, None], 0)
+    b_v *= b_beta
+    b_h += b_k[:, None] * b_v[None, :]
+    return b_h
+
+
+@triton.jit
+def _fold_track(
+    b_h,
+    h0,
+    track_idx,
+    stride_state_slot,
+    i_hv,
+    o_k,
+    o_v,
+    mask_h,
+    V: tl.constexpr,
+    K: tl.constexpr,
+):
+    tl.store(
+        h0
+        + track_idx * stride_state_slot
+        + i_hv * V * K
+        + o_v[None, :] * K
+        + o_k[:, None],
+        b_h.to(h0.dtype.element_ty),
+        mask=mask_h,
+    )
+
+
+@triton.jit
 def kda_replayssm_exact_fold_kernel(
     h0,  # [num_slots, HV, V, K] fp32 checkpoint (folded in place)
     rawv_cache,  # [num_slots, HV, L, V]  raw v
@@ -71,6 +156,9 @@ def kda_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    # 4: accept_lens <= 4, every step's ring rows load before the first update
+    # (a dynamic loop waits a full load latency per step); 0: dynamic loop.
+    MAX_STEPS: tl.constexpr = 0,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -121,6 +209,152 @@ def kda_replayssm_exact_fold_kernel(
         + o_k[:, None]
     )
     b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
+
+    if MAX_STEPS == 4:
+        k0, v0, g0, e0 = _fold_step_inputs(
+            rawk_cache,
+            rawv_cache,
+            gk_cache,
+            beta_cache,
+            state_idx,
+            stride_rawk_slot,
+            stride_rawv_slot,
+            stride_gk_slot,
+            stride_beta_slot,
+            i_h,
+            i_hv,
+            0,
+            n_commit > 0,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            MAX_CACHE_LEN,
+        )
+        k1, v1, g1, e1 = _fold_step_inputs(
+            rawk_cache,
+            rawv_cache,
+            gk_cache,
+            beta_cache,
+            state_idx,
+            stride_rawk_slot,
+            stride_rawv_slot,
+            stride_gk_slot,
+            stride_beta_slot,
+            i_h,
+            i_hv,
+            1,
+            n_commit > 1,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            MAX_CACHE_LEN,
+        )
+        k2, v2, g2, e2 = _fold_step_inputs(
+            rawk_cache,
+            rawv_cache,
+            gk_cache,
+            beta_cache,
+            state_idx,
+            stride_rawk_slot,
+            stride_rawv_slot,
+            stride_gk_slot,
+            stride_beta_slot,
+            i_h,
+            i_hv,
+            2,
+            n_commit > 2,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            MAX_CACHE_LEN,
+        )
+        k3, v3, g3, e3 = _fold_step_inputs(
+            rawk_cache,
+            rawv_cache,
+            gk_cache,
+            beta_cache,
+            state_idx,
+            stride_rawk_slot,
+            stride_rawv_slot,
+            stride_gk_slot,
+            stride_beta_slot,
+            i_h,
+            i_hv,
+            3,
+            n_commit > 3,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            MAX_CACHE_LEN,
+        )
+        b_h = _fold_step(b_h, k0, v0, g0, e0, USE_QK_L2NORM_IN_KERNEL)
+        if HAS_TRACK:
+            if (track_step == 0) and (track_idx > NULL_BLOCK_ID):
+                _fold_track(
+                    b_h, h0, track_idx, stride_state_slot, i_hv, o_k, o_v, mask_h, V, K
+                )
+        if n_commit > 1:
+            b_h = _fold_step(b_h, k1, v1, g1, e1, USE_QK_L2NORM_IN_KERNEL)
+            if HAS_TRACK:
+                if (track_step == 1) and (track_idx > NULL_BLOCK_ID):
+                    _fold_track(
+                        b_h,
+                        h0,
+                        track_idx,
+                        stride_state_slot,
+                        i_hv,
+                        o_k,
+                        o_v,
+                        mask_h,
+                        V,
+                        K,
+                    )
+        if n_commit > 2:
+            b_h = _fold_step(b_h, k2, v2, g2, e2, USE_QK_L2NORM_IN_KERNEL)
+            if HAS_TRACK:
+                if (track_step == 2) and (track_idx > NULL_BLOCK_ID):
+                    _fold_track(
+                        b_h,
+                        h0,
+                        track_idx,
+                        stride_state_slot,
+                        i_hv,
+                        o_k,
+                        o_v,
+                        mask_h,
+                        V,
+                        K,
+                    )
+        if n_commit > 3:
+            b_h = _fold_step(b_h, k3, v3, g3, e3, USE_QK_L2NORM_IN_KERNEL)
+            if HAS_TRACK:
+                if (track_step == 3) and (track_idx > NULL_BLOCK_ID):
+                    _fold_track(
+                        b_h,
+                        h0,
+                        track_idx,
+                        stride_state_slot,
+                        i_hv,
+                        o_k,
+                        o_v,
+                        mask_h,
+                        V,
+                        K,
+                    )
+        tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+        return
 
     for t in range(0, n_commit):
         phys = t.to(tl.int64)
@@ -268,8 +502,12 @@ def commit_kda_replayssm_spec_all_layers(
     mamba_steps_to_track: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    max_steps: int = 0,
 ) -> None:
     """Fold every layer's accepted window in a single launch.
+
+    max_steps: an upper bound on accept_lens (0 = unknown); at most 4 takes
+    the prefetched kernel path.
 
     Replaces the per-layer Python loop over commit_kda_replayssm_spec (one launch
     per KDA layer -> ~69 tiny eager launches at bs=1, dispatch-bound). The layer
@@ -328,6 +566,7 @@ def commit_kda_replayssm_spec_all_layers(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        MAX_STEPS=4 if 0 < max_steps <= 4 else 0,
         num_warps=1,
         num_stages=3,
     )
@@ -343,6 +582,7 @@ def commit_kda_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    max_accept: int = 0,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -371,6 +611,7 @@ def commit_kda_replayssm_after_verify(
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
+        max_steps=max_accept,
     )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
