@@ -227,21 +227,26 @@ def _expand_same_length_kernel(
     req_pool_ptr,
     seq_lens_out_ptr,
     req_pool_out_ptr,
+    positions_out_ptr,
+    window_lens_out_ptr,
     num_tokens,
     qo_len,
     offset,
+    window,
     BLOCK: tl.constexpr,
+    WITH_POSITIONS: tl.constexpr,
 ):
     t = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = t < num_tokens
     r = t // qo_len
     seq_len = tl.load(seq_lens_ptr + r, mask=m, other=0)
-    tl.store(
-        seq_lens_out_ptr + t,
-        seq_len + (offset - qo_len + 1) + t % qo_len,
-        mask=m,
-    )
+    lens = seq_len + (offset - qo_len + 1) + t % qo_len
+    tl.store(seq_lens_out_ptr + t, lens, mask=m)
     tl.store(req_pool_out_ptr + t, tl.load(req_pool_ptr + r, mask=m, other=0), mask=m)
+    if WITH_POSITIONS:
+        lens32 = lens.to(tl.int32)
+        tl.store(positions_out_ptr + t, lens32 - 1, mask=m)
+        tl.store(window_lens_out_ptr + t, tl.minimum(lens32, window), mask=m)
 
 
 def expand_same_length(
@@ -249,17 +254,25 @@ def expand_same_length(
     req_pool_indices: torch.Tensor,
     qo_len: int,
     offset: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    window: Optional[int] = None,
+) -> Tuple[torch.Tensor, ...]:
     """Every request's qo_len rows, one launch: row t of request r sees
     seq_lens[r] + offset - qo_len + 1 + t % qo_len keys (its causal length, in
-    seq_lens' dtype) and reads req_pool_indices[r]."""
+    seq_lens' dtype) and reads req_pool_indices[r]. With ``window``, also each
+    row's int32 position (length - 1) and its length clamped to the window."""
     bs = seq_lens.shape[0]
     assert req_pool_indices.shape[0] == bs and seq_lens.is_contiguous()
     num_tokens = bs * qo_len
-    seq_lens_out = torch.empty(num_tokens, dtype=seq_lens.dtype, device=seq_lens.device)
+    device = seq_lens.device
+    seq_lens_out = torch.empty(num_tokens, dtype=seq_lens.dtype, device=device)
     req_pool_out = torch.empty(
         num_tokens, dtype=req_pool_indices.dtype, device=req_pool_indices.device
     )
+    with_positions = window is not None
+    positions = window_lens = seq_lens_out
+    if with_positions:
+        positions = torch.empty(num_tokens, dtype=torch.int32, device=device)
+        window_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
     if num_tokens:
         block = 256
         _expand_same_length_kernel[(triton.cdiv(num_tokens, block),)](
@@ -267,11 +280,17 @@ def expand_same_length(
             req_pool_indices.contiguous(),
             seq_lens_out,
             req_pool_out,
+            positions,
+            window_lens,
             num_tokens,
             qo_len,
             offset,
+            window if with_positions else 0,
             BLOCK=block,
+            WITH_POSITIONS=with_positions,
         )
+    if with_positions:
+        return seq_lens_out, req_pool_out, positions, window_lens
     return seq_lens_out, req_pool_out
 
 
@@ -491,26 +510,59 @@ def page_table_from_req_to_token(
 
 
 @triton.jit
-def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, BLOCK: tl.constexpr):
+def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, repeat, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = i < n
-    tl.store(oa_ptr + i, tl.load(a_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
+    a = tl.load(a_ptr + i // repeat, mask=mask, other=0)
+    tl.store(oa_ptr + i, a.to(tl.int64), mask=mask)
     tl.store(ob_ptr + i, tl.load(b_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
 
 
 def widen_pair_i64(
-    a: torch.Tensor, b: torch.Tensor
+    a: torch.Tensor, b: torch.Tensor, repeat: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(a.to(torch.int64), b.to(torch.int64)) for two same-length integer vectors in one
-    launch (the decode request slots and positions the low-ratio indexer takes widened)."""
-    assert a.dim() == b.dim() == 1 and a.shape == b.shape, (a.shape, b.shape)
+    """(a.repeat_interleave(repeat).to(torch.int64), b.to(torch.int64)) in one launch,
+    b ``repeat`` times a's length: the request slots and positions the low-ratio
+    indexer takes widened, a slot a row (decode) or a draft token (target verify)."""
+    assert a.dim() == b.dim() == 1 and b.shape[0] == a.shape[0] * repeat, (
+        a.shape,
+        b.shape,
+        repeat,
+    )
     assert a.stride(0) == 1 and b.stride(0) == 1
-    n = a.shape[0]
+    n = b.shape[0]
     oa = torch.empty(n, dtype=torch.int64, device=a.device)
     ob = torch.empty(n, dtype=torch.int64, device=a.device)
     if n:
         block = min(1024, triton.next_power_of_2(n))
         _widen_pair_kernel[(triton.cdiv(n, block),)](
-            a, b, oa, ob, n, BLOCK=block, num_warps=4
+            a, b, oa, ob, n, repeat, BLOCK=block, num_warps=4
         )
     return oa, ob
+
+
+@triton.jit
+def _gather_i32_kernel(table_ptr, idx_ptr, out_ptr, n, table_len, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < n
+    idx = tl.load(idx_ptr + i, mask=mask, other=0).to(tl.int64)
+    # torch indexing: a negative index counts from the end
+    idx = tl.where(idx < 0, idx + table_len, idx)
+    tl.store(out_ptr + i, tl.load(table_ptr + idx, mask=mask).to(tl.int32), mask=mask)
+
+
+def gather_i32(table: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """table[idx].to(torch.int32) in one launch (a 1-D integer table and index vector)."""
+    assert table.dim() == idx.dim() == 1 and table.stride(0) == 1, (
+        table.shape,
+        idx.shape,
+    )
+    idx = idx.contiguous()
+    n = idx.shape[0]
+    out = torch.empty(n, dtype=torch.int32, device=idx.device)
+    if n:
+        block = min(1024, triton.next_power_of_2(n))
+        _gather_i32_kernel[(triton.cdiv(n, block),)](
+            table, idx, out, n, table.shape[0], BLOCK=block, num_warps=4
+        )
+    return out
