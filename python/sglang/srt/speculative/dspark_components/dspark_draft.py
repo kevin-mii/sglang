@@ -255,6 +255,7 @@ def draft_markov_block(
     """Returns the drafted tokens and the step logits over ``base_logits``' columns
     (a sharded vocab's shard: see ``gather_step_logits``), written to
     ``logits_out`` or allocated here; a greedy draft keeps none."""
+    gamma = base_logits.shape[1]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
             base_logits.shape,
