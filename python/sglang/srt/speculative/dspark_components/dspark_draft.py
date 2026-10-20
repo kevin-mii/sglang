@@ -34,7 +34,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:
-    from sglang.srt.models.dspark import BaseDSparkMarkovHead
+    from sglang.srt.models.dspark import BaseDSparkMarkovHead, VocabShard
 
 logger = logging.getLogger(__name__)
 
@@ -216,18 +216,16 @@ def _draft_step(
                 w2_weight=w2_weight,
             )
             return tokens, state
-    bias, state = markov_head.step_bias(
-        prev_tokens, hidden_states=hidden_states, state=state
-    )
+    bias = markov_head.bias_gemv(prev_tokens)
+    if bias is None:
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
     shard = markov_head.vocab_shard
     sharded = (
         {}
         if shard is None
-        else dict(
-            vocab_start=shard.start,
-            gather=shard.gather.gather_stacked,
-            gather_logits=shard.gather,
-        )
+        else dict(vocab_start=shard.start, gather=shard.gather.gather_stacked)
     )
     tokens = MarkovSampleStep.execute(
         base_logits=base_logits,
@@ -260,11 +258,20 @@ def draft_markov_block(
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
     written to ``logits_out`` or allocated here; a greedy draft keeps none."""
     bs, gamma = base_logits.shape[:2]
+    step_dtype = markov_head.step_logits_dtype(base_logits.dtype)
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
             (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
-            dtype=markov_head.step_logits_dtype(base_logits.dtype),
+            dtype=step_dtype,
             device=base_logits.device,
+        )
+    # Sharded, each step keeps its shard's logits and picks through candidates;
+    # the block's logits cross ranks once, after the last step.
+    shard = markov_head.vocab_shard
+    step_logits = logits_out
+    if shard is not None and logits_out is not None:
+        step_logits = torch.empty(
+            base_logits.shape, dtype=step_dtype, device=base_logits.device
         )
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
@@ -279,14 +286,32 @@ def draft_markov_block(
             temperatures=step_temperatures,
             noise=noise,
             step=step,
-            logits_out=None if greedy_draft else logits_out[:, step],
+            logits_out=None if greedy_draft else step_logits[:, step],
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
     if greedy_draft:
         return torch.stack(draft_tokens, dim=1), None
+    if step_logits is not logits_out:
+        _gather_step_logits(shard, step_logits, logits_out)
     noise.offset.add_(1)
     return torch.stack(draft_tokens, dim=1), logits_out
+
+
+def _gather_step_logits(
+    shard: VocabShard, local: torch.Tensor, logits_out: torch.Tensor
+) -> None:
+    """``logits_out[b, s]``: the ranks' ``local[b, s]`` side by side, cropped."""
+    bs, gamma, width = local.shape
+    rows = bs * gamma
+    stacked = shard.gather.gather_stacked(local.view(rows, width))
+    by_rank = stacked.view(-1, rows, width).transpose(0, 1)
+    world = by_rank.shape[1]
+    vocab = logits_out.shape[-1]
+    if vocab == world * width:
+        logits_out.view(rows, world, width).copy_(by_rank)
+    else:
+        logits_out.view(rows, vocab).copy_(by_rank.reshape(rows, -1)[:, :vocab])
 
 
 def sample_draft_block(

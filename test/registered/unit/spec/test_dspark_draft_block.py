@@ -3,11 +3,15 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.distributed.device_communicators.vocab_gather import (
+    LocalVocabGather,
+)
 from sglang.srt.models.dspark import (
     GatedMarkovHead,
     Nemotron35VanillaMarkov,
     RNNHead,
     VanillaMarkov,
+    VocabShard,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
@@ -100,6 +104,24 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertTrue(torch.equal(block.draft_tokens, logits.float().argmax(-1)))
         self.assertIsNone(block.corrected_logits)
         self.assertTrue(block.greedy_draft)
+
+    def test_a_sharded_head_keeps_the_whole_vocab_logits(self):
+        # Sharded, each step keeps its shard's logits; the block gathers them once.
+        head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(torch.bfloat16)
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
+            top_ks=torch.tensor([1, 50, 1, 50]),
+        )
+        blocks = []
+        for shard in (None, VocabShard(start=0, gather=LocalVocabGather())):
+            head.vocab_shard = shard
+            offset = torch.zeros(1, dtype=torch.int64)
+            blocks.append(_draft(head, sampling_info, offset)[0])
+        self.assertTrue(torch.equal(blocks[0].draft_tokens, blocks[1].draft_tokens))
+        self.assertTrue(
+            torch.equal(blocks[0].corrected_logits, blocks[1].corrected_logits)
+        )
 
 
 class TestFusedGreedyEligibility(CustomTestCase):
