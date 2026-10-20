@@ -15,6 +15,7 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
+    gather_step_logits,
     sample_draft_block,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -122,6 +123,21 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertTrue(
             torch.equal(blocks[0].corrected_logits, blocks[1].corrected_logits)
         )
+
+
+class TestGatherStepLogits(CustomTestCase):
+    def test_rank_shards_land_side_by_side_in_each_row(self):
+        # The gather stacks ranks first; each row takes them in rank order, cropped.
+        class TwoRanks:
+            def gather_stacked(self, local):
+                return torch.cat([local, local + 1000])
+
+        local = torch.arange(2 * 3 * 7, dtype=torch.float32).view(2, 3, 7)
+        for vocab in (14, 11):
+            head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
+            head.vocab_shard = VocabShard(start=0, gather=TwoRanks())
+            expected = torch.cat([local, local + 1000], dim=-1)[..., :vocab]
+            self.assertTrue(torch.equal(gather_step_logits(head, local), expected))
 
 
 class TestFusedGreedyEligibility(CustomTestCase):

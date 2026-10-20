@@ -11,7 +11,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     draft_markov_block,
     resolve_draft_params,
     select_draft_hidden_without_anchor,
-    step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 
@@ -70,8 +69,8 @@ class DsparkDraftSampler:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
-        # the first call; a greedy draft keeps none.
+        # [max_bs, gamma, base logits width] step logits for the sampling accept
+        # (a sharded vocab's shard), sized on the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
@@ -79,7 +78,7 @@ class DsparkDraftSampler:
             # The runner's warmup calls the tail eagerly before capture.
             assert not torch.cuda.is_current_stream_capturing()
             self.step_logits = torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, base_logits.shape[-1]),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
@@ -126,11 +125,6 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
-
-
-def _step_logits_width(model) -> int:
-    # Unsharded base logits span the cropped vocab.
-    return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
 
 def maybe_build_draft_sampler(
