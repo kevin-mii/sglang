@@ -386,6 +386,9 @@ class TestMarkovSampleStep(CustomTestCase):
 
             for rank in range(3):
                 run(rank, lambda partial, rank=rank: partials.setdefault(rank, partial))
+            if impl is MarkovSampleStep.triton:
+                # The custom all-gather takes only 16-byte multiples.
+                self.assertEqual(partials[0][0].nbytes % 16, 0)
             stacked = torch.cat([partials[rank] for rank in range(3)])
             kept = []
             for rank in range(3):

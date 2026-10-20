@@ -246,25 +246,27 @@ def _markov_bias_partial_kernel(
     if SELECT:
         key = value
         if SAMPLE:
-            # _select_block's noise: word k of a Philox call goes to token 4 q + k.
             temperature = tl.load(T + row, has_row, 0.0)
-            quad = (part * BLOCK_V + VOCAB_START) // 4 + tl.arange(0, BLOCK_V // 4)
-            lane = tl.zeros([BLOCK_M, BLOCK_V // 4], tl.int64)
-            w0, w1, w2, w3 = tl.philox(
-                KEY,
-                (lane + quad[None, :]).to(tl.uint32),
-                (lane + row[:, None]).to(tl.uint32),
-                (lane + STEP).to(tl.uint32),
-                ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
-                PHILOX_ROUNDS,
-            )
-            bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-            uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
-            exp_noise = -libdevice.log1p(-uniform)
             sampled = temperature != 0.0
-            safe = tl.where(sampled, temperature, 1.0)
-            noised = value / safe[:, None] - tl.log(exp_noise)
-            key = tl.where(sampled[:, None], noised, value)
+            # a block of greedy rows draws no noise
+            if tl.max(sampled.to(tl.int32), 0) > 0:
+                # _select_block's noise: word k of a Philox call goes to token 4 q + k.
+                quad = (part * BLOCK_V + VOCAB_START) // 4 + tl.arange(0, BLOCK_V // 4)
+                lane = tl.zeros([BLOCK_M, BLOCK_V // 4], tl.int64)
+                p0, p1, p2, p3 = tl.philox(
+                    KEY,
+                    (lane + quad[None, :]).to(tl.uint32),
+                    (lane + row[:, None]).to(tl.uint32),
+                    (lane + STEP).to(tl.uint32),
+                    ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
+                    PHILOX_ROUNDS,
+                )
+                bits = tl.interleave(tl.interleave(p0, p2), tl.interleave(p1, p3))
+                uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
+                exp_noise = -libdevice.log1p(-uniform)
+                safe = tl.where(sampled, temperature, 1.0)
+                noised = value / safe[:, None] - tl.log(exp_noise)
+                key = tl.where(sampled[:, None], noised, value)
         live = has_row[:, None] & valid[None, :]
         nan = live & (key != key)
         has_nan = tl.max(nan.to(tl.int32), 1) > 0
@@ -382,7 +384,9 @@ def _launch_bias_partial(
     w1, w2 = bias.w1, bias.w2
     assert w1.dtype == w2.dtype == torch.bfloat16
     assert w1.stride(1) == w2.stride(1) == 1 and w1.shape[1] == w2.shape[1]
-    parts = triton.cdiv(padded, _GEMV_BLOCK_V)
+    # An even count keeps a row of candidates a multiple of 16 bytes, as the
+    # custom all-gather needs; a tile past the shard leaves no candidate.
+    parts = triton.cdiv(padded, 2 * _GEMV_BLOCK_V) * 2
     partial = torch.empty(
         (rows, parts, 2), device=base_logits.device, dtype=torch.float32
     )
