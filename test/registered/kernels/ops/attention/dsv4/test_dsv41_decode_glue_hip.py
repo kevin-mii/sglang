@@ -457,5 +457,195 @@ def test_page_table_from_req_to_token_matches_torch():
     assert empty.shape == (0, 16)
 
 
+@pytest.mark.parametrize("bs", [1, 3, 8])
+@pytest.mark.parametrize("ratios", [(1, 2), (2,)], ids=["c1c2", "c2"])
+@pytest.mark.parametrize("step_inputs", [True, False], ids=["inputs", "no_inputs"])
+def test_verify_step_meta_matches_the_launch_chain(bs, ratios, step_inputs):
+    """One launch builds a target-verify step's metadata bit for bit as the launches
+    make_forward_metadata_from_raw_verify and init_forward_metadata_in_graph chain."""
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+        expand_same_length,
+        gather_i32,
+        page_table_from_req_to_token,
+        sparse_buffers,
+        verify_step_meta,
+        widen_pair_i64,
+    )
+    from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+        BuildCausalSwaPageIndices,
+    )
+
+    _seed(31)
+    qo, page, window, topk = 6, 256, 128, 512
+    bpp = {1: 4, 2: 2}
+    i32 = dict(dtype=torch.int32, device=DEVICE)
+    i64 = dict(dtype=torch.int64, device=DEVICE)
+    rows, width = 64, 8192
+    req_to_token = torch.randint(0, 1 << 20, (rows, width), **i32)
+    full_to_swa = torch.randint(0, 1 << 20, ((1 << 20) + 1,), **i64)
+    full_to_swa[-1] = -1
+    seq_lens = torch.randint(0, width - qo - 1, (bs,), **i64)
+    # a window shorter than SWA_WINDOW, and one crossing it
+    seq_lens[0] = 0
+    if bs > 1:
+        seq_lens[1] = 125
+    req = torch.randperm(rows, device=DEVICE)[:bs].to(torch.int64)
+    n = bs * qo
+    raw_out_loc = torch.randint(0, 1 << 20, (n,), **i32)
+    raw_out_loc[::5] = -3  # ratio 2 floors a negative location
+    out_cache_loc = torch.randint(0, 1 << 20, (n,), **i64)
+    out_cache_loc[::4] = -1  # a padded row's location
+    positions = (seq_lens[:, None] + torch.arange(qo, **i64)).flatten()
+
+    # the chain, as the HIP backend runs it for DeepSeek-V4.1's target verify
+    lens, req_rep, positions32, window_lens = expand_same_length(
+        seq_lens, req, qo, offset=qo, window=window
+    )
+    lens32 = lens.to(torch.int32)
+    expected = {
+        "seq_lens_casual": lens32,
+        "positions_casual": positions32,
+        "swa_topk_lengths": window_lens,
+        "swa_page_indices": BuildCausalSwaPageIndices.execute(
+            req_to_token=req_to_token,
+            full_to_swa_mapping=full_to_swa,
+            req_pool_indices_repeated=req_rep,
+            seq_lens_casual=lens32,
+            swa_window=window,
+            page_index_aligned_size=64,
+        ),
+    }
+    page_table = page_table_from_req_to_token(req_to_token, req_rep, width, page)
+    expected["page_table"] = page_table
+    compression = low_ratio_compression_metadata(lens32, raw_out_loc, ratios)
+    expected.update(compression)
+    expected.update(
+        sparse_buffers(
+            c4_topk_lengths_clamp1=None,
+            c4_topk_lengths_raw=None,
+            c1_topk_lengths_clamp1=compression.get("c1_topk_lengths_clamp1"),
+            c2_topk_lengths_clamp1=compression.get("c2_topk_lengths_clamp1"),
+            index_topk=topk,
+            page_index_align=64,
+        )
+    )
+    for r in ratios:
+        expected[f"c{r}_index_page_table"] = expand_index_page_table(page_table, bpp[r])
+    if step_inputs:
+        expected["swa_out_cache_loc"] = gather_i32(full_to_swa, out_cache_loc)
+        (
+            expected["low_ratio_req_indices"],
+            expected["low_ratio_pos_i64"],
+        ) = widen_pair_i64(req, positions, repeat=qo)
+
+    got = verify_step_meta(
+        seq_lens=seq_lens,
+        req_pool_indices=req,
+        raw_out_loc=raw_out_loc,
+        req_to_token=req_to_token,
+        full_to_swa=full_to_swa,
+        max_seq_len=width,
+        page_size=page,
+        qo_len=qo,
+        offset=qo,
+        swa_window=window,
+        swa_width=128,
+        index_topk=topk,
+        sparse_width=topk,
+        index_blocks_per_page={r: bpp[r] for r in ratios},
+        out_cache_loc=out_cache_loc if step_inputs else None,
+        positions=positions if step_inputs else None,
+    )
+    assert got.keys() == expected.keys()
+    for name, ref in expected.items():
+        assert got[name].dtype is ref.dtype, name
+        assert got[name].shape == ref.shape, name
+        assert torch.equal(got[name], ref), name
+
+
+def _assert_same_metadata(a, b, path="metadata"):
+    import dataclasses
+
+    if isinstance(a, torch.Tensor):
+        assert isinstance(b, torch.Tensor), path
+        assert a.dtype is b.dtype and a.shape == b.shape, path
+        assert torch.equal(a, b), path
+    elif dataclasses.is_dataclass(a):
+        assert type(a) is type(b), path
+        for field in dataclasses.fields(a):
+            _assert_same_metadata(
+                getattr(a, field.name, None),
+                getattr(b, field.name, None),
+                f"{path}.{field.name}",
+            )
+    elif isinstance(a, dict):
+        assert a.keys() == b.keys(), path
+        for key in a:
+            _assert_same_metadata(a[key], b[key], f"{path}[{key!r}]")
+    else:
+        assert a == b, path
+
+
+@pytest.mark.parametrize("bs", [1, 5])
+def test_fused_verify_metadata_matches_the_chain(bs):
+    """The HIP backend's one-launch target-verify metadata sets every field, with
+    the same values, that make_forward_metadata_from_raw_verify's chain sets."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+        DSV4RawVerifyMetadata,
+    )
+
+    _seed(32)
+    qo, rows, width = 6, 32, 4096
+    i32 = dict(dtype=torch.int32, device=DEVICE)
+    i64 = dict(dtype=torch.int64, device=DEVICE)
+    full_to_swa = torch.randint(0, 1 << 16, ((1 << 16) + 1,), **i64)
+    full_to_swa[-1] = -1
+    backend = DeepseekV4HipRadixBackend.__new__(DeepseekV4HipRadixBackend)
+    backend.__dict__.update(
+        token_to_kv_pool=SimpleNamespace(
+            full_to_swa_index_mapping=full_to_swa,
+            request_window=None,
+            unified_swa_pages=0,
+            get_index_k_page_size=lambda ratio: INDEX_PAGE_SIZE,
+        ),
+        req_to_token=torch.randint(0, 1 << 16, (rows, width), **i32),
+        MAX_SEQ_LEN_FOR_CAPTURE=width,
+        page_size=256,
+        index_topk=TOPK,
+        present_ratios=(1, 2),
+        low_ratios=(1, 2),
+        has_c4=False,
+        has_c128=False,
+        need_compress=True,
+        target_verify_num_draft_tokens=qo,
+        cuda_int32_kwargs=i32,
+        dsa_topk_backend=SimpleNamespace(should_use_topk_v2=lambda: False),
+        encoder_replay=False,
+    )
+    seq_lens = torch.randint(0, width - qo - 1, (bs,), **i64)
+    seq_lens[0] = 3
+    raw = DSV4RawVerifyMetadata(
+        req_pool_indices=torch.randperm(rows, device=DEVICE)[:bs].to(torch.int64),
+        seq_lens=seq_lens,
+        out_cache_loc=torch.randint(0, 1 << 16, (bs * qo,), **i32),
+    )
+    from sglang.srt.layers.attention import deepseek_v4_backend_hip_radix as hip
+
+    with mock.patch.object(
+        hip, "verify_step_meta", wraps=hip.verify_step_meta
+    ) as fused_launch:
+        fused = backend.make_forward_metadata_from_raw_verify(raw)
+    assert fused_launch.call_count == 1
+    with mock.patch.object(
+        DeepseekV4HipRadixBackend, "_fused_verify_metadata", return_value=None
+    ):
+        chain = backend.make_forward_metadata_from_raw_verify(raw)
+    _assert_same_metadata(fused, chain)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     mask_indices_by_length,
     page_table_from_req_to_token,
     sparse_buffers,
+    verify_step_meta,
     widen_pair_i64,
 )
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
@@ -704,6 +705,8 @@ class DSV4Metadata:
     # per-step inputs of forward_low_ratio_sources, hoisted for one-token rows and the replay tail
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # verify_step_meta also built swa_out_cache_loc and the two fields above
+    step_inputs_fused: bool = False
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
     # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
@@ -1512,8 +1515,13 @@ class DeepseekV4HipRadixBackend(
         )
 
     def make_forward_metadata_from_raw_verify(
-        self, raw_metadata: DSV4RawVerifyMetadata
+        self,
+        raw_metadata: DSV4RawVerifyMetadata,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
+        fused = self._fused_verify_metadata(raw_metadata, forward_batch)
+        if fused is not None:
+            return fused
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
@@ -1616,6 +1624,149 @@ class DeepseekV4HipRadixBackend(
             ),
         )
 
+    def _fused_verify_metadata(
+        self,
+        raw_metadata: DSV4RawVerifyMetadata,
+        forward_batch: Optional[ForwardBatch],
+    ) -> Optional[DSV4Metadata]:
+        """``make_forward_metadata_from_raw_verify``'s metadata in one launch
+        (``verify_step_meta``) for a pool whose compressed caches are ratios 1 / 2
+        only (DeepSeek-V4.1) and no request window; None where that does not hold.
+        With ``forward_batch``, the launch also builds the step's SWA locations and
+        low-ratio inputs that ``init_forward_metadata_in_graph`` would."""
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
+        pool = self.token_to_kv_pool
+        low_ratios = tuple(self.low_ratios)
+        seq_lens = raw_metadata.seq_lens
+        if (
+            not self.need_compress
+            or self.has_c4
+            or self.has_c128
+            or not low_ratios
+            or not set(low_ratios) <= {1, 2}
+            or is_unified_kv_triton()
+            or pool.request_window is not None
+            or getattr(pool, "unified_swa_pages", 0)
+            or not seq_lens.is_cuda
+            or seq_lens.dtype is not torch.int64
+        ):
+            return None
+        index_blocks_per_page = {}
+        for ratio in low_ratios:
+            slots_per_page = self.page_size // ratio
+            index_page_size = pool.get_index_k_page_size(ratio)
+            if slots_per_page % index_page_size:
+                return None
+            # one block a page shares the page table itself: keep that path
+            if slots_per_page == index_page_size:
+                return None
+            index_blocks_per_page[ratio] = slots_per_page // index_page_size
+        bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
+        n = bs * num_draft_tokens
+        out_cache_loc = positions = None
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and type(pool).translate_loc_from_full_to_swa
+            is DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc.is_cuda
+            and forward_batch.out_cache_loc.shape == (n,)
+            and forward_batch.out_cache_loc.is_contiguous()
+            and forward_batch.positions.is_cuda
+            and forward_batch.positions.shape == (n,)
+            and forward_batch.positions.is_contiguous()
+            and forward_batch.req_pool_indices.shape == (bs,)
+            and forward_batch.req_pool_indices.data_ptr()
+            == raw_metadata.req_pool_indices.data_ptr()
+        ):
+            out_cache_loc, positions = (
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+            )
+        meta = verify_step_meta(
+            seq_lens=seq_lens,
+            req_pool_indices=raw_metadata.req_pool_indices,
+            raw_out_loc=raw_metadata.out_cache_loc,
+            req_to_token=self.req_to_token,
+            full_to_swa=pool.full_to_swa_index_mapping,
+            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            page_size=self.page_size,
+            qo_len=num_draft_tokens,
+            offset=num_draft_tokens,
+            swa_window=SWA_WINDOW,
+            swa_width=(SWA_WINDOW + PAGE_INDEX_ALIGNED_SIZE - 1)
+            // PAGE_INDEX_ALIGNED_SIZE
+            * PAGE_INDEX_ALIGNED_SIZE,
+            index_topk=self.index_topk,
+            sparse_width=(self.index_topk + PAGE_INDEX_ALIGNED_SIZE - 1)
+            // PAGE_INDEX_ALIGNED_SIZE
+            * PAGE_INDEX_ALIGNED_SIZE,
+            index_blocks_per_page=index_blocks_per_page,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+        )
+        core = DSV4AttnMetadata(
+            page_size=self.page_size,
+            raw_out_loc=raw_metadata.out_cache_loc,
+            seq_lens_casual=meta["seq_lens_casual"],
+            cuda_int32_kwargs=self.cuda_int32_kwargs,
+            positions_casual=meta["positions_casual"],
+            page_table=meta["page_table"],
+            swa_page_indices=meta["swa_page_indices"],
+            swa_topk_lengths=meta["swa_topk_lengths"],
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
+            request_window_layout=None,
+        )
+        # what init_compression_metadata and init_flashmla_related set without c4 / c128
+        core.c4_sparse_topk_lengths = None
+        core.c4_sparse_topk_lengths_raw = None
+        core.c4_sparse_page_indices = None
+        for ratio in low_ratios:
+            for name in (
+                "out_loc",
+                "topk_lengths_clamp1",
+                "sparse_topk_lengths",
+                "sparse_page_indices",
+                "sparse_raw_indices",
+            ):
+                setattr(core, f"c{ratio}_{name}", meta[f"c{ratio}_{name}"])
+            setattr(core, f"c{ratio}_flashmla_metadata", _create_flashmla_metadata())
+        core.c0_flashmla_metadata = _create_flashmla_metadata()
+        core.c4_flashmla_metadata = None
+        core.c128_flashmla_metadata = None
+        indexer_metadata = {
+            f"c{ratio}_indexer_metadata": PagedIndexerMetadata(
+                page_size=self.page_size,
+                compressed_page_size=pool.get_index_k_page_size(ratio),
+                page_table=meta[f"c{ratio}_index_page_table"],
+                compressed_seq_lens=meta[f"c{ratio}_topk_lengths_clamp1"],
+                use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
+                compress_ratio=ratio,
+            )
+            for ratio in low_ratios
+        }
+        metadata = DSV4Metadata(
+            core,
+            None,
+            **indexer_metadata,
+            c4_compress_metadata=_create_dummy_paged_compress_data(compress_ratio=4),
+            c128_compress_metadata=_create_dummy_paged_compress_data(
+                compress_ratio=128
+            ),
+        )
+        if out_cache_loc is not None:
+            core.swa_out_cache_loc = meta["swa_out_cache_loc"]
+            metadata.low_ratio_req_indices = meta["low_ratio_req_indices"]
+            metadata.low_ratio_pos_i64 = meta["low_ratio_pos_i64"]
+            metadata.step_inputs_fused = True
+        return metadata
+
     def make_forward_metadata_from_raw_decode(
         self, raw_metadata: DSV4RawDecodeMetadata
     ) -> DSV4Metadata:
@@ -1712,7 +1863,7 @@ class DeepseekV4HipRadixBackend(
         upgraded_verify = isinstance(self.forward_metadata, DSV4RawVerifyMetadata)
         if upgraded_verify:
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
-                raw_metadata=self.forward_metadata,
+                raw_metadata=self.forward_metadata, forward_batch=forward_batch
             )
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
@@ -1745,6 +1896,7 @@ class DeepseekV4HipRadixBackend(
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None
             and window is None
+            and not metadata.step_inputs_fused
         ):
             out_cache_loc = forward_batch.out_cache_loc
             if (
@@ -1792,7 +1944,9 @@ class DeepseekV4HipRadixBackend(
             and metadata.core_metadata.low_ratios
             and one_token_rows
         ):
-            if (
+            if metadata.step_inputs_fused:
+                pass  # verify_step_meta built them
+            elif (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.positions.is_cuda
                 and forward_batch.req_pool_indices.shape
