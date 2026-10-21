@@ -1,4 +1,64 @@
-# DeepSeek-V4.1 mono on SGLang: handoff (2026-10-21)
+# DeepSeek-V4.1 mono on SGLang: handoff (updated 2026-10-21 evening)
+
+## 0. Latest state (supersedes sections 1-2 where they differ)
+
+Everything is rebased onto SGLang main 5e79333c95 and plugin main b27d604, validated, and pushed.
+
+**Plugin (sgl-project/sgl-amd-mono)**
+- [#21](https://github.com/sgl-project/sgl-amd-mono/pull/21): open, CI green.
+- [#14](https://github.com/sgl-project/sgl-amd-mono/pull/14): now MERGEABLE at d668364. Main was merged in, plus the `check_k1` import fix, as new commits on top.
+- PR A / B / C are rebased onto it and pushed as `wip/dsv41-pr-a-rebased` (83cd0a6), `wip/dsv41-pr-b-rebased` (b2a76d5) and `wip/dsv41-pr-c-rebased` (76ff1d7).
+  - PR C needed `torch_quant` -> `quantization/fp4_fake_quant`.
+  - C still carries the fixup commit, to be squashed when its PR opens.
+  - Open them after #14 merges.
+
+**SGLang**
+- [sgl-project/sglang#45658](https://github.com/sgl-project/sglang/pull/45658): meta launch cuts, from `kevin-mii:amd/dsv4-hip-meta-launches`.
+  - It needed a `unified_kv_gate` import fix after #45112; only the e2e caught it.
+- [sgl-project/sglang#45663](https://github.com/sgl-project/sglang/pull/45663): DSpark draft and accept launch cuts, from `kevin-mii:amd/dspark-draft-launch-cuts`.
+- Glue cuts on `kevin-mii:amd/hip-logits-lastdim-gather`: aiter last-dim logits gather into the logits buffer, and the accept's 3 TP syncs in one NCCL group. **Held by the user, no PR.**
+- [#45045](https://github.com/sgl-project/sglang/pull/45045) is superseded by upstream [#45546](https://github.com/sgl-project/sglang/pull/45546), which pins plugin main b27d604. Reuse it for the next bump after #14.
+- Combined stacks:
+  - `wip/dsv41-best-stack` = DSpark PR + meta PR.
+  - `wip/dsv41-best-stack2` = that + the glue cuts. It's the local worktree `sglang-stack2`, not pushed; rebuild it by cherry-picking.
+
+**Validation, all on the new base, MI350X TP4**
+- All SGLang PR unit tests pass.
+- `check_k1` passes at every width, token parallel included.
+- Plugin kernels 4, K2i 14, unit 120.
+- e2e 9/9 for #14, meta, DSpark, the full stack and the glue cuts. GSM8K 0.895-0.915.
+
+**Perf** (decode_ab, ABAB means vs SGLang main + plugin main + #21):
+
+| | c1 | c2 | c4 | c8 |
+|---|---|---|---|---|
+| everything | +12.2% | +10.1% | +12.2% | +14.1% |
+| plugin stack (#14+A+B+C) | +7.2% | +6.0% | +7.3% | +7.6% |
+| #14 alone | +2.7% | +4.2% | +3.7% | +3.0% |
+| meta PR | +3.2% | +3.1% | +1.7% | +1.8% |
+| DSpark PR | +2.2% | +1.9% | +1.5% | +3.7% |
+| DSpark PR on meta + plugin stack | +2.3% | +1.0% | +1.3% | +3.4% |
+| glue cuts on the full stack | +0.2% | +1.0% | +1.4% | +1.1% |
+
+Absolute numbers for the full stack: 738.6 / 595.7 / 490.7 / 370.6 tok/s/user.
+
+**Profiles of the full stack**
+- c1: 4924 us/step, 246 kernels. Mono ~3850 us.
+- c8: 9402 us/step, 257 kernels. Mono ~8130 us.
+
+**Suggested merge order**
+1. #21.
+2. #14, which unlocks A -> B -> C.
+3. Then a pin bump to the merged plugin.
+4. #45658 and #45663 are independent and can be reviewed in parallel.
+
+**Remaining glue ideas (each <1%)**
+- Deferred greedy verify argmax: saves the 73 us bf16 logits gather at c8. It needs a second set of verify graphs.
+- aiter all-gather is capped at 80 CTAs.
+- Markov TP syncs, 5 x 11 us: the user keeps the default `SGLANG_SPEC_TP_SYNC`.
+- The compressor, ~85 us/step at c1: ATOM also runs it outside its kernels, and fusing it changes numerics.
+- Token-parallel `_gather_rows` pack/unpack copies.
+
 
 Goal: every ROCm/ATOM DSv4.1 mono-kernel optimization (ATOM 5e8d913, ROCm/ATOM#2545), plus more, for the best
 DSv4.1-Flash decode on SGLang (MI350X/MI355X, TP4, DSpark, `--monokernel-backend amd` through sgl-amd-mono).
