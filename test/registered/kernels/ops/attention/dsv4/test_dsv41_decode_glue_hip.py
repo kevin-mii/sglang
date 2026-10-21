@@ -647,5 +647,160 @@ def test_fused_verify_metadata_matches_the_chain(bs):
     _assert_same_metadata(fused, chain)
 
 
+@pytest.mark.parametrize("bs", [1, 4])
+@pytest.mark.parametrize("valid_from", [False, True], ids=["paged", "valid_from"])
+@pytest.mark.parametrize("out_loc", [True, False], ids=["out_loc", "no_out_loc"])
+def test_draft_step_meta_matches_the_launch_chain(bs, valid_from, out_loc):
+    """One launch builds a DSpark draft block's SWA metadata bit for bit as
+    init_forward_metadata_dspark_draft_block's launches and the in-graph SWA
+    locations do."""
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+        draft_step_meta,
+        expand_same_length,
+        gather_i32,
+        page_table_from_req_to_token,
+    )
+    from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+        BuildDsparkSwaPageIndices,
+        ComputeDsparkWindowGather,
+    )
+
+    _seed(33)
+    block, page, window, width = 5, 256, 128, 192
+    i32 = dict(dtype=torch.int32, device=DEVICE)
+    i64 = dict(dtype=torch.int64, device=DEVICE)
+    rows, cols = 32, 4096
+    req_to_token = torch.randint(0, 1 << 16, (rows, cols), **i32)
+    full_to_swa = torch.randint(0, 1 << 16, ((1 << 16) + 1,), **i64)
+    full_to_swa[-1] = -1
+    seq_lens = torch.randint(0, cols - 2 * block, (bs,), **i64)
+    seq_lens[0] = 3  # a window still filling
+    req = torch.randperm(rows, device=DEVICE)[:bs].to(torch.int64)
+    n = bs * block
+    block_loc = torch.randint(0, 1 << 16, (n,), **i64)
+    step_loc = torch.randint(0, 1 << 16, (n,), **i64)
+    step_loc[::3] = -1
+    starts = None
+    if valid_from:
+        starts = torch.zeros(rows, **i64)
+        starts[req] = torch.randint(0, cols, (bs,), **i64)
+
+    # the chain, as the HIP backend runs it for the draft block
+    lens, req_rep, positions, _ = expand_same_length(
+        seq_lens, req, block, offset=block, window=window
+    )
+    lens32 = lens.to(torch.int32)
+    gather = ComputeDsparkWindowGather.execute(
+        seq_lens_casual=lens32,
+        req_pool_indices_repeated=req_rep,
+        block_size=block,
+        swa_window=window,
+        valid_from=starts,
+    )
+    swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
+        req_to_token=req_to_token,
+        full_to_swa_mapping=full_to_swa,
+        req_pool_indices_per_request=gather.req_pool_indices_per_request,
+        offsets=gather.offsets,
+        invalid=gather.invalid,
+        out_loc=block_loc,
+        context_lens=gather.context_lens,
+        block_size=block,
+        swa_window=window,
+        page_index_aligned_size=64,
+    )
+    expected = {
+        "seq_lens_casual": lens32,
+        "positions_casual": positions,
+        "swa_page_indices": swa_page_indices,
+        "swa_topk_lengths": swa_topk_lengths,
+        "page_table": page_table_from_req_to_token(
+            req_to_token, req_rep, cols + block, page
+        ),
+    }
+    if out_loc:
+        expected["swa_out_cache_loc"] = gather_i32(full_to_swa, step_loc)
+
+    got = draft_step_meta(
+        seq_lens=seq_lens,
+        req_pool_indices=req,
+        out_loc=block_loc,
+        req_to_token=req_to_token,
+        full_to_swa=full_to_swa,
+        max_seq_len=cols + block,
+        page_size=page,
+        block_size=block,
+        swa_window=window,
+        width=width,
+        valid_from=starts,
+        out_cache_loc=step_loc if out_loc else None,
+    )
+    assert got.keys() == expected.keys()
+    for name, ref in expected.items():
+        assert got[name].dtype is ref.dtype, name
+        assert got[name].shape == ref.shape, name
+        assert torch.equal(got[name], ref), name
+
+
+@pytest.mark.parametrize("bs", [1, 4])
+def test_fused_draft_block_metadata_matches_the_chain(bs):
+    """The HIP backend's one-launch DSpark draft-block metadata sets every field,
+    with the same values, that init_forward_metadata_dspark_draft_block's chain sets."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from sglang.srt.layers.attention import deepseek_v4_backend_hip_radix as hip
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
+
+    _seed(34)
+    block, rows, width = 5, 32, 4096
+    i32 = dict(dtype=torch.int32, device=DEVICE)
+    i64 = dict(dtype=torch.int64, device=DEVICE)
+    full_to_swa = torch.randint(0, 1 << 16, ((1 << 16) + 1,), **i64)
+    full_to_swa[-1] = -1
+    backend = DeepseekV4HipRadixBackend.__new__(DeepseekV4HipRadixBackend)
+    backend.__dict__.update(
+        token_to_kv_pool=SimpleNamespace(
+            full_to_swa_index_mapping=full_to_swa,
+            request_window=None,
+            swa_req_ring_size=None,
+            swa_valid_from=torch.zeros(rows, **i64),
+        ),
+        req_to_token=torch.randint(0, 1 << 16, (rows, width), **i32),
+        page_size=256,
+        index_topk=TOPK,
+        present_ratios=(),
+        low_ratios=(),
+        has_c4=False,
+        has_c128=False,
+        is_dspark_draft=True,
+        is_dsv41=True,
+        target_verify_num_draft_tokens=block,
+        cuda_int32_kwargs=i32,
+        encoder_replay=False,
+    )
+    seq_lens = torch.randint(0, width - 2 * block, (bs,), **i64)
+    seq_lens[0] = 2
+    args = dict(
+        max_seq_len=width,
+        req_pool_indices=torch.randperm(rows, device=DEVICE)[:bs].to(torch.int64),
+        seq_lens=seq_lens,
+        out_cache_loc=torch.randint(0, 1 << 16, (bs * block,), **i64),
+        block_size=block,
+    )
+    with mock.patch.object(
+        hip, "draft_step_meta", wraps=hip.draft_step_meta
+    ) as fused_launch:
+        fused = backend.init_forward_metadata_dspark_draft_block(**args)
+    assert fused_launch.call_count == 1
+    with mock.patch.object(
+        DeepseekV4HipRadixBackend, "_fused_draft_block_metadata", return_value=None
+    ):
+        chain = backend.init_forward_metadata_dspark_draft_block(**args)
+    _assert_same_metadata(fused, chain)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

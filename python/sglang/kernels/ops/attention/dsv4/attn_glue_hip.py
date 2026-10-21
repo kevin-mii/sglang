@@ -826,3 +826,177 @@ def verify_step_meta(
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _draft_step_meta_kernel(
+    seq_lens_ptr,
+    req_pool_ptr,
+    out_loc_ptr,
+    r2t_ptr,
+    f2s_ptr,
+    valid_from_ptr,
+    ocl_ptr,
+    seq_lens_out_ptr,
+    positions_out_ptr,
+    swa_indices_ptr,
+    swa_lens_ptr,
+    page_table_ptr,
+    swa_out_loc_ptr,
+    r2t_stride,
+    f2s_len,
+    n_pages,
+    lens_offset,
+    BLOCK: tl.constexpr,
+    BLOCK_P2: tl.constexpr,
+    SWA_WINDOW: tl.constexpr,
+    WIDTH: tl.constexpr,
+    WIDTH_P2: tl.constexpr,
+    PAGE: tl.constexpr,
+    HAS_VALID_FROM: tl.constexpr,
+    HAS_OUT_LOC: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    # program (r, 0): request r's block rows; program (r, 1 + i): page tile i
+    r = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    req = tl.load(req_pool_ptr + r).to(tl.int64)
+    j = tl.arange(0, BLOCK_P2)
+    m = j < BLOCK
+    t = r * BLOCK + j
+    if tile == 0:
+        lens32 = (tl.load(seq_lens_ptr + r) + lens_offset + j).to(tl.int32)
+        tl.store(seq_lens_out_ptr + t, lens32, mask=m)
+        tl.store(positions_out_ptr + t, lens32 - 1, mask=m)
+        # the window up to the committed prefix, then the whole block, every row alike
+        first = (tl.load(seq_lens_ptr + r) + lens_offset).to(tl.int32)
+        prefix = first.to(tl.int64) - 1
+        context = tl.minimum(prefix, SWA_WINDOW)
+        if HAS_VALID_FROM:
+            valid_from = tl.load(valid_from_ptr + req)
+            context = tl.minimum(context, tl.maximum(prefix - valid_from, 0))
+        context = context.to(tl.int32)
+        k = tl.arange(0, WIDTH_P2)
+        kmask = k < WIDTH
+        in_window = k < context
+        wmask = kmask & in_window
+        off = prefix - context + k
+        win_full = tl.load(r2t_ptr + req * r2t_stride + off, mask=wmask, other=0).to(
+            tl.int64
+        )
+        win_swa = tl.load(f2s_ptr + win_full, mask=wmask, other=-1).to(tl.int32)
+        in_block = (k >= context) & (k < context + BLOCK)
+        bmask = kmask & in_block
+        blk_full = tl.load(
+            out_loc_ptr + r * BLOCK + tl.maximum(k - context, 0), mask=bmask, other=0
+        ).to(tl.int64)
+        blk_swa = tl.load(f2s_ptr + blk_full, mask=bmask, other=-1).to(tl.int32)
+        row = tl.where(in_window, win_swa, tl.where(in_block, blk_swa, -1))
+        tl.store(
+            swa_indices_ptr + t[:, None] * WIDTH + k[None, :],
+            row[None, :] + tl.zeros([BLOCK_P2, WIDTH_P2], tl.int32),
+            mask=m[:, None] & kmask[None, :],
+        )
+        tl.store(
+            swa_lens_ptr + t, context + BLOCK + tl.zeros([BLOCK_P2], tl.int32), mask=m
+        )
+        if HAS_OUT_LOC:
+            idx = tl.load(ocl_ptr + t, mask=m, other=0).to(tl.int64)
+            # torch indexing: a negative index counts from the end
+            idx = tl.where(idx < 0, idx + f2s_len, idx)
+            tl.store(
+                swa_out_loc_ptr + t,
+                tl.load(f2s_ptr + idx, mask=m).to(tl.int32),
+                mask=m,
+            )
+    else:
+        p = (tile - 1) * BLOCK_P + tl.arange(0, BLOCK_P)
+        mp = p < n_pages
+        v = tl.load(
+            r2t_ptr + req * r2t_stride + p.to(tl.int64) * PAGE, mask=mp, other=0
+        )
+        # torch's floor division; the C-style quotient rounds toward zero
+        q = v // PAGE
+        page = tl.where((v < 0) & (v % PAGE != 0), q - 1, q).to(tl.int32)
+        for jj in tl.static_range(BLOCK):
+            tl.store(page_table_ptr + (r * BLOCK + jj) * n_pages + p, page, mask=mp)
+
+
+def draft_step_meta(
+    *,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    out_loc: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+    block_size: int,
+    swa_window: int,
+    width: int,
+    valid_from: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """A DSpark draft block's SWA attention metadata in one launch, keyed by attribute
+    name, bit for bit what the launches build one by one: ``expand_same_length``
+    (offset ``block_size``, with ``window``), the int32 lengths, the block's window
+    and indices (``ComputeDsparkWindowGather`` then ``BuildDsparkSwaPageIndices``,
+    ``width`` wide) and ``page_table_from_req_to_token``. With ``out_cache_loc``, also
+    ``gather_i32`` of its SWA locations."""
+    bs = seq_lens.shape[0]
+    assert seq_lens.is_contiguous() and req_pool_indices.shape[0] == bs
+    assert req_pool_indices.is_contiguous()
+    assert req_to_token.dim() == 2 and req_to_token.stride(1) == 1
+    assert full_to_swa.dim() == 1 and full_to_swa.stride(0) == 1
+    n = bs * block_size
+    assert out_loc.shape[0] >= n and out_loc.stride(0) == 1
+    assert width >= swa_window + block_size
+    device = seq_lens.device
+    n_pages = max(
+        0, (min(max_seq_len, req_to_token.shape[1]) + page_size - 1) // page_size
+    )
+    i32 = dict(dtype=torch.int32, device=device)
+    out = {
+        "seq_lens_casual": torch.empty(n, **i32),
+        "positions_casual": torch.empty(n, **i32),
+        "swa_page_indices": torch.empty((n, width), **i32),
+        "swa_topk_lengths": torch.empty(n, **i32),
+        "page_table": torch.empty((n, n_pages), **i32),
+    }
+    if out_cache_loc is not None:
+        assert out_cache_loc.shape == (n,) and out_cache_loc.is_contiguous()
+        out["swa_out_cache_loc"] = torch.empty(n, **i32)
+    if n == 0:
+        return out
+    placeholder = out["seq_lens_casual"]
+    block_p = 256
+    _draft_step_meta_kernel[(bs, 1 + triton.cdiv(n_pages, block_p))](
+        seq_lens,
+        req_pool_indices,
+        out_loc,
+        req_to_token,
+        full_to_swa,
+        valid_from if valid_from is not None else placeholder,
+        out_cache_loc if out_cache_loc is not None else placeholder,
+        out["seq_lens_casual"],
+        out["positions_casual"],
+        out["swa_page_indices"],
+        out["swa_topk_lengths"],
+        out["page_table"],
+        out.get("swa_out_cache_loc", placeholder),
+        req_to_token.stride(0),
+        full_to_swa.shape[0],
+        n_pages,
+        1,
+        BLOCK=block_size,
+        BLOCK_P2=triton.next_power_of_2(block_size),
+        SWA_WINDOW=swa_window,
+        WIDTH=width,
+        WIDTH_P2=triton.next_power_of_2(width),
+        PAGE=page_size,
+        HAS_VALID_FROM=valid_from is not None,
+        HAS_OUT_LOC=out_cache_loc is not None,
+        BLOCK_P=block_p,
+        num_warps=4,
+    )
+    return out

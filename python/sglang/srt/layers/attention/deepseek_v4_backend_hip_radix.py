@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+    draft_step_meta,
     expand_index_page_table,
     expand_same_length,
     gather_i32,
@@ -705,7 +706,8 @@ class DSV4Metadata:
     # per-step inputs of forward_low_ratio_sources, hoisted for one-token rows and the replay tail
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
-    # verify_step_meta also built swa_out_cache_loc and the two fields above
+    # verify_step_meta / draft_step_meta also built swa_out_cache_loc (and, with
+    # low ratios, the two fields above)
     step_inputs_fused: bool = False
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
@@ -1469,10 +1471,21 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         block_size: int,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
         """DSpark draft block: seq_lens are the committed prefixes, extended by
         block_size per request from the device lengths only (the worker's
         seq_lens_cpu is already extended). SWA-only."""
+        fused = self._fused_draft_block_metadata(
+            max_seq_len,
+            req_pool_indices,
+            seq_lens,
+            out_cache_loc,
+            block_size,
+            forward_batch,
+        )
+        if fused is not None:
+            return fused
         assert block_size == self.target_verify_num_draft_tokens, (
             f"{block_size=} must equal the draft's target_verify_num_draft_tokens="
             f"{self.target_verify_num_draft_tokens}"
@@ -1513,6 +1526,95 @@ class DeepseekV4HipRadixBackend(
                 compress_ratio=128
             ),
         )
+
+    def _fused_draft_block_metadata(
+        self,
+        max_seq_len: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        block_size: int,
+        forward_batch: Optional[ForwardBatch],
+    ) -> Optional[DSV4Metadata]:
+        """``init_forward_metadata_dspark_draft_block``'s metadata in one launch
+        (``draft_step_meta``) for the V4.1 draft's paged SWA window; None where the
+        chain's other branches apply. With ``forward_batch``, the launch also builds
+        the block's SWA locations that ``init_forward_metadata_in_graph`` would."""
+        pool = self.token_to_kv_pool
+        if (
+            block_size != self.target_verify_num_draft_tokens
+            or not self._uses_dspark_draft_window()
+            or pool.request_window is not None
+            or pool.swa_req_ring_size is not None
+            or self.low_ratios
+            or not seq_lens.is_cuda
+            or out_cache_loc.stride(0) != 1
+        ):
+            return None
+        n = len(seq_lens) * block_size
+        step_out_loc = None
+        if (
+            forward_batch is not None
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and type(pool).translate_loc_from_full_to_swa
+            is DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc.is_cuda
+            and forward_batch.out_cache_loc.shape == (n,)
+            and forward_batch.out_cache_loc.is_contiguous()
+        ):
+            step_out_loc = forward_batch.out_cache_loc
+        meta = draft_step_meta(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices.contiguous(),
+            out_loc=out_cache_loc,
+            req_to_token=self.req_to_token,
+            full_to_swa=pool.full_to_swa_index_mapping,
+            # the block may cross into the next page beyond the prefix
+            max_seq_len=max_seq_len + block_size,
+            page_size=self.page_size,
+            block_size=block_size,
+            swa_window=SWA_WINDOW,
+            width=(SWA_WINDOW + block_size + PAGE_INDEX_ALIGNED_SIZE - 1)
+            // PAGE_INDEX_ALIGNED_SIZE
+            * PAGE_INDEX_ALIGNED_SIZE,
+            valid_from=pool.swa_valid_from,
+            out_cache_loc=step_out_loc,
+        )
+        core = DSV4AttnMetadata(
+            page_size=self.page_size,
+            raw_out_loc=out_cache_loc,
+            seq_lens_casual=meta["seq_lens_casual"],
+            cuda_int32_kwargs=self.cuda_int32_kwargs,
+            positions_casual=meta["positions_casual"],
+            page_table=meta["page_table"],
+            swa_page_indices=meta["swa_page_indices"],
+            swa_topk_lengths=meta["swa_topk_lengths"],
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
+            request_window_layout=None,
+        )
+        # what make_core_attn_metadata sets without compression
+        core.c4_sparse_topk_lengths = None
+        core.c4_sparse_topk_lengths_raw = None
+        core.c4_sparse_page_indices = None
+        core.c4_sparse_raw_indices = None
+        core.c0_flashmla_metadata = _create_flashmla_metadata()
+        core.c4_flashmla_metadata = None
+        core.c128_flashmla_metadata = None
+        metadata = DSV4Metadata(
+            core,
+            None,
+            c4_compress_metadata=_create_dummy_paged_compress_data(compress_ratio=4),
+            c128_compress_metadata=_create_dummy_paged_compress_data(
+                compress_ratio=128
+            ),
+        )
+        if step_out_loc is not None:
+            core.swa_out_cache_loc = meta["swa_out_cache_loc"]
+            metadata.step_inputs_fused = True
+        return metadata
 
     def make_forward_metadata_from_raw_verify(
         self,
@@ -1878,6 +1980,7 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=raw.seq_lens,
                 out_cache_loc=raw.out_cache_loc,
                 block_size=raw.block_size,
+                forward_batch=forward_batch,
             )
 
         metadata = self.forward_metadata
