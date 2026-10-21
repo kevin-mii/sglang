@@ -1608,6 +1608,23 @@ class GroupCoordinator:
             )
         return input_
 
+    def broadcast_many(self, tensors: List[torch.Tensor], src: int = 0) -> None:
+        """Broadcast each tensor from ``src``, as one NCCL group when pynccl is on
+        (one collective launch for all of them)."""
+        if self.world_size == 1:
+            return
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            for tensor in tensors:
+                self.broadcast(tensor, src=src)
+            return
+        pynccl_comm.group_start()
+        try:
+            for tensor in tensors:
+                pynccl_comm.broadcast(tensor, src=src)
+        finally:
+            pynccl_comm.group_end()
+
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.

@@ -137,6 +137,11 @@ class SpecTpSync:
             self._tp_group.broadcast(values, src=0)
         return values
 
+    def sync_many(self, site: SpecTpSyncSite, *values: torch.Tensor) -> None:
+        """``sync`` for several tensors, in one collective launch."""
+        if site in self._sites:
+            self._tp_group.broadcast_many(list(values), src=0)
+
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
         """Free GPU memory, reduced to the group minimum when ``site`` is on."""
         distributed = self.enabled(site) and group.world_size > 1

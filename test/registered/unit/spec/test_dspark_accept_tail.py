@@ -25,6 +25,10 @@ class _RecordingTpSync:
         self.calls.append((site, values.clone()))
         return values
 
+    def sync_many(self, site, *values):
+        for value in values:
+            self.sync(site, value)
+
 
 def _greedy_inputs():
     torch.manual_seed(0)

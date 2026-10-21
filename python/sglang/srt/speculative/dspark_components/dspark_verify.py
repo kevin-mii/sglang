@@ -867,9 +867,7 @@ def build_accept_outs(
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
             )
-    tp_sync.sync(sync_site, correct_len)
-    tp_sync.sync(sync_site, bonus)
-    tp_sync.sync(sync_site, cap_trim_lens)
+    tp_sync.sync_many(sync_site, correct_len, bonus, cap_trim_lens)
 
     finalized = FinalizeAcceptLens.execute(
         correct_len=correct_len,
