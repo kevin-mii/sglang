@@ -1,0 +1,3 @@
+#!/bin/bash
+# the `sglang` console script of an installed package, for a PYTHONPATH checkout
+exec python -c 'import sys; from sglang.cli.main import main; sys.exit(main())' "$@"

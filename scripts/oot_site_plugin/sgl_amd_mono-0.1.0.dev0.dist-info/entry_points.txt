@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+sgl_amd_mono = sgl_amd_mono:register_specs

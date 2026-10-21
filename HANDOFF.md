@@ -1,0 +1,238 @@
+# DeepSeek-V4.1 mono on SGLang: handoff (2026-10-21)
+
+Goal: every ROCm/ATOM DSv4.1 mono-kernel optimization (ATOM 5e8d913, ROCm/ATOM#2545), plus more, for the best
+DSv4.1-Flash decode on SGLang (MI350X/MI355X, TP4, DSpark, `--monokernel-backend amd` through sgl-amd-mono).
+
+Everything is pushed. Nothing is left only on the old node, except the worktrees (listed at the end for reference).
+This branch (`kevin-mii/sglang` `wip/dsv41-handoff`) holds this file, the benchmark scripts (`scripts/`) and every
+PR body draft (`pr-bodies/`).
+
+## 1. Where things are
+
+### sgl-project/sgl-amd-mono (plugin)
+
+| Branch | Head | What | State |
+|---|---|---|---|
+| `fix-check-k1-regroup` | 607f5c5 | `check_k1` imports moved by sglang#45112 (#17 did spec/draft) | **PR [sgl-amd-mono#21](https://github.com/sgl-project/sgl-amd-mono/pull/21)** open, CI 2/2 green, mergeable |
+| `deepseek-v41-atom-parity` | 0e94e05 | ATOM parity, first batch (3e3702f + merge of #12 + stamps fix) | **PR [sgl-amd-mono#14](https://github.com/sgl-project/sgl-amd-mono/pull/14)** open, **CONFLICTING** with main b27d604 |
+| `wip/dsv41-pr-a-followup` | 7c6e527 | PR A: token parallel (>=12 rows), MoE down pipeline, K2 (task, tile) units | stacked on #14, body ready |
+| `wip/dsv41-pr-b-index-query` | c90e940 | PR B: index query inside K1 (bit-exact), weights before the q wait, CTA per head tile | on A, body ready |
+| `wip/dsv41-pr-c-glue-engram` | 6727e41 | PR C: K1 writes DSpark captures, int32 SWA slots, tok-par gathers head rows, Engram staging (one AR) | on B; commits gl ae5d77c, tc f047195, fixup 4700131, en 6727e41; body needs the Engram bullet |
+| `wip/dsv41-compat-regroup-shim` | 3db8fb1 | B + a try-new/fall-back-old import shim for post-#45112 SGLang | dev only, never a PR |
+
+A/B/C still use the **pre-#45112 SGLang names** (`unified_kv_kernels.env_gate`, `mhc.hc_combine`). When rebasing
+onto plugin main, take #17's imports (`srt/layers/attention/dsv4/unified_kv_gate.py`, `mhc_combine`) and #21's
+`check_k1` imports. Check with `test/unit/test_contract.py` against the SGLang tree first.
+
+### kevin-mii/sglang (fork)
+
+| Branch | Head | Base | What |
+|---|---|---|---|
+| `amd/dsv4-meta-launches-pr` | 3aa3cbddc0 | main 617c8b67b1 (old) | HIP DSv4 metadata launch cuts (~15 launches/step). Body: `pr-bodies/sglang_dsv4_meta.md`. Not opened. |
+| `amd/dspark-draft-launches` | 4fa9231023 | main f8fd41c36e | DSpark draft launch cuts: fused Markov bias GEMV, shard-kept draft logits, draft params in one launch, strided HIP KV commit, accept writes static buffers. Body: `pr-bodies/sglang_dspark.md`. Not opened. |
+| `wip/dsv41-best-stack-dspark` | 328cc643b2 | 617c8b67b1 | The measured best SGLang tree (meta + DSpark stack). Pair with plugin `wip/dsv41-pr-c-glue-engram`. Never a PR. |
+| `wip/dsv41-handoff` | - | orphan | this file + scripts + PR bodies |
+
+SGLang main is now 5e79333c95; plugin main is b27d604. SGLang main's plugin pin (`python/pyproject_other.toml`,
+e07665c) is **broken** for `--monokernel-backend amd` since sglang#45112. [sglang#45045](https://github.com/sgl-project/sglang/pull/45045) (pin bump) is open.
+
+## 2. Next steps (all already approved by the user)
+
+1. **sgl-amd-mono#21**: wait for review/merge (CI green).
+2. **Meta PR**: rebase `amd/dsv4-meta-launches-pr` onto current main (it cherry-picked cleanly onto f8fd41c36e).
+   Rerun `test/registered/kernels/ops/attention/dsv4/test_dsv41_decode_glue_hip.py` (17 expected) and the plugin
+   e2e (9), push, open the PR with `pr-bodies/sglang_dsv4_meta.md`. Update its "Accuracy Tests" plugin commit and
+   base. The branch is pushed but not a PR. Pushing a rebase over it needs a force-push, so push the rebased branch
+   under a new name instead (e.g. `amd/dsv4-meta-launches`), or ask first.
+3. **DSpark PR**: rebase `amd/dspark-draft-launches` onto current main if needed. Rerun:
+   - `test/registered/kernels/ops/speculative/test_dspark_markov_sample.py` (10)
+   - `test/registered/unit/spec/test_dspark_draft_block.py` (6)
+   - `test/registered/spec/dspark/test_dspark_draft_graph.py` (4)
+   - `test/registered/spec/dspark/test_dspark_kernel_parity.py` (20 subtests)
+   - the plugin e2e with **plugin main + #21** (instead of the shim).
+
+   Then push and open the PR with `pr-bodies/sglang_dspark.md`, updating the plugin line to the commit used.
+4. **Pin bump** (sglang#45045 or a new one): a plugin commit containing #17 + #21.
+5. **Plugin A/B/C**: blocked on #14. #14 first needs main merged in (conflicts; ask the user before pushing to it).
+   Then rebase A, B and C in turn onto the new #14 head, with the regroup names above. Rerun on each:
+   - `check_k1` / `check_k2` (TP2 + TP4, `--widths 6,12,24,48`)
+   - `test/kernels/test_deepseek_v41_kernels.py` (4)
+   - `test/kernels/test_deepseek_v41_k2i.py` (14)
+   - `test/e2e/test_deepseek_v41_server.py` (9)
+   - `test/unit` (120)
+
+   Then ABAB each against its parent, and open them with the bodies in `pr-bodies/`.
+   - PR C's body still needs an Engram staging bullet: one int32 all-reduce up front for every Engram layer's rows,
+     as ATOM stages them. Its enab ABAB vs tc was -0.1/+0.2/+1.8/0.0% at c1/c2/c4/c8, so it is neutral and kept
+     for parity.
+
+Rules that applied on this work:
+- No force-push on PR branches.
+- Ask before opening SGLang PRs, posting comments or editing bodies. Edit PR bodies by PATCHing them via `gh api`.
+- No `/tag-and-rerun-ci`.
+- Ping only on PR Test (Base) failures.
+
+## 3. Decisions already taken (do not reopen)
+
+- **Deployment knobs stay default.** No `SGLANG_SPEC_TP_SYNC=init`, no `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`.
+  - knobab2 on the best build: greedy draft alone is now noise (+0.8/+0.4/+1.0/-0.9%).
+  - greedy + TP_SYNC=init gives +1.6/+3.2/+1.4/+0.8%.
+- **No numerics-changing speedups** (FP8 lm_head, K1 index-key fusion).
+- **ATOM's in-kernel index top-k is excluded.** Its `lds_topk` tree is ~2x slower than SGLang `topk_v2` on gfx950
+  (table in the PR B body).
+  - Tuning tried: compacting emit, LDS-only barriers, predicated atomics, 32k segments, bitmap placement.
+  - Don't retry without a different algorithm (SGLang-style 12-bit coarse histogram + candidate refine).
+- **Parked (no e2e gain, judged by ABAB, not timelines):**
+  - MoE stream work: cross-task ug prefetch, UG_AHEAD 4, staged down. It gave -0.1/-0.4/-1.6/+0.2%.
+  - Splitting the 64 extra down tiles.
+  - Local route in every CTA.
+  - `HSA_ENABLE_SDMA=0`.
+
+## 4. Results
+
+Per-user decode tok/s:
+- Script: `decode_ab.py`, run as ABAB means.
+- Setup: MI350X, TP4, DSpark, forced acceptance 3.51, 5 rounds x 3000 tokens.
+
+| Build | c1 | c2 | c4 | c8 |
+|---|---|---|---|---|
+| SGLang main + plugin main, morning of 10-20 | 691 | 558 | 445 | 327 |
+| best stack (plugin C 6727e41 on sglang 328cc643b2) | ~720 | ~584 | ~483 | ~366 |
+
+AgentX (aiperf, 900 s, TP4, AL 3.51; X = 1000/P90 ITL):
+
+| Build | c1 P90 / P50 / TTT/GPU | c4 P90 / P50 / TTT/GPU |
+|---|---|---|
+| main, morning of 10-19 | 594.8 / 635.1 / 6484 | 506.4 / 629.8 / 7493 |
+| best stack | 656.5 / 702.2 / 6731 | same-session ABAB vs the 10-20 best: P50 +2.0%, P90 +2.6% |
+
+Per-PR ABAB numbers are in each body:
+- meta: +1.7/+2.3/+3.9/+1.3%
+- DSpark: +0.9/+2.1/+4.5/+9.3%
+- A: +1.6/-1.0/0.0/+5.7%
+- B: +1.2/-1.7/+0.4/+1.7%
+- C: within noise
+
+Noise:
+- decode_ab ~1% between sessions; c2 swings ~2%.
+- AgentX TTT ±3.5% run to run.
+
+## 5. Remaining "beyond ATOM" ideas (ranked)
+
+1. **Plugin step-meta kernel**, like ATOM's `write_step_meta`: about 10 launches in the post-draft verify prep,
+   ~45 µs/step at c1. Glue launches are worth more than their kernel time at c1: ~15 launches cut gave +2.9%.
+2. **c1 inter-forward glue** is ~1100 µs/step (187 kernels). By call site:
+
+   | Call site | µs/step |
+   |---|---|
+   | graph-input copies | ~97 |
+   | MXFP8 linears (N 25600, K 6144) | 83 |
+   | eager extend path | 74 |
+   | SPEC_TP_SYNC broadcasts | 63 |
+   | fp32 logits all-gathers | 59 |
+   | lm_head GEMMs (at roofline) | 109 |
+
+3. **DSpark sharded verify argmax.** V4.1 logits are bf16 without softcap, so it needs `LogitsProcessor`
+   generalized. Expected gain is small, ~0.3-0.4%.
+4. **Per-layer glue at c1:**
+   - Index-source layers: 37-65 µs.
+   - Engram layers: ~74 µs each before staging. Their RCCL int32 AR misses aiter's custom AR, because bf16 is
+     viewed as int32 for bit-exactness.
+
+## 6. Environment and how to reproduce
+
+Hardware: MI350X gfx950; the old node used GPUs 2-5 for TP4.
+
+Software stack on the old node:
+- ROCm 10.0.0 pip-SDK venv (`scripts/env-full.sh`, `/opt/rocm` deliberately off the paths).
+- torch 2.11.0+rocm10.0.0.
+- aiter main e7d2453f.
+- FlyDSL 0.3.4.1 overlay.
+- sgl_kernel 0.4.7.
+
+Settings that every run needs:
+- `AITER_BF16_FP8_MOE_BOUND=0`, otherwise graph capture crashes.
+- `DEEPSEEK_V41_FLASH_MODEL_PATH=<model>` plus `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1`,
+  otherwise the server downloads the model.
+- Tests: `HF_ENDPOINT=http://127.0.0.1:9`, and run only the target test file (the launcher retries online).
+- To use the plugin without a pip install, put a generated dist-info on `PYTHONPATH`
+  (`scripts/oot_site_plugin/`, entry point `sglang.srt.plugins: sgl_amd_mono = sgl_amd_mono:register_specs`).
+  The plugin e2e needs `OOT_SITE=` pointing at it. `scripts/bin/sglang` is the console script for a checkout.
+
+Scripts:
+- `scripts/oot_env.sh`: env for the SGLang tree `$W` + plugin `$OOT`.
+- `scripts/run_perf.sh` + `scripts/decode_ab.py`: decode ABAB.
+  - `ARMS="label:plugin_tree@sglang_tree:on[:VAR=V,...] ..."`, `AB_ROUNDS`, `AB_TOKENS`, `CONCURRENCY`.
+  - `AB_CONTEXT=N` for a long shared prefix.
+  - Example: `scripts/chain_dsp3.sh` (e2e then ABAB).
+- `scripts/run_agx2.sh` + `scripts/serve_agx.sh` + `scripts/client_agentx.sh`: AgentX.
+  - Uses the published MI355X agentic recipe, forced acceptance (`SGLANG_SIMULATE_ACC_LEN=3.51`,
+    `..._METHOD=match-expected`, `..._TOKEN_MODE=real-draft-token`).
+  - Example: `scripts/chain_agxfinal.sh`.
+
+The scripts hard-code the old node's paths (`/scratch/agentx/...`, the scratchpad path): edit `S=`, `W`, `OOT`
+and the model path.
+
+Kernel timelines: `SGLANG_AMD_MONO_TIMELINE=1` with `check_ffn` / `check_k1` / `check_k2` and
+`--timeline --widths 6,12,24,48`. Judge by the last CTA's end. Cross-rank skew dominates the harness marks.
+
+## 7. Gotchas learned
+
+**FlyDSL**
+- A name assigned in a dynamic `if` that also exists outside becomes carried state. So does the context dict when
+  you call `c.get(...)` inside the branch ("Cannot extract IR values from bound method"). Read such values before
+  the branch and use distinct names.
+- A plain `for ... in range()` in a jit function becomes a device loop; use `range_constexpr` to unroll.
+- `gpu.barrier()` waits vmcnt. Use a workgroup fence + `s_barrier` for LDS-only hand-offs.
+- vmcnt is in order on gfx950: any wait drains every earlier load. "Prefetch, then poll" never overlaps, so put
+  polls before prefetches and pin the order with `rocdl.sched_barrier(0)`.
+
+**Collectives**
+- aiter's custom all-gather needs a 16-byte-multiple input, else it silently falls back to RCCL. That is why the
+  DSpark candidate parts are even.
+
+**Test harness**
+- `check_k2` with token parallel: unowned rows are `torch.empty` and may hold NaN bits. Seed a finite sentinel.
+- The plugin e2e rewrites the tracked `tmp_output_gsm8k.txt`. Run `git checkout -- tmp_output_gsm8k.txt` and
+  never `git add -A` after an e2e.
+- Its log always shows 4 memory faults + 12 hipErrorIllegalAddress, from the intentional
+  `SGLANG_AMD_MONO_FAULT_INJECT` test.
+- e2e helpers reuse any live server. Make sure no orphan server is up before an A/B.
+
+**Workflow**
+- Run `ruff --select F821,F401` on changed files before GPU chains.
+- Never whole-file checkout across worktrees with different bases: it reverts upstream changes. Use
+  `git diff A B -- files | git apply -3`.
+- Pre-commit runs offline with `PRE_COMMIT_HOME=<cache>`.
+
+## 8. Old node worktrees (reference only)
+
+| Path | Contents |
+|---|---|
+| `/scratch/agentx/sglang-pr` | meta PR branch |
+| `/scratch/agentx/sglang-dspark-pr` | DSpark PR branch |
+| `/scratch/agentx/sglang-markov4` | best stack |
+| `/scratch/agentx/sglang-main2` | plain main f8fd41c36e |
+| `/scratch/agentx/sgl-amd-mono-pra`, `-iw`, `-gl`, `-tc`, `-en` | plugin A / B / C chain |
+| `/scratch/agentx/sgl-amd-mono-iwm` | shim |
+| `/scratch/agentx/sgl-amd-mono-rg` | #21 |
+| `/scratch/agentx/sgl-amd-mono-tk`, `-mn`, `-ml` | parked experiments |
+
+### Parked plugin experiments
+
+The parked experiments' committed branches are in `dsv41-plugin-parked.bundle` (72 KB, 18 branches). Their bases
+are on sgl-project/sgl-amd-mono. To restore them:
+
+```
+git fetch origin
+git fetch dsv41-plugin-parked.bundle 'refs/heads/*:refs/heads/parked/*'
+```
+
+| Branch | What it holds |
+|---|---|
+| `perf-index-topk`, `perf-index-k2`, `perf-index-topk-tune`, `perf-indexer-clean` | in-kernel top-k (slower) |
+| `perf-moe-*`, `perf-down-*`, `perf-ug-place`, `perf-woa-xo`, `perf-local-route` | MoE stream (no e2e gain) |
+| `perf-followup-clean` | the early "fu" arm |
+| `perf-token-parallel`, `perf-down-pipe`, `perf-k2-tiles` | pre-squash histories of PR A |
+
+Uncommitted sweep edits in a few of these worktrees were not kept.
