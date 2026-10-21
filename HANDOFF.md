@@ -52,6 +52,28 @@ Absolute numbers for the full stack: 738.6 / 595.7 / 490.7 / 370.6 tok/s/user.
 3. Then a pin bump to the merged plugin.
 4. #45658 and #45663 are independent and can be reviewed in parallel.
 
+**Later on 2026-10-21**
+
+- **ATOM's `write_step_meta` is ported** (SGLang side) on `kevin-mii:amd/dsv41-verify-step-meta` (f93193a651), which stacks on #45658.
+  - `verify_step_meta` fuses the 10 target-verify metadata launches into 1. It takes 4.5 us at c1, where the 10 launches took ~45 us.
+  - 31 glue tests pass, including a field-by-field fused-vs-chain backend check. e2e is 9/9 on the full stack and alone.
+  - Full stack: +1.2% at c1, neutral at c2-c8. Kernels per step go from 243 to 234.
+  - **Open it after #45658 merges** (user decision). Body: `pr-bodies/body_stepmeta.md`.
+- **Plugin per-PR numbers on the new base** (ABAB, each against its parent). A and B also pass e2e alone.
+
+  | | c1 | c2 | c4 | c8 |
+  |---|---|---|---|---|
+  | A | +2.2% | +0.4% | +2.5% | +4.6% |
+  | B | +0.7% | +0.3% | +0.9% | +1.1% |
+  | C | +1.6% | +0.7% | -0.6% | -0.2% |
+
+  - Bodies: `pr-bodies/prA_body.md`, `prB_body.md`, `prC_body.md`.
+  - C's fixup is squashed as local branch `dsv41-pr-c-final` (75626ee, same tree as 76ff1d7). Push it under a new name when C opens.
+  - Open A, then B, then C once #14 merges (user decision).
+- **Glue cuts** (`amd/hip-logits-lastdim-gather`): still held (user decision). Body: `pr-bodies/body_glue2.md`.
+- **Best stack**: SGLang meta + DSpark + glue cuts + step-meta, on the plugin stack. It runs ~750 / 603 / 490 / 372 tok/s/user at c1/c2/c4/c8, and the c1 step is 4807 us with 234 kernels.
+- **Long context (64k, c1)** adds only ~85 us/step over short context. SGLang's topk_v2 split-select and main kernel are the growth (~+45 us).
+
 **Remaining glue ideas (each <1%)**
 - Deferred greedy verify argmax: saves the 73 us bf16 logits gather at c8. It needs a second set of verify graphs.
 - aiter all-gather is capped at 80 CTAs.
