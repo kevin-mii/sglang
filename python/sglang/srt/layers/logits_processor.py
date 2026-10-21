@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     is_cpu,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -78,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -948,7 +950,9 @@ class LogitsProcessor(nn.Module):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             else:
-                logits = self._logits_gatherer(logits)
+                logits = self._gather_tp_logits(
+                    logits, logits_metadata, use_logits_buffer
+                )
             _trace_e2e_logits(
                 "tp_logits_gather_returned", logits_shape=tuple(logits.shape)
             )
@@ -1239,6 +1243,24 @@ class LogitsProcessor(nn.Module):
             )
             dp_scatter(logits, global_logits, logits_metadata)
         return logits
+
+    def _gather_tp_logits(
+        self,
+        logits: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+        use_logits_buffer: bool,
+    ) -> torch.Tensor:
+        # ROCm: aiter gathers the vocab shards straight into the logits buffer,
+        # leaving _copy_logits_to_buffer nothing to copy
+        if _is_hip and use_logits_buffer:
+            buffer = logits_metadata.next_token_logits_buffer
+            if buffer is not None:
+                from sglang.srt.distributed import get_tp_group
+
+                gathered = get_tp_group().all_gather_last_dim(logits, out=buffer)
+                if gathered is not None:
+                    return gathered
+        return self._logits_gatherer(logits)
 
     def _copy_logits_to_buffer(
         self,

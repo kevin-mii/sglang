@@ -1294,42 +1294,69 @@ class GroupCoordinator:
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
-    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
+    def _can_aiter_all_gather(self, input: torch.Tensor) -> bool:
+        return (
+            is_hip()
+            and envs.SGLANG_USE_AITER_AG.get()
+            and self._has_aiter_custom_all_gather()
+            and input.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and self.ca_comm.should_custom_ag(input)
+        )
+
+    def _aiter_all_gather(
+        self, output: torch.Tensor, input: torch.Tensor, dim: int = 0
+    ) -> bool:
+        """Gather with aiter's custom all-gather (ROCm) along ``dim`` (0 or the
+        last), into ``output``; False when it does not apply.
+        SGLANG_USE_AITER_AG=0 disables it."""
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
         # size <= max_size/(world*2).
         # On a hit, writes directly into the caller's pre-allocated `output` via
         # all_gather_reg during CUDA-graph capture, and all_gather_unreg
         # under torch_memory_saver and other paths.
+        if not (output.is_contiguous() and self._can_aiter_all_gather(input)):
+            return False
         ca_comm = self.ca_comm
-        if (
-            is_hip()
-            and envs.SGLANG_USE_AITER_AG.get()
-            and self._has_aiter_custom_all_gather()
-            and input.is_contiguous()
-            and output.is_contiguous()
-            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
-            and ca_comm.should_custom_ag(input)
-        ):
-            if getattr(ca_comm, "_IS_CAPTURING", False):
-                if torch.cuda.is_current_stream_capturing():
-                    if (
-                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or _AITER_CAPTURE_COPY_IN
-                    ):
-                        ca_comm.all_gather_unreg(input, out=output, dim=0)
-                    else:
-                        ca_comm.all_gather_reg(input, out=output, dim=0)
-                elif is_in_tc_piecewise_cuda_graph():
-                    ca_comm.all_gather_unreg(input, out=output, dim=0)
+        if getattr(ca_comm, "_IS_CAPTURING", False):
+            if torch.cuda.is_current_stream_capturing():
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
+                    ca_comm.all_gather_unreg(input, out=output, dim=dim)
                 else:
-                    # True CUDA graph warmup: avoid a different host collective.
-                    output.zero_()
-                return
+                    ca_comm.all_gather_reg(input, out=output, dim=dim)
+            elif is_in_tc_piecewise_cuda_graph():
+                ca_comm.all_gather_unreg(input, out=output, dim=dim)
             else:
-                ca_comm.all_gather_unreg(input, out=output, dim=0)
-                return
+                # True CUDA graph warmup: avoid a different host collective.
+                output.zero_()
+        else:
+            ca_comm.all_gather_unreg(input, out=output, dim=dim)
+        return True
+
+    def all_gather_last_dim(
+        self, input_: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """``all_gather(input_, dim=-1)`` written by aiter's last-dim kernel straight
+        into ``out`` (or a new tensor); None when it does not apply."""
+        # the kernel moves 16-byte packs within each rank's row chunk
+        if (
+            self.world_size == 1
+            or input_.dim() < 2
+            or input_.shape[-1] * input_.element_size() % 16 != 0
+            or not self._can_aiter_all_gather(input_)
+        ):
+            return None
+        shape = input_.shape[:-1] + (input_.shape[-1] * self.world_size,)
+        if out is None:
+            out = torch.empty(shape, dtype=input_.dtype, device=input_.device)
+        elif out.shape != shape or out.dtype != input_.dtype:
+            return None
+        return out if self._aiter_all_gather(out, input_, dim=-1) else None
+
+    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self._aiter_all_gather(output, input):
+            return
 
         pymscclpp_comm = self.pymscclpp_comm
         if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
@@ -1421,6 +1448,11 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        if dim > 0 and dim == input_.dim() - 1 and not input_.is_cpu:
+            # no dim-0 gather and relayout copy
+            output_tensor = self.all_gather_last_dim(input_)
+            if output_tensor is not None:
+                return output_tensor
         input_size = input_.size()
         # NOTE: we have to use concat-style all-gather here,
         # stack-style all-gather has compatibility issues with
