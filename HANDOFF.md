@@ -74,6 +74,24 @@ Absolute numbers for the full stack: 738.6 / 595.7 / 490.7 / 370.6 tok/s/user.
 - **Best stack**: SGLang meta + DSpark + glue cuts + step-meta, on the plugin stack. It runs ~750 / 603 / 490 / 372 tok/s/user at c1/c2/c4/c8, and the c1 step is 4807 us with 234 kernels.
 - **Long context (64k, c1)** adds only ~85 us/step over short context. SGLang's topk_v2 split-select and main kernel are the growth (~+45 us).
 
+**2026-10-22 (overnight)**
+
+- Draft-block metadata is also fused (`draft_step_meta`, second commit on `amd/dsv41-verify-step-meta`).
+  - 6 launches become 1 (4.5 us). Kernels/step at c1: 243 -> 234 -> 229.
+  - 41 glue tests pass; e2e 9/9.
+- **AgentX, official settings** (temperature 1.0; no simulated-acceptance shortcuts, which upstream sglang#45433 made opt-in). Full best stack (SGLang stack4 + plugin #14+A+B+C) vs current main (5e79333c95 + plugin main):
+
+  | | TTT/GPU | P90 | P50 |
+  |---|---|---|---|
+  | c1 | 6883 vs 6541 (+5.2%) | 664.5 vs 546.8 (+21.5%) | 701.6 vs 633.1 (+10.8%) |
+  | c4 | 7673 vs 7801 (-1.6%, within the run-to-run swing) | 578.1 vs 505.1 (+14.5%) | 692.6 vs 627.4 (+10.4%) |
+
+- **Shortcuts back on** gives +0.9/-0.2/-0.6/-0.3% (decode_ab, temperature 1.0). Not worth it; InferenceX's dsv4 multi-node recipe also sets `SGLANG_SIMULATE_ACC_GREEDY=0`.
+- **64k context, old best vs new** (greedy): +1.8% c1, +1.9% c4. No long-context regression.
+- **Next ideas** (each ~1%):
+  - a vocab-sharded rejection sampler (no corrected-logits gather or full-vocab softmax; real sampling serving);
+  - folding the sampling accept into the verify graph (today the graph's epilogue runs masked and the eager accept/commit runs again).
+
 **Remaining glue ideas (each <1%)**
 - Deferred greedy verify argmax: saves the 73 us bf16 logits gather at c8. It needs a second set of verify graphs.
 - aiter all-gather is capped at 80 CTAs.
