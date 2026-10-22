@@ -197,7 +197,9 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+    """The step's tokens and state, and whether every rank picked the tokens from
+    the same gathered candidates (a sharded vocab), so they already agree."""
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
@@ -208,7 +210,7 @@ def _draft_step(
                 prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
                 w2_weight=w2_weight,
             )
-            return tokens, state
+            return tokens, state, False
     bias = markov_head.bias_gemv(prev_tokens)
     if bias is None:
         bias, state = markov_head.step_bias(
@@ -233,7 +235,7 @@ def _draft_step(
         has_sampled_rows=None if logits_out is not None else False,
         **sharded,
     )
-    return tokens, state
+    return tokens, state, shard is not None
 
 
 def draft_markov_block(
@@ -262,7 +264,7 @@ def draft_markov_block(
     prev_tokens = anchor_tokens.long()
     draft_tokens = []
     for step in range(gamma):
-        prev_tokens, state = _draft_step(
+        prev_tokens, state, picked_alike = _draft_step(
             markov_head,
             prev_tokens,
             base_logits[:, step],
@@ -273,7 +275,9 @@ def draft_markov_block(
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
         )
-        prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
+        # every rank picked from the same gathered candidates: rank 0's copy is this one
+        if not picked_alike:
+            prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
     if greedy_draft:
         return torch.stack(draft_tokens, dim=1), None

@@ -108,6 +108,35 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertIsNone(block.corrected_logits)
         self.assertTrue(block.greedy_draft)
 
+    def test_the_draft_broadcast_skips_only_picks_from_gathered_candidates(self):
+        # A sharded vocab's pick reads candidates every rank gathered alike; an
+        # unsharded head picks from its own logits and keeps rank 0's broadcast.
+        sampling_info = SimpleNamespace(
+            is_all_greedy=False,
+            temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
+            top_ks=torch.tensor([1, 50, 1, 50]),
+        )
+        for shard, broadcasts in (
+            (None, GAMMA),
+            (VocabShard(start=0, gather=LocalVocabGather()), 0),
+        ):
+            head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(torch.bfloat16)
+            head.vocab_shard = shard
+            tp_sync = Mock()
+            tp_sync.sync.side_effect = lambda site, tokens: tokens
+            sample_draft_block(
+                base_logits=torch.randn(BS, GAMMA, VOCAB).to(torch.bfloat16),
+                anchor_tokens=torch.randint(0, VOCAB, (BS,)),
+                draft_hidden=torch.randn(BS, GAMMA, HIDDEN).to(torch.bfloat16),
+                sampling_info=sampling_info,
+                markov_head=head,
+                noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
+                device="cpu",
+                tp_sync=tp_sync,
+                greedy_draft=False,
+            )
+            self.assertEqual(tp_sync.sync.call_count, broadcasts)
+
     def test_a_sharded_head_keeps_the_whole_vocab_logits(self):
         # Sharded, each step keeps its shard's logits; the block gathers them once.
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(torch.bfloat16)
