@@ -92,6 +92,12 @@ Absolute numbers for the full stack: 738.6 / 595.7 / 490.7 / 370.6 tok/s/user.
   - a vocab-sharded rejection sampler (no corrected-logits gather or full-vocab softmax; real sampling serving);
   - folding the sampling accept into the verify graph (today the graph's epilogue runs masked and the eager accept/commit runs again).
 
+- **Draft-site TP sync skip** (user-approved): `kevin-mii:amd/dspark-draft-sync-skip`, on the DSpark PR branch.
+  - On a vocab-sharded Markov head every rank picks each draft token from identical all-gathered candidates, so the per-position rank-0 broadcast (`DSPARK_DRAFT`) is skipped there. An unsharded head and the one-row greedy kernel keep it.
+  - e2e 9/9. ABAB: greedy +0.9/+0.1/+1.1/+1.2%; T=1.0 +0.7/+0.4/+0.2/+0.8%.
+  - Open as a PR only with the user's OK.
+- #14: the user approved the squash merge, but Claude's auto mode denies `gh pr merge`. Merge it in the UI.
+
 **Remaining glue ideas (each <1%)**
 - Deferred greedy verify argmax: saves the 73 us bf16 logits gather at c8. It needs a second set of verify graphs.
 - aiter all-gather is capped at 80 CTAs.
