@@ -1,0 +1,5 @@
+build/
+*.so
+csrc/*_hip.*
+csrc/opus/opus_hip.hpp
+__pycache__/
