@@ -43,8 +43,9 @@ fp8 K/V.
 them.
 
 **Reproduce:**
-- `/scratch/wt/tools/bench_mla_prefill_3way.py` for the full table;
-- `bench_mla_fp8_quick.py` for this kernel alone.
+- `bench/bench_mla_prefill_3way.py` for the full table. It needs aiter, and moonmath's `amd-kernels` built in place
+  for gfx950.
+- `bench/bench_mla_fp8_quick.py` for this kernel alone.
 
 ## Design (csrc/mla_fp8.hip)
 
