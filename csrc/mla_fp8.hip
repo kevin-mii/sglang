@@ -37,6 +37,10 @@ namespace attn::mla8 {
 #ifndef MLA8_NO_MFMA
 #define MLA8_NO_MFMA 0
 #endif
+// MLA8_VALU_RSUM: row sums by VALU adds over the fp32 P instead of the all-ones MFMA (one MFMA fewer per tile).
+#ifndef MLA8_VALU_RSUM
+#define MLA8_VALU_RSUM 1
+#endif
 
 using i32x2_t  = __attribute__((ext_vector_type(2))) int;
 using i32x4_t  = __attribute__((ext_vector_type(4))) int;
@@ -100,6 +104,14 @@ __device__ __forceinline__ float max_xor32(float x)
     // s_nop 1: the VALU write -> permlane read hazard (x and the copy t).
     asm volatile("v_mov_b32 %1, %0\n\ts_nop 1\n\tv_permlane32_swap_b32 %0, %1 bound_ctrl:1" : "+v"(x), "=&v"(t));
     return fmaxf(x, t);
+}
+
+// The sum of x over lanes L and L ^ 32.
+__device__ __forceinline__ float sum_xor32(float x)
+{
+    float t;
+    asm volatile("v_mov_b32 %1, %0\n\ts_nop 1\n\tv_permlane32_swap_b32 %0, %1 bound_ctrl:1" : "+v"(x), "=&v"(t));
+    return x + t;
 }
 
 // ---- the kernel ----------------------------------------------------------------------------------
@@ -218,8 +230,10 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     f32x16_t o_acc[DMTiles] = {};                  // O^T[d = 32 dt + 8 (i / 4) + 4 h + i % 4][q = r]
     f32x16_t s_acc[KvMTiles];                      // S^T[kv = 32 mt + 8 (i / 4) + 4 h + i % 4][q = r]
     f32x16_t row_sum = {};                         // [rsum] every element: row r's sum of P
+    float rsum = 0.0f;                             // MLA8_VALU_RSUM: this lane's half of row r's sum
     i32x8_t p_frag = {};                           // [p8]
     float seed = 0.0f;                             // -frame (log2 units), row r's
+    f32x16_t seed16 = {};                          // seed as QK's first C operand; changes only with the frame
     i32x8_t ones;
     for (int w = 0; w < 8; ++w) ones[w] = 0x38383838;   // fp8 e4m3 1.0
 
@@ -241,6 +255,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     };
     auto shift_frame = [&](float shift) INLINE {
         seed -= shift;
+        seed16 = f32x16_t{} + seed;
         for (int mt = 0; mt < KvMTiles; ++mt)
             for (int i = 0; i < 16; ++i) s_acc[mt][i] -= shift;
     };
@@ -256,12 +271,14 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
             const float rs = __builtin_amdgcn_exp2f(-shift);
             for (int dt = 0; dt < DMTiles; ++dt) o_acc[dt] *= rs;
             row_sum *= rs;
+            rsum *= rs;
         }
         for (int w = 0; w < 8; ++w) {
             const int mt = w / 4, i = 4 * (w % 4);
             auto e = [](float x) INLINE { return MLA8_NO_EXP ? x : __builtin_amdgcn_exp2f(x); };
             const float p0 = e(s_acc[mt][i]), p1 = e(s_acc[mt][i + 1]), p2 = e(s_acc[mt][i + 2]), p3 = e(s_acc[mt][i + 3]);
-            p_frag[w] = cvt_pk_fp8_hi(p2, p3, cvt_pk_fp8_lo(p0, p1));
+            p_frag[w] = cvt_pk_fp8_hi(p2, p3, __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, p_frag[w], false));
+            if (MLA8_VALU_RSUM) rsum += (p0 + p1) + (p2 + p3);
         }
     };
 
@@ -300,7 +317,6 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     auto mfma_block = [&](auto ga, int t, auto qk_c) INLINE {
         constexpr bool A = decltype(ga)::value, qk = decltype(qk_c)::value;
         constexpr int Dmas = A ? KDmas : VDmas;
-        const f32x16_t seed16 = f32x16_t{} + seed;
         move_rsrc(t + 1);
         tile_barrier();
         s_setprio<0>();
@@ -319,7 +335,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
                 reads = StepReads[0];
             }
             if (MLA8_NO_MFMA && j > 0) {}
-            else if (j == 0) row_sum = mfma32(ones, p_frag, row_sum);
+            else if (j == 0) { if (!MLA8_VALU_RSUM) row_sum = mfma32(ones, p_frag, row_sum); }
             else if (j <= DMTiles) o_acc[j - 1] = mfma32(frag[j], p_frag, o_acc[j - 1]);
             else if (qk) {
                 const int mt = (j - 1 - DMTiles) / KSteps, ks = (j - 1 - DMTiles) % KSteps;
@@ -361,7 +377,7 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
     else         main_loop(std::false_type{});
 
     // ==== epilogue ================================================================================
-    const float l = row_sum[0];
+    const float l = MLA8_VALU_RSUM ? sum_xor32(rsum) : row_sum[0];
     const int q = work.row0 + r;
     if (work.slot >= 0) {                          // a part of a split q block: fp32 partials for merge_parts
         if ((unsigned)q >= (unsigned)work.sq) return;

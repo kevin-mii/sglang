@@ -13,7 +13,7 @@ setup(
     name="mla-fp8",
     version="0.1.0",
     packages=["mla_fp8"],
-    ext_modules=[CUDAExtension(name="mla_fp8._C", sources=["csrc/mla_fp8_api.cpp", os.environ.get("MLA8_KERNEL", "csrc/mla_fp8_v2.hip")],
+    ext_modules=[CUDAExtension(name="mla_fp8._C", sources=["csrc/mla_fp8_api.cpp", os.environ.get("MLA8_KERNEL", "csrc/mla_fp8.hip")],
                                include_dirs=[str(ROOT / "csrc")],
                                extra_compile_args={"cxx": ["-O3"], "nvcc": HIP_FLAGS})],
     cmdclass={"build_ext": BuildExtension},

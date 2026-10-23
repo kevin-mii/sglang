@@ -94,3 +94,41 @@ if __name__ == "__main__":
             print(f"causal={causal} {seqs}: rel err {err:.2e}")
     print("scales + lse:", run([(300, 2000), (64, 64)], True, k_scale=0.05, v_scale=4.0, lse=True))
     print("device cu_seqlens:", run([(300, 2000), (64, 64)], True, host=False))
+
+
+def test_split_lse():
+    # 128 rows on 50K keys runs as a KV split (parts + merge); LSE comes from the merge.
+    err, lse_err = run([(128, 50128)], True, lse=True)
+    assert err < 0.1 and lse_err < 0.1, (err, lse_err)
+
+
+def test_graph_replay():
+    # Device-planned run captured in a CUDA graph, then replayed with new cu_seqlens contents.
+    seqs = [(300, 2000), (64, 64)]
+    q, k, v = make(seqs)
+    scale = 192**-0.5
+    cq, ck = cu([a for a, _ in seqs]).to(DEV), cu([b for _, b in seqs]).to(DEV)
+    out = torch.empty(q.shape[0], q.shape[1], 128, dtype=torch.bfloat16, device=DEV)
+    plan = mla_fp8.VarlenPlan()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        plan.plan(cq, ck, 2048, 2048, q.shape[0], k.shape[0], 12, 12, True)
+        plan.run(q, k, v, scale, out=out)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        plan.plan(cq, ck, 2048, 2048, q.shape[0], k.shape[0], 12, 12, True)
+        plan.run(q, k, v, scale, out=out)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    ref, _ = reference(q, k, v, seqs, scale, True, 1.0, 1.0)
+    assert ((out.float() - ref).abs().max() / ref.abs().max()).item() < 0.1
+    # New lengths in the same buffers: 200 and 164 q rows over 2000 and 64 keys.
+    seqs2 = [(200, 2000), (164, 64)]
+    cq.copy_(cu([a for a, _ in seqs2]).to(DEV))
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    ref2, _ = reference(q, k, v, seqs2, scale, True, 1.0, 1.0)
+    assert ((out.float() - ref2).abs().max() / ref2.abs().max()).item() < 0.1

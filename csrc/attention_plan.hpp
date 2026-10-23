@@ -412,7 +412,7 @@ namespace host {
 constexpr int NumXcd          = 8;
 constexpr int SplitMaxRounds  = 8;
 constexpr double SplitMinGain = 1.05;
-constexpr int MaxParts        = 8;
+constexpr int MaxParts        = 16;   // fp8 MLA: 8 left small-q extends (128 rows on 50K keys) short of the CUs
 constexpr double CtaTiles     = 2;
 constexpr double PartTiles    = 8;
 constexpr double MergeTiles   = 8;
