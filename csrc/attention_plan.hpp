@@ -851,7 +851,7 @@ inline Staged* stage(StreamState& st, std::vector<int> key, Plan plan, int dev, 
 // ---- host: launches -----------------------------------------------------------------------------
 // A head dim's kernels fwd[r][split] for wave rows 32 and 48 (r = rows / 16 - 2; split: plans with parts
 // or LSEs), a 32-row wave's KV tile cost in 48-row tiles, and a tile's cost on fwd[r][true] over fwd[r][false].
-struct Kernels { void (*fwd[2][2])(Args); float q2_tile_cost; float split_tile_cost[2]; };
+struct Kernels { void (*fwd[2][2])(Args); float q2_tile_cost; float split_tile_cost[2]; int threads = BlockSize; };
 
 // The split workspace: part_o first, then part_ml; a part holds BlockM rows.
 template <int Dv>
@@ -869,7 +869,7 @@ int run_plan(Kernels k, Args a, const Plan& plan, const WorkItem* list, void* ws
     a.part_o = (float*)ws;
     a.part_ml = (float2*)((char*)ws + (size_t)plan.slots * BlockM * Dv * sizeof(float));
     const auto fwd = k.fwd[plan.rows / 16 - 2][plan.merges > 0 || a.lse];
-    hipLaunchKernelGGL(fwd, dim3(plan.ctas), dim3(BlockSize), 0, stream, a);
+    hipLaunchKernelGGL(fwd, dim3(plan.ctas), dim3(k.threads), 0, stream, a);
     if (plan.merges > 0) {
         a.work = list + plan.ctas;
         const auto merge = plan.rows == 48 ? merge_parts<Dv, 48> : merge_parts<Dv, 32>;

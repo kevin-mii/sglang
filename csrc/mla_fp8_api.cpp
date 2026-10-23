@@ -15,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 extern "C" {
 int mla_fp8_varlen_fwd_dev(const void* q, const void* k, const void* v, void* o, float* lse, const int64_t* strides,
@@ -22,6 +23,7 @@ int mla_fp8_varlen_fwd_dev(const void* q, const void* k, const void* v, void* o,
                            int num_seqs, int max_q, int max_k, int total_q, int total_k, int H, int HKv, int causal,
                            float scale, float k_scale, float v_scale, hipStream_t stream);
 void* mla_fp8_plan_new();
+__attribute__((weak)) int mla_fp8_timing(unsigned long long* out);
 void mla_fp8_plan_free(void* p);
 int mla_fp8_plan(void* plan, const int* cu_q, const int* cu_k, const int* host_cu_q, const int* host_cu_k,
                  int num_seqs, int max_q, int max_k, int total_q, int total_k, int H, int HKv, int causal,
@@ -135,7 +137,15 @@ class VarlenPlan {
 
 }  // namespace
 
+// MLA8_TIMING builds: per-phase cycle totals since the last call (barrier, X, mask, Y, frame, tiles).
+static std::vector<unsigned long long> timing() {
+  std::vector<unsigned long long> v(8, 0);
+  if (mla_fp8_timing) mla_fp8_timing(v.data());
+  return v;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("timing", &timing);
   m.def("fwd_varlen", &fwd_varlen, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_q"), py::arg("cu_k"),
         py::arg("max_q"), py::arg("max_k"), py::arg("causal"), py::arg("scale"), py::arg("k_scale") = 1.0,
         py::arg("v_scale") = 1.0, py::arg("host_cu_q") = py::none(), py::arg("host_cu_k") = py::none(),

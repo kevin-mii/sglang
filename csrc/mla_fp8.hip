@@ -26,6 +26,18 @@
 
 namespace attn::mla8 {
 
+// Experiment switches (profiling only): MLA8_NO_EXP skips the exps, MLA8_SAME_TILE makes every DMA reread tile 0,
+// MLA8_NO_MFMA skips QK and PV.
+#ifndef MLA8_NO_EXP
+#define MLA8_NO_EXP 0
+#endif
+#ifndef MLA8_SAME_TILE
+#define MLA8_SAME_TILE 0
+#endif
+#ifndef MLA8_NO_MFMA
+#define MLA8_NO_MFMA 0
+#endif
+
 using i32x2_t  = __attribute__((ext_vector_type(2))) int;
 using i32x4_t  = __attribute__((ext_vector_type(4))) int;
 using i32x8_t  = __attribute__((ext_vector_type(8))) int;
@@ -247,13 +259,23 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         }
         for (int w = 0; w < 8; ++w) {
             const int mt = w / 4, i = 4 * (w % 4);
-            const float p0 = __builtin_amdgcn_exp2f(s_acc[mt][i]), p1 = __builtin_amdgcn_exp2f(s_acc[mt][i + 1]);
-            const float p2 = __builtin_amdgcn_exp2f(s_acc[mt][i + 2]), p3 = __builtin_amdgcn_exp2f(s_acc[mt][i + 3]);
+            auto e = [](float x) INLINE { return MLA8_NO_EXP ? x : __builtin_amdgcn_exp2f(x); };
+            const float p0 = e(s_acc[mt][i]), p1 = e(s_acc[mt][i + 1]), p2 = e(s_acc[mt][i + 2]), p3 = e(s_acc[mt][i + 3]);
             p_frag[w] = cvt_pk_fp8_hi(p2, p3, cvt_pk_fp8_lo(p0, p1));
         }
     };
 
     // ==== the MFMA block ==========================================================================
+    // Block t, 11 steps: row sums of P(t - 1) [rsum]; PV of P(t - 1) over V(t - 1), d tiles 0..3 (block 0: P = 0
+    // over V(0)); QK of K(t), (mt, ks) in order. A step's fragment is read Lead steps ahead; steps 1 and 2's
+    // (V fragments) before the block: A after its softmax, B in its previous block's last two steps.
+    constexpr int Steps = 1 + DMTiles + KvMTiles * KSteps, Lead = 2;
+    auto step_frag = [&](int j, int t) INLINE {     // j >= 1
+        return j <= DMTiles ? v_frag(t > 0 ? t - 1 : 0, j - 1)
+                            : k_frag(t, (j - 1 - DMTiles) / KSteps, (j - 1 - DMTiles) % KSteps);
+    };
+    constexpr int StepReads[2] = {4, 2};            // LDS reads of a V / K fragment
+    i32x8_t first_frags[Lead];                      // steps 1 .. Lead of the next block
     auto tile_barrier = []() INLINE {
         s_waitcnt_vmcnt<0>();
         sched_fence();
@@ -265,42 +287,78 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
         s_barrier();
         sched_fence();
     };
-    // Block t: row sums and PV of P(t - 1) over V(t - 1) (block 0: P = 0 over V(0)), QK of K(t), DMA of t + 1.
-    auto mfma_block = [&](int t, bool qk) INLINE {
+    // Tile t's DMA instruction i (A: K(t), B: V(t)).
+    auto dma_inst = [&](auto ga, int t, int i) INLINE {
+        const uint32_t off = MLA8_SAME_TILE ? 0u : (uint32_t)(t - rsrc_t0) * tile_bytes;
+        if constexpr (decltype(ga)::value)
+            buffer_load_dwordx4_lds(dma_rsrc, (lds_ptr_t)(lds + k_buf(t) + 4096 * i + 1024 * gw), dma_lane,
+                                    off + 64 * i);
+        else
+            buffer_load_dwordx4_lds(dma_rsrc, (lds_ptr_t)(lds + v_buf(t) + 2048 * gw + 1024 * i), dma_lane,
+                                    off + 32 * i * v_row_bytes);
+    };
+    auto mfma_block = [&](auto ga, int t, auto qk_c) INLINE {
+        constexpr bool A = decltype(ga)::value, qk = decltype(qk_c)::value;
+        constexpr int Dmas = A ? KDmas : VDmas;
         const f32x16_t seed16 = f32x16_t{} + seed;
+        move_rsrc(t + 1);
         tile_barrier();
         s_setprio<0>();
-        const int tv = t > 0 ? t - 1 : 0;
-        row_sum = mfma32(ones, p_frag, row_sum);
-        for (int dt = 0; dt < DMTiles; ++dt) o_acc[dt] = mfma32(v_frag(tv, dt), p_frag, o_acc[dt]);
-        move_rsrc(t + 1);
-        dma_tile(t + 1);
-        if (qk)
-            for (int mt = 0; mt < KvMTiles; ++mt)
-                for (int ks = 0; ks < KSteps; ++ks)
-                    s_acc[mt] = mfma32_scaled(k_frag(t, mt, ks), q_frag[ks], ks == 0 ? seed16 : s_acc[mt], scale_k, scale_q);
+        i32x8_t frag[Steps];
+        for (int j = 1; j <= Lead; ++j) frag[j] = first_frags[j - 1];
+#pragma unroll
+        for (int j = 0; j < Steps; ++j) {
+            sched_fence();
+            const int ahead = j + Lead;
+            int reads = 0;
+            if (ahead < Steps && (qk || ahead <= DMTiles)) {
+                frag[ahead] = step_frag(ahead, t);
+                reads = StepReads[ahead > DMTiles];
+            } else if (!A && ahead >= Steps && ahead - Steps + 1 <= Lead) {   // B: the next block's first
+                first_frags[ahead - Steps] = v_frag(t, ahead - Steps);
+                reads = StepReads[0];
+            }
+            if (MLA8_NO_MFMA && j > 0) {}
+            else if (j == 0) row_sum = mfma32(ones, p_frag, row_sum);
+            else if (j <= DMTiles) o_acc[j - 1] = mfma32(frag[j], p_frag, o_acc[j - 1]);
+            else if (qk) {
+                const int mt = (j - 1 - DMTiles) / KSteps, ks = (j - 1 - DMTiles) % KSteps;
+                s_acc[mt] = mfma32_scaled(frag[j], q_frag[ks], ks == 0 ? seed16 : s_acc[mt], scale_k, scale_q);
+            }
+            if (j % 2 == 1 && j / 2 < Dmas) dma_inst(ga, t + 1, j / 2);
+            __builtin_amdgcn_sched_group_barrier(SchedMfma, 1, 0);
+            for (int n = 0; n < reads; ++n) __builtin_amdgcn_sched_group_barrier(SchedDsRead, 1, 0);
+        }
         sched_fence();
         block_barrier();
         s_setprio<1>();
     };
-    auto dma_only_block = [&](int t) INLINE {
-        tile_barrier();
+    auto dma_only_block = [&](auto ga, int t) INLINE {
         move_rsrc(t + 1);
-        dma_tile(t + 1);
+        tile_barrier();
+        for (int i = 0; i < (decltype(ga)::value ? KDmas : VDmas); ++i) dma_inst(ga, t + 1, i);
         block_barrier();
     };
 
     // ==== the main loop (barriers as attention_mla.hip) ===========================================
     s_waitcnt_vmcnt<0>();
     s_barrier();                                   // tile 0 visible to every wave
-    if (!group_a) s_barrier();                     // B's blocks trail by one window
-    for (int t = 0; t < work.num_live; ++t) {
-        mfma_block(t, true);
-        softmax(t);
-    }
-    mfma_block(work.num_live, false);              // the final PV
-    for (int t = work.num_live + 1; t <= work.num_tiles; ++t) dma_only_block(t);
-    if (group_a) s_barrier();                      // pairs with B's last block barrier
+    auto main_loop = [&](auto ga) INLINE {
+        constexpr bool A = decltype(ga)::value;
+        for (int j = 0; j < Lead; ++j) first_frags[j] = v_frag(0, j);
+        if constexpr (!A) s_barrier();             // B's blocks trail by one window
+        for (int t = 0; t < work.num_live; ++t) {
+            mfma_block(ga, t, std::true_type{});
+            softmax(t);
+            if constexpr (A)                       // block t + 1's first fragments: V(t), visible since
+                for (int j = 0; j < Lead; ++j) first_frags[j] = v_frag(t, j);   // B's barrier of block t
+        }
+        mfma_block(ga, work.num_live, std::false_type{});   // the final PV
+        for (int t = work.num_live + 1; t <= work.num_tiles; ++t) dma_only_block(ga, t);
+        if constexpr (A) s_barrier();              // pairs with B's last block barrier
+    };
+    if (group_a) main_loop(std::true_type{});
+    else         main_loop(std::false_type{});
 
     // ==== epilogue ================================================================================
     const float l = row_sum[0];
@@ -332,6 +390,10 @@ __global__ __launch_bounds__(BlockSize, 1) void fwd(Args a)
             *reinterpret_cast<bf16x4_t*>(o_row + 32 * dt + 8 * j + 4 * h) = x;
         }
 }
+
+// Explicit instantiations: clang 23 leaves fwd<true> undefined on the host when only the Kernels table names it.
+template __global__ void fwd<false>(Args);
+template __global__ void fwd<true>(Args);
 
 }  // namespace attn::mla8
 
