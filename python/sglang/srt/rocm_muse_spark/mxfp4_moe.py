@@ -20,9 +20,12 @@ from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
 from sglang.kernels.ops.quantization.mxfp4_quant_rows import mxfp4_quant_rows
 from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import muse_moe_flydsl
+from sglang.srt.utils.common import is_gfx95_supported
 
-COMPACT_A4_ENABLED = envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get()
-A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get()
+# Both paths run FlyDSL kernels (aiter stage 1 / 2, Muse finalize) that only compile for gfx950; other archs
+# such as gfx1250 use the Triton experts.
+COMPACT_A4_ENABLED = envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get() and is_gfx95_supported()
+A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get() and is_gfx95_supported()
 A4W4_MIN_ROWS = 256
 # Stage-1 launch (tile_n, async copy, waves per EU), MI355X prefill widths.
 _S1_TILE_N = 128

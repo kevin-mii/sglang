@@ -111,6 +111,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
 )
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -1043,6 +1044,8 @@ class MuseSpark1xMoE(nn.Module):
             )
             if _FINALIZE_AR_PUSH
             and _is_rocm()
+            # The kernel's barrier and cache-policy encodings are gfx950 only; gfx1250 changed both.
+            and is_gfx95_supported()
             and mxfp4_moe.COMPACT_A4_ENABLED
             and self.mxfp4_checkpoint
             and self.tp_size == self.ep_size == 4
