@@ -116,7 +116,13 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
             req_to_decode_prefix_len={},
             failed_sessions=set(),
             session_failures=defaultdict(int),
+            failed_session_probes={},
             session_lock=Lock(),
+            state_layout_rejections={},
+            poison_deferred_ack_room=MagicMock(),
+            _maybe_ack_drained_abort=MagicMock(),
+            _poison_unsettled_send=MagicMock(),
+            validate_aux_buffers=MagicMock(),
             decode_kv_args_table={
                 session: SimpleNamespace(
                     requires_dcp_relayout=False,
@@ -124,6 +130,8 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
                     dst_kv_layer_ids=[],
                     dst_kv_item_len=1,
                     dst_attn_tp_size=1,
+                    dst_aux_ptrs=[3000],
+                    dst_aux_item_lens=[16],
                 )
             },
             kv_args=SimpleNamespace(kv_data_ptrs=[1000]),
