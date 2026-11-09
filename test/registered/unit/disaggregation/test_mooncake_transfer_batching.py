@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +26,11 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMooncakeTransferQueueSharding(CustomTestCase):
+    def setUp(self):
+        override = envs.SGLANG_MOONCAKE_SHARD_TRANSFERS_BY_ROOM.override(True)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
     @staticmethod
     def _make_manager(rooms, queue_count=4):
         queued_rooms = [[] for _ in range(queue_count)]

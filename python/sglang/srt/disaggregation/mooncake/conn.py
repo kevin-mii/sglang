@@ -3439,8 +3439,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # Room IDs can be congruent with their DP rank, so mix all bits first.
-        shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
+        if envs.SGLANG_MOONCAKE_SHARD_TRANSFERS_BY_ROOM.get():
+            # Room IDs can be congruent with their DP rank, so mix all bits first.
+            shard_idx = _mix_room_id(bootstrap_room) % len(self.transfer_queues)
+        else:
+            # requests with the same dst_sessions share a queue, so a failed session
+            # aborts them early
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            session_port_sum = sum(
+                int(session.rsplit(":", 1)[1]) for session in dst_infos
+            )
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()

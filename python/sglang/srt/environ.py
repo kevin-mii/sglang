@@ -947,6 +947,9 @@ class Envs:
     # Opt-in limit for the number of KV cache indices represented by one
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
+    # Pick a prefill KV-transfer queue by a hash of the bootstrap room instead of the destination
+    # port sum, which puts every room of a 1P1D pair on one queue (sgl-project/sglang#42163).
+    SGLANG_MOONCAKE_SHARD_TRANSFERS_BY_ROOM = EnvBool(False)
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
