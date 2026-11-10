@@ -402,6 +402,7 @@ pub enum PoolName {
     Swa,
     AuxiliarySwa,
     Indexer,
+    IndexerScale,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
     DeepseekV4C4IndexerScale,
